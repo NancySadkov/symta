@@ -627,13 +627,24 @@ is_path_file X =
    else [_mcall A '<>' B]
 #else
 is_fixkw X = X.is_fixtext and X.is_keyword
+// OP-2: when either side is the literal `No`, emit the dedicated
+// SBC_NO / SBC_GOT opcode (`L[src]==No ? 1:0` / `L[src]!=No ? 1:0`
+// -- ~5 ns each, no method dispatch) instead of falling into the
+// IMMEQ slow path which MCALLs `m_eq` whenever the non-int side
+// isn't a fixnum.  `No` in the AST IS the runtime No marker (the
+// reader interns the bare `No` identifier), so `no X` on the AST
+// node correctly identifies it.
 `><` A B =
-   if A.is_int or is_fixkw A
+   if no A then form: _no B
+   elif no B then form: _no A
+   elif A.is_int or is_fixkw A
       or case A ['\\'+'"'+_quote X] (X.is_fixtext or X.is_int)
    then form: _same A B
    else [_eq A B]
 `<>` A B =
-   if A.is_int or is_fixkw A
+   if no A then form: _got B
+   elif no B then form: _got A
+   elif A.is_int or is_fixkw A
       or case A ['\\'+'"'+_quote X] (X.is_fixtext or X.is_int)
    then form: _vary A B
    else [_ne A B]

@@ -47,14 +47,11 @@ _list_._ = Me
 _empty_._ = Me
 hard_list._ = Me
 
-// `_.><` and `_.<>` come from runtime/bltin.c as direct C-level
-// raw-dyn identity comparators -- 1 MCALL each (~50 ns) instead
-// of the 250 ns the old `same Me B` / `not Me >< B` Symta chain
-// cost on every heap value.  Type-specific overrides
-// (int.><, text.><, ...) still win via METHOD_FN dispatch.
-_.`<<` B = not B < Me
-_.`>` B = B < Me
-_.`>>` B = not Me < B
+// `_.><`/`_.<>`/`_.<<`/`_.>`/`_.>>` all come from runtime/bltin.c
+// as direct C-level raw-dyn comparators -- 1 builtin call (~50 ns)
+// instead of the chained Symta-side `same Me B` / `not Me >< B`
+// (~250 ns).  Type-specific overrides (int.<, text.<, list.<, ...)
+// still win via METHOD_FN dispatch before falling here.
 
 _.is_int = 0
 int.is_int = 1

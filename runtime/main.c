@@ -233,13 +233,14 @@ method_node_t *add_method_r(int depth, int type_id
       if (!s->super) break;
     }
     if (depth) return 0; //subtype already has this method
-    /* `_.><` / `_.<>` get registered both via the C-side init
-     * (fast direct-dispatch handlers) and via the bootstrap SBC's
-     * Symta-side definitions of the same methods.  Allow the
-     * silent override so the latest registration wins.  Any OTHER
-     * method redefinition is still an error -- usually a real
-     * bug. */
-    if (method_id == api.m_equal || method_id == api.m_ne_) {
+    /* `_.><` / `_.<>` / `_.<<` / `_.>` / `_.>>` get registered
+     * both via the C-side init (fast direct-dispatch handlers)
+     * and via the bootstrap SBC's Symta-side definitions of the
+     * same methods.  Allow the silent override so the latest
+     * registration wins.  Any OTHER method redefinition is still
+     * an error -- usually a real bug. */
+    if (method_id == api.m_equal || method_id == api.m_ne_
+     || method_id == m_lte || method_id == m_gt || method_id == m_gte) {
       goto replace;
     }
     rterr("add_method: redefining %s.%s"

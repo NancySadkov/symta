@@ -393,6 +393,30 @@ BUILTIN2("_.`><`",any_eq,C_ANY,a,C_ANY,b)
 RETURNS(FXN(a == b))
 BUILTIN2("_.`<>`",any_ne,C_ANY,a,C_ANY,b)
 RETURNS(FXN(a != b))
+
+/* OP-3: `_.<<` / `_.>` / `_.>>` -- raw-dyn ordering comparators
+ * on T_OBJECT, mirroring OP-1's identity comparators above.  The
+ * Symta-side defs in core_.s used to read
+ *
+ *   _.`<<` B = not B < Me
+ *   _.`>`  B = B < Me
+ *   _.`>>` B = not Me < B
+ *
+ * which is one MCALL into `<` plus a `not` opcode on top.  These
+ * builtins skip both, doing the bit-level compare directly.
+ *
+ * Caveat: dyn-bit ordering is only meaningful when both operands
+ * have the same tag; cross-type comparisons (T_NO < T_LIST) are
+ * nonsensical.  In practice these are rarely called with
+ * mismatched heap types, and every common type (int / float /
+ * list / text) has its own type-specific override that wins via
+ * METHOD_FN dispatch before we get here. */
+BUILTIN2("_.`<<`",any_lte,C_ANY,a,C_ANY,b)
+RETURNS(FXN((uintptr_t)a <= (uintptr_t)b))
+BUILTIN2("_.`>`", any_gt, C_ANY,a,C_ANY,b)
+RETURNS(FXN((uintptr_t)a >  (uintptr_t)b))
+BUILTIN2("_.`>>`",any_gte,C_ANY,a,C_ANY,b)
+RETURNS(FXN((uintptr_t)a >= (uintptr_t)b))
 BUILTIN1("no.hash",no_hash,C_ANY,a)
 RETURNS(FXN(0x12345678))
 
@@ -3090,21 +3114,32 @@ void init_builtins(int argc, char **argv) {
   init_subtypes();
 
   /* `_.><` / `_.<>` -- raw-dyn identity comparators on T_OBJECT.
-   * Registered AFTER init_subtypes so add_method propagates them
-   * to every subtype that doesn't already have a type-specific
-   * override (int / text / float / fn / no have their own via
-   * METHOD_FN).  Bootstrap core_.sbc may still carry Symta-side
-   * defs of these methods; add_method allows redefinition for
-   * the two specific method ids (m_equal / m_ne) so the latest
-   * registration wins. */
+   * `_.<<` / `_.>` / `_.>>` -- raw-dyn ordering comparators
+   * (OP-3).  All registered AFTER init_subtypes so add_method
+   * propagates them to every subtype that doesn't already have a
+   * type-specific override (int / float have all six; list has
+   * the four orderings Symta-side; text has equality C-side and
+   * a Symta-side `<` that propagates via the order chain).
+   * Bootstrap core_.sbc may still carry Symta-side defs of these
+   * methods; add_method allows redefinition for the five specific
+   * method ids so the latest registration wins. */
   {
     setup_b_any_eq();
     setup_b_any_ne();
+    setup_b_any_lte();
+    setup_b_any_gt();
+    setup_b_any_gte();
     void *met;
     BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_any_eq)->hook);
     add_method(T_OBJECT, api.m_equal, met);
     BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_any_ne)->hook);
     add_method(T_OBJECT, api.m_ne_, met);
+    BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_any_lte)->hook);
+    add_method(T_OBJECT, m_lte, met);
+    BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_any_gt)->hook);
+    add_method(T_OBJECT, m_gt, met);
+    BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_any_gte)->hook);
+    add_method(T_OBJECT, m_gte, met);
   }
 
   init_args(argc, argv);
