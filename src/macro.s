@@ -1648,6 +1648,19 @@ maybe_doc X =
 build_ssv Name T =
   [_ssv [_quote 'docs'] [_quote Name] [_quote T]]
 
+// Cheap shape test -- does Body start with an `@"text"` doc
+// head?  Avoids running the expensive name-interpolation +
+// list rebuild in `prefix_doc` on the 99 % of definitions
+// (game / app code) that have no docstring.
+has_doc_head Body =
+| less Body.is_list and Body.n > 0: ret 0
+| First Body.0
+| if Body.n >< 1 and First.is_list and First.n > 0 and First.0 >< '|'
+    then
+      Stmts First.tail
+      if Stmts.n > 0 then got maybe_doc Stmts.0 else 0
+    else got maybe_doc First
+
 prefix_doc Body Name =
 | less Body.is_list and Body.n > 0: ret Body
 | First Body.0
@@ -1671,17 +1684,20 @@ expand_block_item Expr =
   Y case Expr:
       [`=` [[Op<`.`+`.=` Type<1.is_keyword Method] @Args] Body] =
         when Op><`.=`: Method = "=[Method]"
-        Body = prefix_doc Body "[Type].[Method]"
+        when has_doc_head Body:
+          Body = prefix_doc Body "[Type].[Method]"
         expand_block_item_method Type Method Args Body
       [`=` [['@' Method] @Args] Body] =
         less GLastType: mex_error "no type declared beforehard"
         case Method nullary_,Name: Method = Name
-        Body = prefix_doc Body "[GLastType].[Method]"
+        when has_doc_head Body:
+          Body = prefix_doc Body "[GLastType].[Method]"
         expand_block_item_method GLastType Method Args Body
       [`=` [Name @Args] Value] =
         if Name.is_keyword
           then
-            Value = prefix_doc Value "[Name]"
+            when has_doc_head Value:
+              Value = prefix_doc Value "[Name]"
             expand_block_item_fn Name Args Value
           else
             when Args.n: mex_error "`=`: left side has too many expressions"
