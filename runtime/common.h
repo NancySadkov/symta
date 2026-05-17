@@ -207,12 +207,37 @@ struct method_node_t {
   int mid; //method id
   int tid; //type id
   dyn fn;  //closure
-  method_node_t *next;
+  method_node_t *next; //RT-6: unused (kept for ABI compat with mcache)
 };
 
-//smaller table size will help conserving memory at cost of speed
-#define METHOD_TABLE_SIZE 512
-#define METHOD_TABLE_MASK (METHOD_TABLE_SIZE-1)
+/* RT-6: per-type method slot.  The dispatch table used to be a
+ * fixed 512-bucket head-pointer array (`method_node_t
+ * *methods[512]` = 4096 bytes per type) with chained
+ * `method_node_t` chains for collisions.  4 KB per type, only a
+ * fraction of which was populated, and every MCALL miss touched
+ * three disjoint cache lines (type header + far-away
+ * `methods[hid]` + chain node).
+ *
+ * RT-6 swaps the bucket array for a packed open-addressed probe
+ * table sized to the actual method count per type (initial cap
+ * 8, doubled on >= 75 % load).  Empty slots are marked by
+ * `mid == 0`; the `""` (null) method id reserved at
+ * `init_types()` time guarantees no real method ever uses 0.
+ * Each slot stores the method id and a pointer into the stable
+ * `method_pages` arena, so the cached node pointers held by
+ * `mcache_t` survive any per-type table resize.
+ *
+ * Typical small types now hold ~16-64 slots = 256-1024 bytes;
+ * heavy types (T_OBJECT plus everything that inherits from it)
+ * top out around 256 slots = 4 KB, no worse than before.  The
+ * footprint summed across the ~30 base types drops by 4-8×. */
+typedef struct {
+  uint32_t mid;       /* 0 = empty slot */
+  uint32_t _pad;      /* alignment */
+  method_node_t *node;
+} method_slot_t;
+
+#define INITIAL_METHOD_CAP 8
 #define METHODS_PAGE_BITS 10
 #define METHODS_PAGE_SIZE (1<<METHODS_PAGE_BITS)
 #define METHODS_PAGE_MASK (METHODS_PAGE_SIZE-1)
@@ -228,10 +253,10 @@ struct type_t {
   int subtypes;  // child types
   int next;      // next subtype of this super type
   int id;
-  //this hashtable work fast enough as long as
-  //methods ids are spaced randomly enough
-  //FIXME: convert it to use perfect hashing ans smaller table sizes.
-  method_node_t *methods[METHOD_TABLE_SIZE];
+  /* RT-6: open-addressed probe table; see method_slot_t above. */
+  uint32_t method_cap;    // capacity (power of 2)
+  uint32_t method_count;  // entries used
+  method_slot_t *methods; // dynamically allocated, calloc'd
 };
 
 

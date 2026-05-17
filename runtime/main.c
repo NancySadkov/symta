@@ -98,35 +98,77 @@ dyn get_method_name(uint32_t method_id) {
   return method_names[method_id];
 }
 
-#define GET_METH_STEP \
-  if (!m) return t->sink->fn; \
-  if (m->mid == method_id) return m->fn; \
-  m = m->next;
+/* RT-6: probe-based dispatch.  See method_slot_t in common.h. */
+
 dyn get_method(int method_id, dyn object) {
-  type_t *t = types+O_TAG(object);
-  method_node_t *m = t->methods[method_id&METHOD_TABLE_MASK];
-  GET_METH_STEP;
-  GET_METH_STEP;
-  while (1) { //almost never gets here, if type_t->methods is big eough
-    GET_METH_STEP
+  type_t *t = types + O_TAG(object);
+  uint32_t mask = t->method_cap - 1;
+  uint32_t i = (uint32_t)method_id & mask;
+  method_slot_t *ms = t->methods;
+  for (;;) {
+    uint32_t slot_mid = ms[i].mid;
+    if (!slot_mid) return t->sink->fn;
+    if (slot_mid == (uint32_t)method_id) return ms[i].node->fn;
+    i = (i + 1) & mask;
   }
-  return t->sink->fn;
 }
 
-
-#define GET_METH_NODE_STEP \
-  if (!m) return t->sink; \
-  if (m->mid == method_id) return m; \
-  m = m->next;
 method_node_t *get_method_node(int method_id, int tag) {
-  type_t *t = types+tag;
-  method_node_t *m = t->methods[method_id&METHOD_TABLE_MASK];
-  GET_METH_NODE_STEP;
-  GET_METH_NODE_STEP;
-  while (1) { //almost never gets here, if type_t->methods is big eough
-    GET_METH_NODE_STEP
+  type_t *t = types + tag;
+  uint32_t mask = t->method_cap - 1;
+  uint32_t i = (uint32_t)method_id & mask;
+  method_slot_t *ms = t->methods;
+  for (;;) {
+    uint32_t slot_mid = ms[i].mid;
+    if (!slot_mid) return t->sink;
+    if (slot_mid == (uint32_t)method_id) return ms[i].node;
+    i = (i + 1) & mask;
   }
-  return t->sink;
+}
+
+/* Returns the slot pointer for `mid` in t's table, or NULL if absent. */
+static method_slot_t *find_method_slot(type_t *t, int mid) {
+  uint32_t mask = t->method_cap - 1;
+  uint32_t i = (uint32_t)mid & mask;
+  method_slot_t *ms = t->methods;
+  for (;;) {
+    uint32_t slot_mid = ms[i].mid;
+    if (!slot_mid) return 0;
+    if (slot_mid == (uint32_t)mid) return &ms[i];
+    i = (i + 1) & mask;
+  }
+}
+
+/* Find the slot to insert `mid` into.  Returns either the existing
+ * matching slot or the first empty one found by linear probing.
+ * Caller is responsible for resizing before calling so load < 1. */
+static method_slot_t *find_insert_slot(type_t *t, int mid) {
+  uint32_t mask = t->method_cap - 1;
+  uint32_t i = (uint32_t)mid & mask;
+  method_slot_t *ms = t->methods;
+  for (;;) {
+    uint32_t slot_mid = ms[i].mid;
+    if (!slot_mid || slot_mid == (uint32_t)mid) return &ms[i];
+    i = (i + 1) & mask;
+  }
+}
+
+static void resize_method_table(type_t *t) {
+  uint32_t old_cap = t->method_cap;
+  method_slot_t *old_slots = t->methods;
+  uint32_t new_cap = old_cap * 2;
+  method_slot_t *new_slots = (method_slot_t*)calloc(new_cap,
+                                                    sizeof(method_slot_t));
+  uint32_t new_mask = new_cap - 1;
+  for (uint32_t i = 0; i < old_cap; i++) {
+    if (!old_slots[i].mid) continue;
+    uint32_t j = (uint32_t)old_slots[i].mid & new_mask;
+    while (new_slots[j].mid) j = (j + 1) & new_mask;
+    new_slots[j] = old_slots[i];
+  }
+  free(old_slots);
+  t->method_cap = new_cap;
+  t->methods = new_slots;
 }
 
 //O_TAG(object)
@@ -151,7 +193,13 @@ intptr_t intern(char *name) {
   t->super = END_TAG;
   t->subtypes = END_TAG;
   t->next = END_TAG;
-  memset(t->methods, 0, sizeof(method_node_t*)*METHOD_TABLE_SIZE);
+
+  /* RT-6: start with a small open-addressed table.  Grows on
+   * load >= 75 % via resize_method_table. */
+  t->method_cap = INITIAL_METHOD_CAP;
+  t->method_count = 0;
+  t->methods = (method_slot_t*)calloc(INITIAL_METHOD_CAP,
+                                      sizeof(method_slot_t));
 
   shput(typelut,t->name,index);
   arrput(collectors,gc_custom);
@@ -164,7 +212,10 @@ intptr_t intern(char *name) {
   return index;
 }
 
-static void init_method(method_node_t **dst, int tid, int mid, void *handler) {
+/* Allocate a stable method_node_t in the page-arena (for mcache
+ * pointer stability) and return its pointer.  Caller inserts
+ * into the type's slot table separately via insert_method. */
+static method_node_t *alloc_method_node(int tid, int mid, void *handler) {
   method_node_t *page;
   int page_ofs = nmethods & METHODS_PAGE_MASK;
   if (page_ofs) {
@@ -177,26 +228,41 @@ static void init_method(method_node_t **dst, int tid, int mid, void *handler) {
   m->mid = mid;
   m->tid = tid;
   m->fn = handler;
-  m->next = *dst;
-  *dst = m;
+  m->next = 0;
   api.hgp->dirty |= DRT_TYPE_METHODS;
   ++nmethods;
+  return m;
 }
 
-static method_node_t *list_has_method(method_node_t *m, int mid) {
-  for ( ; m; m = m->next) if (m->mid == mid) return m;
-  return 0;
+/* Insert (mid, node) into t's slot table.  Resizes first if the
+ * load factor would exceed 75 %.  If a slot for `mid` already
+ * exists, just overwrites its `node` (used both for the bootstrap-
+ * SBC-overrides-C-handler case and for the user-redefinition
+ * whitelist path). */
+static void insert_method(type_t *t, int mid, method_node_t *node) {
+  if (t->method_count + 1 >= (t->method_cap * 3) / 4) {
+    resize_method_table(t);
+  }
+  method_slot_t *s = find_insert_slot(t, mid);
+  if (!s->mid) {
+    s->mid = (uint32_t)mid;
+    t->method_count++;
+  }
+  s->node = node;
 }
 
 static void inherit_methods(type_t *parent, type_t *child) {
-  int i;
-  method_node_t *m, *n;
-  method_node_t **pms = parent->methods, **cms = child->methods;
-
-  for (i = 0; i < METHOD_TABLE_SIZE; i++)
-    for (n = pms[i]; n; n = n->next)
-      if (!list_has_method(cms[i], n->mid))
-        init_method(cms+i, child->id, n->mid, n->fn);
+  uint32_t cap = parent->method_cap;
+  method_slot_t *pms = parent->methods;
+  for (uint32_t i = 0; i < cap; i++) {
+    if (!pms[i].mid) continue;
+    int mid = (int)pms[i].mid;
+    /* Skip if the child already defines its own version of mid. */
+    if (find_method_slot(child, mid)) continue;
+    method_node_t *n = pms[i].node;
+    method_node_t *m = alloc_method_node(child->id, mid, n->fn);
+    insert_method(child, mid, m);
+  }
 }
 
 void add_subtype(int tag, int subtag) {
@@ -212,24 +278,22 @@ void add_subtype(int tag, int subtag) {
 
 method_node_t *add_method_r(int depth, int type_id
                            ,int method_id, void *handler) {
-  int hid; //hashed id
-  method_node_t *n, *m, **ms;
   type_t *s, *t = &types[type_id];
 
-  hid = method_id&METHOD_TABLE_MASK;
-  ms = t->methods;
-
   if (depth == ADD_CORE_SINK) {
-    init_method(ms+hid, type_id, method_id, handler);
-    return ms[hid];
+    method_node_t *m = alloc_method_node(type_id, method_id, handler);
+    insert_method(t, method_id, m);
+    return m;
   }
 
-  n = list_has_method(ms[hid], method_id);
+  method_slot_t *n_slot = find_method_slot(t, method_id);
+  method_node_t *n = n_slot ? n_slot->node : 0;
   if (n) {
+    /* Walk the super chain to detect inherited-and-still-matches. */
     for (int si = t->super; si != END_TAG; si = s->super) {
       s = &types[si];
-      m = list_has_method(s->methods[hid], method_id);
-      if (m && m->fn == n->fn) goto inherited;
+      method_slot_t *m_slot = find_method_slot(s, method_id);
+      if (m_slot && m_slot->node->fn == n->fn) goto inherited;
       if (!s->super) break;
     }
     if (depth) return 0; //subtype already has this method
@@ -251,18 +315,21 @@ method_node_t *add_method_r(int depth, int type_id
   }
 
 replace:
-  init_method(ms+hid, type_id, method_id, handler);
+  {
+    method_node_t *m = alloc_method_node(type_id, method_id, handler);
+    insert_method(t, method_id, m);
 
-  for (int si = t->subtypes; si != END_TAG; si = s->next) {
-    s = &types[si];
-    add_method_r(depth+1, s->id, method_id, handler);
-  }
+    for (int si = t->subtypes; si != END_TAG; si = s->next) {
+      s = &types[si];
+      add_method_r(depth+1, s->id, method_id, handler);
+    }
 
-  if (method_id == api.m_underscore) {
-    t->sink = ms[hid];
-    api.hgp->dirty |= DRT_TYPES;
+    if (method_id == api.m_underscore) {
+      t->sink = m;
+      api.hgp->dirty |= DRT_TYPES;
+    }
+    return m;
   }
-  return ms[hid];
 }
 
 

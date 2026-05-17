@@ -1617,23 +1617,20 @@ BUILTIN2("tok.=parsed",tok_sparsed,C_ANY,o,C_ANY,v)
 RETURNS(0);
 
 
-//FIXME: can be speed-up, if all type's methods are linked
 BUILTIN1("methods_",methods_,C_ANY,o)
   GC_DISABLE();
-  int i;
-  method_node_t *m, **ms;
-  int t = (int)O_TAG(o);
   R = Empty;
-  ms = types[t].methods;
-  for (i = 0; i < METHOD_TABLE_SIZE; i++) {
-    for (m = ms[i]; m; m = m->next) {
-      void *name, *c, *pair;
-      LIST(pair, 2);
-      LGET(pair,0) = method_names[m->mid];
-      LGET(pair,1) = m->fn;
-      CONS(c, pair, R);
-      R = c;
-    }
+  type_t *t = &types[(int)O_TAG(o)];
+  /* RT-6: walk the packed slot table -- empty slots have mid==0. */
+  for (uint32_t i = 0; i < t->method_cap; i++) {
+    if (!t->methods[i].mid) continue;
+    method_node_t *m = t->methods[i].node;
+    void *c, *pair;
+    LIST(pair, 2);
+    LGET(pair,0) = method_names[m->mid];
+    LGET(pair,1) = m->fn;
+    CONS(c, pair, R);
+    R = c;
   }
   GC_ENABLE();
 RETURNS(R)
