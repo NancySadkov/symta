@@ -25,7 +25,7 @@ GModuleCompiler No
 GModuleFolders No
 GSrc: 0 0 unknown
 GTypes No
-GVarsTypes:
+GVarsTypes No // hash: Var -> Type.  Cleared per macroexpand via (!)
 GMexLets No //verb mexlets
 GLastType 0
 FFI_Lib No
@@ -800,10 +800,12 @@ sbs What With Src = form: case Src What With ~Else ~Else
              [`&` Fn] | [Fn A]
   | when A.is_keyword:
       A =: '\\' A
-  | when A^is_var_sym: case GVarsTypes.find(?0><A) [Var Type]
-    | Fields GTypes.Type
-    | P | got Fields and Fields.locate(B)
-    | when got P: ret [_dget A P]
+  | when A^is_var_sym:
+    | Type GVarsTypes.A
+    | when got Type:
+      | Fields GTypes.Type
+      | P | got Fields and Fields.locate(B)
+      | when got P: ret [_dget A P]
   | ret ['()' ['.' A B]]
   case B [`:` ':'+'!'<Op Body]:
     As case Body
@@ -1512,10 +1514,12 @@ expand_destructuring Value Bs Body =
 expand_assign Place Value =
 | case Place
   [`.` A B] | if B.is_keyword
-              then | when A^is_var_sym: case GVarsTypes.find(?0><A) [Var Type]
-                     | Fields GTypes.Type
-                     | P | got Fields and Fields.locate(B)
-                     | when got P: ret [_dset A P Value]
+              then | when A^is_var_sym:
+                     | Type GVarsTypes.A
+                     | when got Type:
+                       | Fields GTypes.Type
+                       | P | got Fields and Fields.locate(B)
+                       | when got P: ret [_dset A P Value]
                    | [_mcall A "=[B]" Value]
               else [_lset A B Value]
   [`$` Field] | expand_assign [`.` \Me Field] Value
@@ -2208,7 +2212,12 @@ hcase MexFormCases Expr ()
   [_goto Name] | Expr
   [_quote X] | if X.is_list: expand_quoted_list X else Expr
   [_nomex X] | X // no macroexpand
-  [_type Type Var Body] | let GVarsTypes [[Var Type]@GVarsTypes]: mex Body
+  [_type Type Var Body]
+    | Old GVarsTypes.Var
+    | GVarsTypes.Var =  Type
+    | R mex Body
+    | GVarsTypes.Var =  Old
+    | R
   [`&` O] | if O.is_keyword then O else bad "implement `&Var` ([O])" // [O^mex]
 
 mex ExprIn =
@@ -2244,6 +2253,7 @@ macroexpand Expr Macros ModuleCompiler ModuleFolders =
       GModuleCompiler ModuleCompiler
       GModuleFolders ModuleFolders
       GTypes (!)
+      GVarsTypes (!)
       GMexLets (!)
       GLastType 0
   | R mex Expr
