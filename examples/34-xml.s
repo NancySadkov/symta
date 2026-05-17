@@ -8,9 +8,9 @@
 // In Symta, an XML document IS a Symta nested list with the right
 // shape:
 //
-//   <book>...</book>            [\book ...]
-//   <author>Nancy</author>      [\author "Nancy"]
-//   <tag>v</tag><tag>w</tag>    [\tag "v"]  [\tag "w"]
+//   <book>...</book>            [book ...]
+//   <author>Nancy</author>      [author "Nancy"]
+//   <tag>v</tag><tag>w</tag>    [tag "v"]  [tag "w"]
 //
 // So tree transformation is just `{}` term rewriting on the
 // nested list -- no library, no `findall`, no XPath.  The bulk of
@@ -27,13 +27,13 @@
 // ----------------------------------------------------------------
 // 1. Our document, as a Symta nested list.
 // ----------------------------------------------------------------
-T [\book
-    [\title  "Symta"]
-    [\author "Nancy Sadkov"]
-    [\year   "2026"]
-    [\tag    "language"]
-    [\tag    "lisp"]
-    [\tag    "rewriting"]]
+T: book
+     title  , "Symta"
+     author , "Nancy Sadkov"
+     year   , "2026"
+     tag    , "language"
+     tag    , "lisp"
+     tag    , "rewriting"
 
 say "document:"
 say T
@@ -45,18 +45,18 @@ say ""
 //    A child is a 2-element `[\name value]` list, so destructuring
 //    in `.keep` picks them straight out.
 // ----------------------------------------------------------------
-Tags T.tail.keep(C => C.0 >< \tag)
+Tags T(_@~){-[tag@]=} //take tail and remove non-tag pairs
 say "tag children:"
 for [_ V] Tags: say "  - [V]"
 say ""
 
 // Pull a specific child by name:
 find_child Tree Name =
-  Found Tree.tail.keep(C => C.0 >< Name)
+  Found Tree.tail.keep(?0 >< Name)
   if Found.n then Found.0.1 else No
-say "title:  [find_child T \title]"
-say "year:   [find_child T \year]"
-say "author: [find_child T \author]"
+say "title:  [find_child T title]"
+say "year:   [find_child T year]"
+say "author: [find_child T author]"
 say ""
 
 
@@ -64,7 +64,7 @@ say ""
 // 3. Transform: rename every <tag> to <keyword>.
 //    REFAL pattern, two characters of body.
 // ----------------------------------------------------------------
-T2 [@T{[\tag V] =: \keyword V}]
+T2 [@T{[tag V] =: keyword V}]
 say "after renaming tag -> keyword:"
 say T2
 say ""
@@ -74,7 +74,7 @@ say ""
 // 4. Add a new child.  Symta lists are persistent: build a fresh
 //    list with the new node spliced in.
 // ----------------------------------------------------------------
-T3 [@T2 [\publisher "self"]]
+T3 [@T2 [publisher "self"]]
 say "after adding publisher:"
 say T3
 say ""
