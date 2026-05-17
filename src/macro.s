@@ -2218,6 +2218,23 @@ hcase MexFormCases Expr ()
     | R mex Body
     | GVarsTypes.Var =  Old
     | R
+  // TS-1: `_the T E` -- DYN -> typed boundary.  Runtime-checks
+  // that E's value is of type T, then propagates T statically
+  // via the existing `_type T G G` mex form so the type-aware
+  // fast-paths at macro.s:803 / :1518 fire for downstream uses.
+  // If the check fails, `bad` raises a runtime error.
+  [_the Type E]
+    | G @rand 'G'
+    | Mname "is_[Type]"
+    | Msg "value not [Type]"
+    | Check [`_if` [`.` G Mname] [`_type` Type G G] [bad Msg]]
+    | mex [`let_` [[G E]] Check]
+  // TS-1: `_unsafe T E` -- C-style trust-me cast.  Skips the
+  // runtime check; propagates T statically.  UB if you lie.
+  // Use only when the strict checker is provably wrong.
+  [_unsafe Type E]
+    | G @rand 'G'
+    | mex [`let_` [[G E]] [`_type` Type G G]]
   [`&` O] | if O.is_keyword then O else bad "implement `&Var` ([O])" // [O^mex]
 
 mex ExprIn =
