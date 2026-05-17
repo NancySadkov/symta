@@ -333,6 +333,19 @@ extern api_t api_g; //FIXME: all routines should use local versions
 #define api (api_g)
 
 extern type_t *types;
+
+/* RT-9 measurement: per-tag allocation counters incremented by
+ * gc_alloc().  Always on (one uint64_t add per allocation, ~1-2
+ * cycles).  Printed by `rtstat`.  Used to answer "how much does
+ * CONS dominate?" empirically before committing to a specific
+ * RT-9 implementation strategy. */
+typedef struct {
+  uint64_t by_tag[32];  /* indexed by O_TAG; tags top out at ~22 */
+  uint64_t list_size_bucket[16]; /* [0]=size 0, [1]=1, ..., [14]=14,
+                                    [15]=15+ (saturating bucket) */
+} alloc_stats_t;
+extern alloc_stats_t alloc_stats;
+
 extern char *main_path;
 extern void *main_args;
 extern dyn single_chars[];

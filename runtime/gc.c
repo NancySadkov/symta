@@ -430,10 +430,28 @@ void gc() {
 void *gc_alloc(uint32_t tag, uint32_t size) {
   hg_t *hgp = api.hgp;
 
+  /* RT-9 measurement: count allocations by tag.  Hoisted above
+   * the GC-retry branch so a retry doesn't double-count.  For
+   * T_LIST also bucket by size to expose the small-list-density
+   * question. */
+  if (tag < 32) alloc_stats.by_tag[tag]++;
+  if (tag == T_LIST) {
+    uint32_t b = size < 15 ? size : 15;
+    alloc_stats.list_size_bucket[b]++;
+  }
+
   void *r = hgp->top - size;
   gc_head_t *h = (gc_head_t*)r - 1;
   if ((void**)h < hgp->ts && hgp->top < hgp->base && !api.gc_disable) {
     gc();
+    /* Counter already bumped above; the recursive call below would
+     * bump it again -- decrement here so each *successful* alloc
+     * counts exactly once. */
+    if (tag < 32) alloc_stats.by_tag[tag]--;
+    if (tag == T_LIST) {
+      uint32_t b = size < 15 ? size : 15;
+      alloc_stats.list_size_bucket[b]--;
+    }
     return gc_alloc(tag, size);
   }
   uintptr_t tmp_h = (uintptr_t)h;

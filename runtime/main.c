@@ -33,6 +33,8 @@ static char *version = "1.1";
 
 dyn sink;  /* RT-6b: default sink fn (was method_node_t*) */
 
+alloc_stats_t alloc_stats;  /* RT-9 measurement; see common.h */
+
 lib_expts_t lib_expts;
 
 static char **lib_folders;

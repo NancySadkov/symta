@@ -1793,9 +1793,42 @@ static uint64_t show_runtime_info() {
   fprintf(stderr, "\n");
 }
 
+/* RT-9 measurement: per-tag allocation counts.  Separate from
+ * rtstat to keep workload-dependent output out of the 24-runtime
+ * golden -- this one is for benchmark-time data capture. */
+static void show_alloc_stats() {
+  fprintf(stderr, "-------------\n");
+  fprintf(stderr, "allocations by tag:\n");
+  for (uint32_t t = 0; t < 32; t++) {
+    if (!alloc_stats.by_tag[t]) continue;
+    char *name = (t < (uint32_t)arrlen(types) && types[t].name) ? types[t].name : "?";
+    fprintf(stderr, "  %-12s %lu\n", name, (unsigned long)alloc_stats.by_tag[t]);
+  }
+  fprintf(stderr, "list size distribution:\n");
+  for (uint32_t b = 0; b < 16; b++) {
+    if (!alloc_stats.list_size_bucket[b]) continue;
+    if (b < 15)
+      fprintf(stderr, "  size %-3u  %lu\n", b, (unsigned long)alloc_stats.list_size_bucket[b]);
+    else
+      fprintf(stderr, "  size 15+  %lu\n", (unsigned long)alloc_stats.list_size_bucket[b]);
+  }
+  fprintf(stderr, "\n");
+}
+
 BUILTIN0("rtstat",rtstat)
   show_runtime_info();
 RETURNS(0)
+
+BUILTIN0("alloc_stats_",alloc_stats_)
+  show_alloc_stats();
+RETURNS(0)
+
+/* RT-9 measurement: if SYMTA_ALLOC_STATS is set in the env, dump
+ * per-tag allocation counts on process exit.  Lets a cold ./game
+ * compile capture the numbers without modifying the workload. */
+static void alloc_stats_atexit(void) {
+  show_alloc_stats();
+}
 
 /* Force a minor GC.  The collector chooses the generation based
  * on the usual triggers (gen0 fill, magnet/dirty signals); we just
@@ -2766,6 +2799,7 @@ static struct {
   B(dbg)
   B(say_)
   B(rtstat)
+  B(alloc_stats_)
   B(gc)
   B(gc_set_gen0_pages)
   B(gc_gen0_used)
@@ -3138,7 +3172,12 @@ void init_builtin_functions() {
 void init_builtins(int argc, char **argv) {
   int i;
   void *tmp;
-  
+
+  /* RT-9 measurement: opt-in alloc-stats-on-exit via env var.
+   * Registered here (before any GC_ENABLE) so even early-exit
+   * paths get the dump. */
+  if (getenv("SYMTA_ALLOC_STATS")) atexit(alloc_stats_atexit);
+
   GC_DISABLE();
 
   api.alloc(T_CLOSURE,0);
