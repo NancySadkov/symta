@@ -1454,6 +1454,17 @@ dyn sbc_exec_fn(uint8_t *pin) {
     if (TAGIS(T_INT, L[a])) {
       IMMEQ(L[dst],L[a],L[b]);
       MCACHE_SKIP;
+    } else if ((TAGIS(T_TEXT, L[a]) || TAGIS(T_FIXTEXT, L[a]))
+            && (TAGIS(T_TEXT, L[b]) || TAGIS(T_FIXTEXT, L[b]))) {
+      /* OP-5c: text-vs-text fast path.  `case X [\foo @Rest]:`
+       * patterns reduce to a head-vs-literal-keyword IMMEQ.
+       * For FIXTEXT operands the existing `><` macro peephole
+       * emits SBC_SAME (identity); for BIGTEXT (or mixed) the
+       * fallback used to go through MCACHE_CALL m_eq.  Call
+       * `texts_equal` directly here -- skips the mcache lookup
+       * and the per-call frame setup. */
+      L[dst] = FXN(texts_equal(L[a], L[b]));
+      MCACHE_SKIP;
     } else {
       ARGLIST2(L[a],L[b]);
       MCACHE_CALL(L[dst],L[a],m_eq);
@@ -1464,6 +1475,11 @@ dyn sbc_exec_fn(uint8_t *pin) {
     CHKREG(dst); CHKREG(a); CHKREG(b);
     if (TAGIS(T_INT, L[a])) {
       IMMNE(L[dst],L[a],L[b]);
+      MCACHE_SKIP;
+    } else if ((TAGIS(T_TEXT, L[a]) || TAGIS(T_FIXTEXT, L[a]))
+            && (TAGIS(T_TEXT, L[b]) || TAGIS(T_FIXTEXT, L[b]))) {
+      /* OP-5c: text-vs-text fast path for `<>` / inequality. */
+      L[dst] = FXN(!texts_equal(L[a], L[b]));
       MCACHE_SKIP;
     } else {
       ARGLIST2(L[a],L[b]);
