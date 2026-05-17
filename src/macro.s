@@ -226,6 +226,32 @@ tag_for_predicate Name =
   else if Name >< "fn"      then 8
   else No
 
+// OP-5b: multi-tag predicates.  `text?` matches both T_FIXTEXT and
+// T_TEXT; `list?` matches the four concrete list-like tags
+// (T_LIST, T_VIEW, T_CONS, T_BYTES -- the T_HARD_LIST + T_CONS
+// subtypes of T_GENERIC_LIST).  Same override-bypass tradeoff as
+// the single-tag predicates above: user-defined types overriding
+// `is_text` / `is_list` would no longer be recognised in
+// `case X type?:` patterns, but the explicit `if X.is_text`
+// MCALL form is unaffected.
+tags_for_predicate Name =
+  if Name >< "text"      then [2 13]
+  else if Name >< "list" then [9 10 11 18]
+  else No
+
+// OP-5b helper: right-fold a list of tag values into a nested
+// `_if` chain that tests each tag against `(_tag Key)`.  Hit
+// duplicates per branch (typically a small body or label-jump in
+// pattern matching, so duplication is cheap).  Uses only
+// primitive forms so the result is compiler-ready without
+// further macroexpand.  Re-evaluates `(_tag Key)` per branch
+// (cheap: just an O_TAG read + FXN-wrap), to avoid let_-binding
+// a fresh variable which surprisingly didn't preserve identity
+// in early prototypes.
+build_tag_chain_simple Key Tags Hit Miss =
+| when Tags.end: ret Miss
+| [_if [_eq [_tag Key] Tags.0] Hit (build_tag_chain_simple Key Tags.tail Hit Miss)]
+
 expand_hole_term Key Hole Hit Miss =
 #if #NCM_TRACE_MACROS
 | mtrace_say \expand_hole_term [Key Hole]
@@ -240,7 +266,17 @@ expand_hole_term Key Hole Hit Miss =
     | Tag tag_for_predicate Lead
     | if got Tag
         then ret: form: _if (_eq (_tag Key) $Tag) Hit Miss
-        else ret: form: _if (@$"is_[Lead]" Key) Hit Miss
+    | // OP-5b: multi-tag predicates (text?, list?).  Re-evaluate
+    | // `(_tag Key)` per branch (cheap O_TAG read + FXN-wrap);
+    | // an attempt to bind it once via let_ surprisingly didn't
+    | // preserve identity in early prototypes.  Hit duplicates N
+    | // times for an N-tag predicate -- bounded since the worst
+    | // case is `list?` with 4 tags and pattern-arm bodies are
+    | // typically small.
+    | Tags tags_for_predicate Lead
+    | if got Tags
+        then ret: build_tag_chain_simple Key Tags Hit Miss
+    | ret: form: _if (@$"is_[Lead]" Key) Hit Miss
   | Hole =  [_quote Hole]
 | ret: if Hole.is_text then [let_ [[Hole Key]] Hit]
        else [_if ['><' Hole Key] Hit Miss]
