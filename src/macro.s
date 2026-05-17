@@ -2109,21 +2109,28 @@ mex_table Xs =
   if got Var: Tbl = form @| Var $@Tbl
   Tbl
 
+// MACRO-2: short-circuit the list-pattern checks (1, 3, 4) when X
+// is not a list -- the common case for plain function/macro calls.
+// Most macroexpand_normal invocations hit the non-list path, and
+// each skipped `case X [...]` is ~20-30 ns; the `Xs.locate`
+// args-splat scan also gets a fast bypass when no list-shape
+// special is possible.
 mex_try_special X Xs =
-  less Xs.end: case X [`.`+`$` @_]:
-    case Xs [[`:` _ _]]:
-      Xs = [Xs] //escape, otherwise `()` treat it as O(:) matcher
-    ret: mex:: `()` X @Xs
+  when X.is_list:
+    less Xs.end: case X [`.`+`$` @_]:
+      case Xs [[`:` _ _]]:
+        Xs = [Xs] //escape, otherwise `()` treat it as O(:) matcher
+      ret: mex:: `()` X @Xs
+    case X [`!` _]: ret: mex: mex_table [X@Xs]
+    case X [`@` Z]:
+      case Z nullary_,N: Z = N
+      case Z [N @Zs]:
+        Z = N
+        Xs =: @Zs @Xs
+      ret: mex [_mcall Xs.~ Z @Xs.lead] //method call
   when X >< `!`:
     case Xs [[`!`_]@_]: ret: mex: mex_table Xs
     ret: mex: mex_table [[X@Xs]]
-  case X [`!` _]: ret: mex: mex_table [X@Xs]
-  case X [`@` Z]:
-    case Z nullary_,N: Z = N
-    case Z [N @Zs]:
-      Z = N
-      Xs =: @Zs @Xs
-    ret: mex [_mcall Xs.~ Z @Xs.lead] //method call
   when got Xs.locate($0 [`@` X]=>1):
     when X >< _mcall: ret: mex: form:
       _mcall [$(Xs.0) $@(Xs.drop(2))] apply_method (_method $(Xs.1))
