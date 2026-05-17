@@ -110,12 +110,12 @@ extern uint32_t amFinalizerHook;
 #define AM_VOID(o) (*((void **)&LGET8((o),1)))
 
 #define AM_TYPE(o) (O_CODE(o)&0xFF)
-#define AM_SET_TYPE(o,v) O_SET_CODE(o, (O_CODE(o)&~(uint32_t)0xFF)|(v))
+#define AM_SET_TYPE(o,v) O_CODE(o) = ((O_CODE(o)&~(uint32_t)0xFF)|(v))
 
 //the age of the youngest object it holds
 #define AM_YOUNGEST(o) (O_CODE(o)>>8)
 #define AM_SET_YOUNGEST(o,v) \
-  O_SET_CODE(o, (O_CODE(o)&~(uint32_t)0xFFFF00)|((v)<<8))
+  O_CODE(o) = ((O_CODE(o)&~(uint32_t)0xFFFF00)|((v)<<8))
 
 
 #define AM_OLDER(hm,v) (!IMMEDIATE(v) && AM_YOUNGEST(hm) > O_AGE(v))

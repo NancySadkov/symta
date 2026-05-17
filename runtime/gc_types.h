@@ -75,15 +75,15 @@ again:;
   //GC them in one loop, so stack space wont be an issue.
   while (!IMMEDIATE(o) && O_TAG(o) == T_CONS) {
     void *oo_ = (void*)(o);
-    /* RT-4: moved flag in theap0; age inline. */
-    if (O_IS_MOVED(oo_)) {
-      o = O_RELOC(oo_); /*already moved*/
-      break;
-    }
     uint32_t hg_ = O_AGE(oo_);
     if (hg_ != GC_AGE) {
-      o = oo_; /*older gen*/
-      break;
+      if (hg_ == GC_MOVED) {
+        o = O_RELOC(oo_); /*already moved*/
+        break;
+      } else {
+        o = oo_; /*older gen*/
+        break;
+      }
     }
 
     void *prev = p;
@@ -175,10 +175,7 @@ GCDEF(gc_custom)
   uint64_t tag = O_TAG(o);
   size = types[tag].size;
   OBJECT(p, tag, size);
-  /* RT-4: O_SET_CODE preserves p's inline age (just set by
-   * gc_alloc to hgp->age); copying source's full `code` would
-   * clobber it with source's age. */
-  O_SET_CODE(p, O_CODE(o));
+  O_CODE(p) = O_CODE(o);
   GC_REDIR(o,p);
   pp = (void**)&LGET(p,0);
   oo = (void**)&LGET(o,0);

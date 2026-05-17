@@ -71,10 +71,9 @@ int fixtext_size(void *o) {
 
 void *alloc_textdata(int l) {
   void *r;
-  /* RT-4 prep: bigtext data origin is now LGET(o, 0).  Size the
-   * data area to cover the whole length starting at slot 0 --
-   * no more "first 4 bytes overlap with the code field" deal. */
-  int nwords = ((l + ALIGN_MASK) >> ALIGN_BITS); // div word size and align
+  int a = l - 4; //-4 since we use the O_CODE field
+  if (a < 0) a = 0;
+  int nwords = ((a+ALIGN_MASK)>>ALIGN_BITS); // div word size and align
   OBJECT(r, T_TEXT, nwords);
   BIGTEXT_SIZE(r) = (uint32_t)l;
   return r;
@@ -105,8 +104,9 @@ void *bytes_to_text(uint8_t *bytes, int size) {
 
 void *alloc_bytes(int l) {
   void *r;
-  /* RT-4: bytes data origin is LGET(o, 0). */
-  int nwords = (l + ALIGN_MASK) >> ALIGN_BITS;
+  int a = l - 4; //-4 since we use the O_CODE field
+  if (a < 0) a = 0;
+  int nwords = (a+ALIGN_MASK)>>ALIGN_BITS; // div word size and align
   OBJECT(r, T_BYTES, nwords);
   BYTES_SIZE(r) = (uint32_t)l;
   return r;
@@ -772,7 +772,7 @@ BUILTIN3("list.`=`",view_set,C_ANY,o,C_INT,index,C_ANY,value)
     for (int i = 0; i < size; i++) {
       pp[i] = oo[i];
     }
-    O_SET_CODE(o, 0); /* VIEW_START -- view now at offset 0 in base */
+    VIEW_START(o) = 0;
     VIEW_BASE(o) = VIEW_STRIP_SHARED(r); //personal copy, so not shared
   }
   uint64_t uindex = (uint64_t)UNFXN(index);
@@ -1639,7 +1639,7 @@ RETURNS(R)
 BUILTIN1("get_meta_",get_meta_,C_ANY,o)
 RETURNS(FXN((int64_t)O_CODE(o)))
 BUILTIN2("set_meta_",set_meta_,C_ANY,o,C_ANY,v)
-  O_SET_CODE(o, (uint32_t)UNFXN(v));
+  O_CODE(o) = (uint32_t)UNFXN(v);
   /* RT-5: if the user just rewired O_CODE for a closure, the
    * dispatch the closure resolves to has changed.  Mirror the
    * new hooks_heap entry into the inline slots so the next

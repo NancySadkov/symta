@@ -15,18 +15,17 @@ static int gc_cycle = 0;
 
 #define GC_AGE (api.hgp-1)->age
 
-/* RT-4: moved sentinel in theap0 (O_IS_MOVED), age inline. */
 #define GC_REC3(dst,o,mover) { \
   void *oo_ = (void*)(o); \
-  if (O_IS_MOVED(oo_)) { \
-    dst = O_RELOC(oo_); /*already moved*/ \
-  } else { \
-    uint32_t hg_ = O_AGE(oo_); \
-    if (hg_ != GC_AGE) { \
-      dst = oo_; /*older gen*/  \
+  uint32_t hg_ = O_AGE(oo_); \
+  if (hg_ != GC_AGE) { \
+    if (hg_ == GC_MOVED) { \
+      dst = O_RELOC(oo_); /*already moved*/ \
     } else { \
-      dst = mover; \
+      dst = oo_; /*older gen*/  \
     } \
+  } else { \
+    dst = mover; \
   } \
 }
 
@@ -43,13 +42,9 @@ static int gc_cycle = 0;
   }                      \
 }
 
-/* RT-4: redirect marker in theap0; the inline age byte in the
- * header is destroyed by the redirect-pointer write, but
- * O_IS_MOVED reads theap0 not the header. */
-#define GC_REDIR(o,p) do { \
-  api.theap0[O_GID(o)-1] = GC_MOVED; \
-  O_RELOC(o) = (p); \
-} while (0)
+//place redirection to the new location of the object
+//if O_AGE(o) is not GCGen, then it is already moved
+#define GC_REDIR(o,p) O_AGE(o) = GC_MOVED; O_RELOC(o) = p;
 
 
 static void *gc_immediate(void *o) {
@@ -220,7 +215,7 @@ static void gc_older_gens(hg_t *src, hg_t *dst) {
   }
 }
 
-#define GC_IS_MOVED(o) (!IMMEDIATE(o) && O_IS_MOVED(o))
+#define GC_IS_MOVED(o) (!IMMEDIATE(o) && O_AGE(o) == GC_MOVED)
 
 void gc_finalizers(hg_t *src, hg_t *dst) {
   int n = arrlen(src->finalizers);
@@ -335,13 +330,13 @@ void gc_hg(hg_t *src, hg_t *dst) {
         ihSet(&fresh, key, val);
         continue;
       }
-      /* RT-4: moved flag in theap0; real age inline. */
-      if (O_IS_MOVED(key)) {
+      uint32_t age = O_AGE(key);
+      if (age == GC_MOVED) {
         /* Alive.  Forward both key and value to the new gen. */
         dyn new_key = (dyn)O_RELOC(key);
         if (!IMMEDIATE(val)) GC_REC(val, val);
         ihSet(&fresh, new_key, val);
-      } else if (O_AGE(key) == src->age) {
+      } else if (age == src->age) {
         /* Dead -- drop entry. */
       } else {
         /* Older generation -- this collection didn't touch the key.
@@ -421,15 +416,9 @@ void *gc_alloc(uint32_t tag, uint32_t size) {
   uintptr_t tmp_h = (uintptr_t)h;
   hgp->top = (void**)tmp_h;
   h->size = size;
-  /* RT-4: write age BOTH inline (high byte of code) AND in
-   * theap0[gid-1].  The inline path is the hot LSET-barrier
-   * source for non-CONS objects; theap0 stays the authoritative
-   * source for T_CONS (whose CAR overlays the gc_head_t) and
-   * the carrier for the GC_MOVED relocation flag. */
-  h->code = (uint32_t)hgp->age << 24;
   //hgp->theap[((void**)r - hgp->heap)] |= TG_OBJECT; //FIXNE: not required
   r = HEAPREF(TAGIFY(PTRENC(r), tag));
-  api.theap0[O_GID(r)-1] = hgp->age;
+  O_AGE(r) = hgp->age;
   return r;
 }
 
