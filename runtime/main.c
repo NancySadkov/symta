@@ -283,7 +283,8 @@ void add_method_r(int depth, int type_id
      * an error -- usually a real bug. */
     if (method_id == api.m_equal || method_id == api.m_ne_
      || method_id == m_lte || method_id == m_gt || method_id == m_gte
-     || method_id == api.m_underscore) {
+     || method_id == api.m_underscore
+     || method_id == api.m_call) {
       goto replace;
     }
     rterr("add_method: redefining %s.%s"
@@ -668,6 +669,7 @@ void init_types() {
   api.m_hash = resolve_method("hash");
   api.m_equal = resolve_method("><");
   api.m_ne_ = resolve_method("<>");
+  api.m_call = resolve_method("()");  /* RT-9 whitelist */
 
   intern("int");
   intern("float");

@@ -1083,6 +1083,26 @@ BUILTIN2("list.apply_method",list_apply_method,C_ANY,as,C_ANY,m)
   CALL(R,fn);
 RETURNS(R)
 
+/* RT-9: C-side replacement for the Symta-side `fn.\`()\` @As =
+ * As.apply(Me)`.  The Symta-side defn was the top emitter of
+ * size-1 LIST allocations on the ./game compile -- every
+ * single-arg closure call (`f(x)`) allocated a size-1 LIST for
+ * the @As collection just to immediately unpack it back in
+ * As.apply.  This C-side variant skips the @As collection
+ * entirely: it shifts api.args left by one slot to drop the
+ * receiver, decrements the size, and CALLs the closure
+ * directly.  No new LIST is allocated. */
+BUILTIN_VARARGS("fn.`()`", fn_call)
+  dyn me = getArg(0);  /* receiver = the closure */
+  uint32_t n = LIST_SIZE(api.args);
+  /* Shift api.args[1..n-1] -> api.args[0..n-2], shrink size. */
+  for (uint32_t i = 1; i < n; i++) {
+    lsetm(api.args, i - 1, LGET(api.args, i));
+  }
+  O_SIZE(api.args) = n - 1;
+  CALL(R, me);
+RETURNS(R)
+
 
 BUILTIN1("float.neg",float_neg,C_ANY,a)
   float fa;
@@ -1819,6 +1839,21 @@ static void show_alloc_stats() {
       fprintf(stderr, "  size %-3u  %lu\n", b, (unsigned long)alloc_stats.list_size_bucket[b]);
     else
       fprintf(stderr, "  size 15+  %lu\n", (unsigned long)alloc_stats.list_size_bucket[b]);
+  }
+  /* RT-9: element-type distribution for size-1 LIST allocations
+   * caught at the SBC_LIST1 store moment (LITERAL `[X]` subset). */
+  uint64_t total_l1 = 0;
+  for (uint32_t t = 0; t < 32; t++) total_l1 += alloc_stats.list1_elem_tag[t];
+  if (total_l1) {
+    fprintf(stderr, "size-1 LIST element types (LITERAL [X] subset, %lu samples):\n",
+            (unsigned long)total_l1);
+    for (uint32_t t = 0; t < 32; t++) {
+      if (!alloc_stats.list1_elem_tag[t]) continue;
+      char *name = (t < (uint32_t)arrlen(types) && types[t].name) ? types[t].name : "?";
+      double pct = (100.0 * (double)alloc_stats.list1_elem_tag[t] / (double)total_l1);
+      fprintf(stderr, "  %-12s %10lu  %5.1f%%\n", name,
+              (unsigned long)alloc_stats.list1_elem_tag[t], pct);
+    }
   }
 
   /* RT-9: top-N caller-pin attribution for T_LIST.  Walk the
@@ -3079,6 +3114,11 @@ void init_builtin_methods() {
   METHOD_FN1("=col", T_TOK, b_tok_scol);
   METHOD_FN1("=orig", T_TOK, b_tok_sorig);
   METHOD_FN1("=parsed", T_TOK, b_tok_sparsed);
+
+  /* RT-9: register the C-side fn.() handler for T_CLOSURE.
+   * Replaces the Symta-side `fn.\`()\` @As = As.apply(Me)` whose
+   * @As collection was the top emitter of size-1 LIST allocs. */
+  METHOD_FN1("()", T_CLOSURE, b_fn_call);
 
   m_add = resolve_method("+");
   m_sub = resolve_method("-");

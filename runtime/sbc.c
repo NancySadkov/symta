@@ -968,6 +968,13 @@ dyn sbc_exec_fn(uint8_t *pin) {
     CHKREG(dst); CHKREG(x);
     LIST(L[dst], 1);
     LGET(L[dst], 0) = L[x];
+    /* RT-9 measurement: count what element type ends up in
+     * size-1 LISTs.  Tells us which `T_LIST1_<tag>` tagged-
+     * immediate variants would be worth implementing. */
+    {
+      uint64_t etag = O_TAG(L[x]);
+      if (etag < 32) alloc_stats.list1_elem_tag[etag]++;
+    }
     BREAK;}
   OP(SBC_MOVEEMT) {
     int dst = RD16;

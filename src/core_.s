@@ -92,7 +92,9 @@ Example:  methods 42          // table of int methods"
 | Object^methods_.t
 
 _.`()` A = A.Me
-fn.`()` @As = As.apply(Me)
+// RT-9: fn.`()` is now a C-side BUILTIN_VARARGS in runtime/bltin.c
+// (b_fn_call) -- avoids the @As collection that previously made it
+// the top emitter of size-1 LIST allocations.
 
 _.`{}` F = $map(F)
 

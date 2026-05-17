@@ -356,6 +356,14 @@ typedef struct {
   uint64_t list_size_bucket[16]; /* [0]=size 0, [1]=1, ..., [14]=14,
                                     [15]=15+ (saturating bucket) */
   alloc_pin_count_t pin_counts[ALLOC_ATTRIB_BUCKETS]; /* T_LIST only */
+  /* RT-9: element-tag distribution for size-1 LIST allocations.
+   * Indexed by O_TAG of LGET(list, 0).  Counts which tags would
+   * benefit from a `T_LIST1_<tag>` tagged-immediate encoding
+   * that puts the size-1 list entirely in the dyn payload (no
+   * heap alloc).  Captured at the size-1-store moment in
+   * SBC_LIST1 + SBC_FXNLSET (when target is a freshly-allocated
+   * size-1 LIST). */
+  uint64_t list1_elem_tag[32];
 } alloc_stats_t;
 extern alloc_stats_t alloc_stats;
 

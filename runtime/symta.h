@@ -332,6 +332,10 @@ struct api_t {
    * default identity comparator on T_OBJECT can be registered, and
    * by add_method's redefinition special-case (latest wins). */
   int m_ne_;
+  /* RT-9: `()` method id -- needed by add_method redefinition
+   * whitelist so the C-side `fn.()` handler can override the
+   * Symta-side def (or vice versa, latest wins). */
+  int m_call;
   char* (*print_object_f)(void *object);   /* error/trace path */
   void *(*alloc)(uint32_t tag, uint32_t size);   /* one-time init */
   void (*gc)();          /* explicit-gc builtin (RT-2) */
