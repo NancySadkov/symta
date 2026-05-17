@@ -133,6 +133,7 @@ void sif_loader_init() {
   shput(asmsbc,"arglist"   ,SBC_ARGLIST);
   shput(asmsbc,"starg"     ,SBC_STARG);
   shput(asmsbc,"list"      ,SBC_LIST);
+  shput(asmsbc,"list1"     ,SBC_LIST1);
   shput(asmsbc,"list2"     ,SBC_LIST2);
   shput(asmsbc,"mv"        ,SBC_MOVE);
   shput(asmsbc,"st"        ,SBC_STOR);

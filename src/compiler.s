@@ -390,6 +390,18 @@ uniquify Expr = //gives each variables unique name
 
 ssa_list K Xs =
 | less Xs.n: ret: ssa mv K 'Empty'
+| when Xs.n >< 1:
+  | // RT-9: fused size-1 list literal.  Size-1 is the most
+  | // common bucket (65% of alloc traffic); the LITERAL subset
+  | // shrinks by one dispatch per [X].  Preserve the legacy
+  | // [0] optimization: bare SBC_LIST 1 leaves the slot at the
+  | // default 0 value, so no store is needed.
+  | when 0><Xs.0:
+    | ssa list K 1
+    | ret
+  | A Xs.0^ev
+  | ssa list1 K A
+  | ret
 | when Xs.n >< 2:
   | // RT-9: fused size-2 list literal -- SBC_LIST2 K A B allocates
   | // and stores in one opcode (vs SBC_LIST + 2x SBC_STOR).

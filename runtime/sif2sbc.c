@@ -397,6 +397,15 @@ uint8_t *sif2sbc(sif_t *sif) {
       EMIT16(a);
       EMIT16(b);
       break;}
+    case SBC_LIST1: {
+      /* RT-9: fused size-1 list allocation.  SIF form:
+       *   list1 <dst> <x> */
+      int dst = refidx(as[1]);
+      int x   = refidx(as[2]);
+      EMIT8(SBC_LIST1);
+      EMIT16(dst);
+      EMIT16(x);
+      break;}
     case SBC_MOVE: {
       if (!strcmp(as[2],"Empty")) {
         int dst = refidx(as[1]);

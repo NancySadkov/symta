@@ -671,6 +671,7 @@ dyn sbc_exec_fn(uint8_t *pin) {
     [SBC_SAME] = &&L_SBC_SAME,
     [SBC_VARY] = &&L_SBC_VARY,
     [SBC_LIST2] = &&L_SBC_LIST2,
+    [SBC_LIST1] = &&L_SBC_LIST1,
     [SBC_TINIT] = &&L_SBC_TINIT,
     [SBC_TINITI] = &&L_SBC_TINITI,
     [SBC_SUBTYPE] = &&L_SBC_SUBTYPE,
@@ -958,6 +959,15 @@ dyn sbc_exec_fn(uint8_t *pin) {
     LIST(L[dst], 2);
     LGET(L[dst], 0) = L[a];
     LGET(L[dst], 1) = L[b];
+    BREAK;}
+  OP(SBC_LIST1) {
+    /* RT-9: fused size-1 list allocation.  Replaces SBC_LIST 1 +
+     * SBC_ST4_0 for `[X]` literals.  Args: dst u16, x u16. */
+    uint32_t dst = RD16;
+    uint32_t x = RD16;
+    CHKREG(dst); CHKREG(x);
+    LIST(L[dst], 1);
+    LGET(L[dst], 0) = L[x];
     BREAK;}
   OP(SBC_MOVEEMT) {
     int dst = RD16;

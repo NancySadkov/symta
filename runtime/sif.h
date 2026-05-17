@@ -209,7 +209,14 @@ enum {
                           count for [A B] literals from 3 to 1
                           (size-2 LISTs are 24.6% of all alloc
                           traffic; ~130 M per ./game compile). */
-/*A2*/ SBC_UNUSEDA2,
+/*A2*/ SBC_LIST1,        /* RT-9: fused size-1 list allocation.
+                          Single opcode replaces SBC_LIST 1 +
+                          SBC_ST4_0 for [X] literals.  Size-1
+                          LISTs are 65.5% of alloc traffic
+                          (348 M per ./game compile); SBC_LIST1
+                          only optimises the LITERAL subset
+                          (runtime `_listn 1` from `dup N` still
+                          goes through SBC_FXNLISTN). */
 /*A3*/ SBC_UNUSEDA3,
 /*A4*/ SBC_UNUSEDA4,
 /*A5*/ SBC_UNUSEDA5,
