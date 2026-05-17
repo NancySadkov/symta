@@ -51,6 +51,29 @@ mex_error Message =
 
 source_ = [_quote GSrc]
 
+//MACRO-1: macro-expansion trace.  To enable, add a line
+//`##NCM_TRACE_MACROS 1` (without the leading `##` escape --
+//the escape is here so this comment doesn't itself define the
+//macro!) immediately before the `#if #NCM_TRACE_MACROS` block
+//below.  ncm then splices the trace-emit body into mtrace_say
+//and wraps each entry point with a trace call.  When the macro
+//is undefined, ncm elides every `#if` block byte-for-byte --
+//the drift test's 5-stage bootstrap reaches fixed point in one
+//round either way.
+//
+//Output format: one line per entry, prefixed by GExpansionDepth
+//for cheap hierarchical context (mex bumps the depth on every
+//recursive call, so indented reading is automatic).  Wire format
+//is human-readable; upgrade to JSONL once we know what fields
+//we actually want to grep on.
+//
+//Wrapped entry points: macroexpand, mex, mex_normal,
+//expand_hole_term, mexlet.
+
+#if #NCM_TRACE_MACROS
+mtrace_say Name X = say "[GExpansionDepth]> [Name]: [X]"
+#endif
+
 is_var_sym X = X.is_text and not X.is_keyword
 
 is_list_case V =
@@ -204,6 +227,9 @@ tag_for_predicate Name =
   else No
 
 expand_hole_term Key Hole Hit Miss =
+#if #NCM_TRACE_MACROS
+| mtrace_say \expand_hole_term [Key Hole]
+#endif
 | when Hole >< '_': ret Hit
 | when Hole >< '~':
    say "~ is obsolete"
@@ -406,7 +432,11 @@ has_head Head Xs =
     else Xs.any(X=>has_head Head X)
   else 0
 
-mexlet @As = case As
+mexlet @As =
+#if #NCM_TRACE_MACROS
+| mtrace_say \mexlet As
+#endif
+| case As
   [[@Bs] Body]
   | NBs map [Expr Value] Bs:
     | Noun,Name case Expr
@@ -2066,6 +2096,9 @@ mex_try_special X Xs =
   0
 
 mex_normal X Xs Rec =
+#if #NCM_TRACE_MACROS
+| mtrace_say \mex_normal [X@Xs]
+#endif
 | when GExpansionDepth > GExpansionDepthLimit:
   | mex_error "macroexpansion depth exceed at [[X@Xs]]"
 | Macro when X.is_keyword:
@@ -2136,6 +2169,9 @@ hcase MexFormCases Expr ()
   [`&` O] | if O.is_keyword then O else bad "implement `&Var` ([O])" // [O^mex]
 
 mex ExprIn =
+#if #NCM_TRACE_MACROS
+| mtrace_say \mex ExprIn
+#endif
 | when no GMacros: mex_error 'lib_path got clobbered again'
 | Expr normalize_nesting ExprIn
 | when Expr.is_text
@@ -2156,6 +2192,9 @@ mex ExprIn =
 | R
 
 macroexpand Expr Macros ModuleCompiler ModuleFolders =
+#if #NCM_TRACE_MACROS
+| mtrace_say \macroexpand Expr
+#endif
 | let GMacros Macros
       GExpansionDepth 0
       GExports []

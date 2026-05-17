@@ -362,8 +362,18 @@ static int isopchrF(ncm_state *this, int c) {
   return c && !issymchr(c) && !isspace(c)
          && c != MCH && c != '\\'
          && c != '\"' && c != '\''
-         //uncomment if your language uses ` as string operator
-         //&& c != '\`'
+         /* Symta uses backtick as an operator-quoting delimiter
+          * (`[\`=>\` A B]` etc.); `isquote` already includes it.
+          * Without this exclusion `get_op` consumes the opening
+          * backtick as part of a longer op-name, leaving the
+          * closing backtick to be parsed as a *new* opening
+          * quote that runs to EOF -- silently swallowing any
+          * `#if`/`#endif` directives that follow.  Failure mode
+          * was: `#if NCM_TRACE_MACROS` in macro.s positioned
+          * after an `[\`OP\`...]` line stopped being recognised
+          * as a directive and leaked verbatim into Symta
+          * source, breaking the bootstrap drift test. */
+         && c != '`'
          && c != '(' && c != ')'
          && c != '{' && c != '}'
          && c != '>';
