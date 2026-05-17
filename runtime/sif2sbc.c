@@ -383,6 +383,20 @@ uint8_t *sif2sbc(sif_t *sif) {
         EMIT16(size);
       }
       break;}
+    case SBC_LIST2: {
+      /* RT-9: fused size-2 list allocation.  SIF form:
+       *   list2 <dst> <a> <b>
+       * Compiler emits this when ssa_list sees Xs.n == 2 and
+       * both elements are simple (non-aggregate) values that
+       * map straight to register refs. */
+      int dst = refidx(as[1]);
+      int a   = refidx(as[2]);
+      int b   = refidx(as[3]);
+      EMIT8(SBC_LIST2);
+      EMIT16(dst);
+      EMIT16(a);
+      EMIT16(b);
+      break;}
     case SBC_MOVE: {
       if (!strcmp(as[2],"Empty")) {
         int dst = refidx(as[1]);

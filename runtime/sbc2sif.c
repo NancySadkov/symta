@@ -160,6 +160,12 @@ void sbc_dasm_sub(dasm_t *dasm) {
     arrput(as, afmt(0,"L[%d]",RD16));
     arrput(as, afmt(0,"%d",RD16));
     break;}
+  case SBC_LIST2: {
+    /* RT-9: fused size-2 list literal */
+    arrput(as, afmt(0,"L[%d]",RD16));
+    arrput(as, afmt(0,"L[%d]",RD16));
+    arrput(as, afmt(0,"L[%d]",RD16));
+    break;}
   case SBC_MOVEEMT: {
     as[0] = afmt(0,"mv");
     arrput(as, afmt(0,"L[%d]",RD16));
@@ -696,6 +702,12 @@ sif_t *sbc2sif(char *filename) {
     case SBC_LIST: {
       arrput(as, afmt(0,"L[%d]",RD16));
       arrput(as, afmt(0,"%d",RD16));
+      break;}
+    case SBC_LIST2: {
+      /* RT-9 */
+      arrput(as, afmt(0,"L[%d]",RD16));
+      arrput(as, afmt(0,"L[%d]",RD16));
+      arrput(as, afmt(0,"L[%d]",RD16));
       break;}
     case SBC_MOVEEMT: {
       as[0] = afmt(0,"mv");

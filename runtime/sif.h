@@ -203,7 +203,12 @@ enum {
                           side table so no LSRC bytes are ever
                           emitted; the SIF-side `SBC_LSRC` is
                           now a virtual opcode (see below). */
-/*A1*/ SBC_UNUSEDA1,
+/*A1*/ SBC_LIST2,        /* RT-9: fused size-2 list allocation.
+                          Single opcode replaces SBC_LIST 2 +
+                          SBC_ST4_0 + SBC_ST4_1.  Cuts dispatch
+                          count for [A B] literals from 3 to 1
+                          (size-2 LISTs are 24.6% of all alloc
+                          traffic; ~130 M per ./game compile). */
 /*A2*/ SBC_UNUSEDA2,
 /*A3*/ SBC_UNUSEDA3,
 /*A4*/ SBC_UNUSEDA4,

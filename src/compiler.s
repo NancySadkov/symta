@@ -390,13 +390,22 @@ uniquify Expr = //gives each variables unique name
 
 ssa_list K Xs =
 | less Xs.n: ret: ssa mv K 'Empty'
+| when Xs.n >< 2:
+  | // RT-9: fused size-2 list literal -- SBC_LIST2 K A B allocates
+  | // and stores in one opcode (vs SBC_LIST + 2x SBC_STOR).
+  | // size-2 LISTs are ~25% of all alloc traffic on a ./game compile;
+  | // this cuts their bytecode dispatch count 3:1.
+  | A Xs.0^ev
+  | B Xs.1^ev
+  | ssa list2 K A B
+  | ret
 | ssa list K Xs.n
 | H Xs.0
 | less H.is_list: when Xs.all(H):
-  | when 0><H: ret  
+  | when 0><H: ret
   | V ev H
   | for [I X] Xs.i: ssa st K I V
-  | ret  
+  | ret
 | for [I X] Xs.i: when X: ssa st K I X^ev
 
 ssa_data K Type Xs =

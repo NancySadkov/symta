@@ -670,6 +670,7 @@ dyn sbc_exec_fn(uint8_t *pin) {
     [SBC_FXNSHR] = &&L_SBC_FXNSHR,
     [SBC_SAME] = &&L_SBC_SAME,
     [SBC_VARY] = &&L_SBC_VARY,
+    [SBC_LIST2] = &&L_SBC_LIST2,
     [SBC_TINIT] = &&L_SBC_TINIT,
     [SBC_TINITI] = &&L_SBC_TINITI,
     [SBC_SUBTYPE] = &&L_SBC_SUBTYPE,
@@ -941,6 +942,22 @@ dyn sbc_exec_fn(uint8_t *pin) {
     uint32_t size = RD16;
     CHKREG(dst);
     LIST(L[dst],size);
+    BREAK;}
+  OP(SBC_LIST2) {
+    /* RT-9: fused size-2 list allocation.  Replaces the 3-opcode
+     * sequence SBC_LIST 2 + SBC_ST4_0 + SBC_ST4_1 used to emit
+     * `[A B]` literals.  Args: dst u16, a u16, b u16 (8 B total
+     * vs 4 + 2 + 2 = 8 B for the old sequence -- code size
+     * unchanged, but dispatch count drops 3:1, and for the
+     * 130 M size-2 LISTs in a ./game compile that's ~260 M
+     * fewer opcode dispatches). */
+    uint32_t dst = RD16;
+    uint32_t a = RD16;
+    uint32_t b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    LIST(L[dst], 2);
+    LGET(L[dst], 0) = L[a];
+    LGET(L[dst], 1) = L[b];
     BREAK;}
   OP(SBC_MOVEEMT) {
     int dst = RD16;
