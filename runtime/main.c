@@ -31,7 +31,7 @@ void *main_args;
 static char *version = "1.1";
 
 
-method_node_t *sink;
+dyn sink;  /* RT-6b: default sink fn (was method_node_t*) */
 
 lib_expts_t lib_expts;
 
@@ -59,10 +59,6 @@ type_t *types;
 
 collector_t *collectors;
 
-
-
-method_node_t **method_pages;
-int nmethods;
 
 
 void **method_names;
@@ -98,7 +94,8 @@ dyn get_method_name(uint32_t method_id) {
   return method_names[method_id];
 }
 
-/* RT-6: probe-based dispatch.  See method_slot_t in common.h. */
+/* RT-6/RT-6b: probe-based dispatch with inline fn.
+ * See method_slot_t in common.h. */
 
 dyn get_method(int method_id, dyn object) {
   type_t *t = types + O_TAG(object);
@@ -107,21 +104,23 @@ dyn get_method(int method_id, dyn object) {
   method_slot_t *ms = t->methods;
   for (;;) {
     uint32_t slot_mid = ms[i].mid;
-    if (!slot_mid) return t->sink->fn;
-    if (slot_mid == (uint32_t)method_id) return ms[i].node->fn;
+    if (!slot_mid) return t->sink_fn;
+    if (slot_mid == (uint32_t)method_id) return ms[i].fn;
     i = (i + 1) & mask;
   }
 }
 
-method_node_t *get_method_node(int method_id, int tag) {
+/* RT-6b: same probe by raw tag (no dyn object handy).  Used by
+ * MCACHE_CALL on miss to fill `(tid, mid, fn)` into the cache. */
+dyn get_method_for_tag(int method_id, int tag) {
   type_t *t = types + tag;
   uint32_t mask = t->method_cap - 1;
   uint32_t i = (uint32_t)method_id & mask;
   method_slot_t *ms = t->methods;
   for (;;) {
     uint32_t slot_mid = ms[i].mid;
-    if (!slot_mid) return t->sink;
-    if (slot_mid == (uint32_t)method_id) return ms[i].node;
+    if (!slot_mid) return t->sink_fn;
+    if (slot_mid == (uint32_t)method_id) return ms[i].fn;
     i = (i + 1) & mask;
   }
 }
@@ -205,41 +204,19 @@ intptr_t intern(char *name) {
   arrput(collectors,gc_custom);
 
   if (!sink) init_root_sink();
-  t->sink = sink; //default sink method
+  t->sink_fn = sink; //default sink method
 
   api.hgp->dirty |= DRT_TYPES;
 
   return index;
 }
 
-/* Allocate a stable method_node_t in the page-arena (for mcache
- * pointer stability) and return its pointer.  Caller inserts
- * into the type's slot table separately via insert_method. */
-static method_node_t *alloc_method_node(int tid, int mid, void *handler) {
-  method_node_t *page;
-  int page_ofs = nmethods & METHODS_PAGE_MASK;
-  if (page_ofs) {
-    page = method_pages[nmethods>>METHODS_PAGE_BITS];
-  } else {
-    page = malloc(METHODS_PAGE_SIZE*sizeof(method_node_t));
-    arrput(method_pages,page);
-  }
-  method_node_t *m = page + page_ofs;
-  m->mid = mid;
-  m->tid = tid;
-  m->fn = handler;
-  m->next = 0;
-  api.hgp->dirty |= DRT_TYPE_METHODS;
-  ++nmethods;
-  return m;
-}
-
-/* Insert (mid, node) into t's slot table.  Resizes first if the
- * load factor would exceed 75 %.  If a slot for `mid` already
- * exists, just overwrites its `node` (used both for the bootstrap-
+/* RT-6b: insert (mid, fn) into t's slot table.  Resizes first if
+ * the load factor would exceed 75 %.  If a slot for `mid` already
+ * exists, just overwrites its `fn` (used both for the bootstrap-
  * SBC-overrides-C-handler case and for the user-redefinition
  * whitelist path). */
-static void insert_method(type_t *t, int mid, method_node_t *node) {
+static void insert_method(type_t *t, int mid, dyn fn) {
   if (t->method_count + 1 >= (t->method_cap * 3) / 4) {
     resize_method_table(t);
   }
@@ -248,7 +225,8 @@ static void insert_method(type_t *t, int mid, method_node_t *node) {
     s->mid = (uint32_t)mid;
     t->method_count++;
   }
-  s->node = node;
+  s->fn = fn;
+  api.hgp->dirty |= DRT_TYPE_METHODS;
 }
 
 static void inherit_methods(type_t *parent, type_t *child) {
@@ -259,9 +237,7 @@ static void inherit_methods(type_t *parent, type_t *child) {
     int mid = (int)pms[i].mid;
     /* Skip if the child already defines its own version of mid. */
     if (find_method_slot(child, mid)) continue;
-    method_node_t *n = pms[i].node;
-    method_node_t *m = alloc_method_node(child->id, mid, n->fn);
-    insert_method(child, mid, m);
+    insert_method(child, mid, pms[i].fn);
   }
 }
 
@@ -276,27 +252,26 @@ void add_subtype(int tag, int subtag) {
   inherit_methods(&types[tag], &types[subtag]);
 }
 
-method_node_t *add_method_r(int depth, int type_id
-                           ,int method_id, void *handler) {
+void add_method_r(int depth, int type_id
+                 ,int method_id, void *handler) {
   type_t *s, *t = &types[type_id];
 
   if (depth == ADD_CORE_SINK) {
-    method_node_t *m = alloc_method_node(type_id, method_id, handler);
-    insert_method(t, method_id, m);
-    return m;
+    insert_method(t, method_id, handler);
+    return;
   }
 
   method_slot_t *n_slot = find_method_slot(t, method_id);
-  method_node_t *n = n_slot ? n_slot->node : 0;
-  if (n) {
+  dyn n_fn = n_slot ? n_slot->fn : 0;
+  if (n_slot) {
     /* Walk the super chain to detect inherited-and-still-matches. */
     for (int si = t->super; si != END_TAG; si = s->super) {
       s = &types[si];
       method_slot_t *m_slot = find_method_slot(s, method_id);
-      if (m_slot && m_slot->node->fn == n->fn) goto inherited;
+      if (m_slot && m_slot->fn == n_fn) goto inherited;
       if (!s->super) break;
     }
-    if (depth) return 0; //subtype already has this method
+    if (depth) return; //subtype already has this method
     /* `_.><` / `_.<>` / `_.<<` / `_.>` / `_.>>` (OP-1, OP-3) and
      * `__` (OP-4: meta.__ direct-dispatch sink) get registered
      * both via the C-side init (fast direct-dispatch handlers)
@@ -316,8 +291,7 @@ method_node_t *add_method_r(int depth, int type_id
 
 replace:
   {
-    method_node_t *m = alloc_method_node(type_id, method_id, handler);
-    insert_method(t, method_id, m);
+    insert_method(t, method_id, handler);
 
     for (int si = t->subtypes; si != END_TAG; si = s->next) {
       s = &types[si];
@@ -325,16 +299,15 @@ replace:
     }
 
     if (method_id == api.m_underscore) {
-      t->sink = m;
+      t->sink_fn = handler;
       api.hgp->dirty |= DRT_TYPES;
     }
-    return m;
   }
 }
 
 
-method_node_t *add_method(int type_id, int method_id, void *handler) {
-  return add_method_r(0, type_id, method_id, handler);
+void add_method(int type_id, int method_id, void *handler) {
+  add_method_r(0, type_id, method_id, handler);
 }
 
 void set_type_size_and_name(int tag, int size, void *name) {

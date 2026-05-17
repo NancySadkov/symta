@@ -1621,14 +1621,14 @@ BUILTIN1("methods_",methods_,C_ANY,o)
   GC_DISABLE();
   R = Empty;
   type_t *t = &types[(int)O_TAG(o)];
-  /* RT-6: walk the packed slot table -- empty slots have mid==0. */
+  /* RT-6/6b: walk the packed slot table -- empty slots have mid==0. */
   for (uint32_t i = 0; i < t->method_cap; i++) {
-    if (!t->methods[i].mid) continue;
-    method_node_t *m = t->methods[i].node;
+    uint32_t mid = t->methods[i].mid;
+    if (!mid) continue;
     void *c, *pair;
     LIST(pair, 2);
-    LGET(pair,0) = method_names[m->mid];
-    LGET(pair,1) = m->fn;
+    LGET(pair,0) = method_names[mid];
+    LGET(pair,1) = t->methods[i].fn;
     CONS(c, pair, R);
     R = c;
   }
@@ -1783,7 +1783,11 @@ static uint64_t show_runtime_info() {
   fprintf(stderr, "heap used: %ld+%ld\n", (long)used0, (long)used1);
   fprintf(stderr, "heap size: %ld\n", (long)(HEAP_SIZE*2));
   fprintf(stderr, "types: %ld\n", arrlen(types));
-  fprintf(stderr, "methods: %d\n", nmethods);
+  /* RT-6b: nmethods retired with the method_pages arena; sum
+   * the per-type slot-table counts instead. */
+  uint64_t total_methods = 0;
+  for (int ti = 0; ti < arrlen(types); ti++) total_methods += types[ti].method_count;
+  fprintf(stderr, "methods: %lu\n", (unsigned long)total_methods);
   fprintf(stderr, "gid_get_ calls: %d\n", prf.gid_get_);
   fprintf(stderr, "gid_set_ calls: %d\n", prf.gid_set_);
   fprintf(stderr, "\n");
@@ -3040,7 +3044,11 @@ void init_root_sink() {
   setup_b_sink();
   dyn sink_fn;
   BUILTIN_CLOSURE(sink_fn, meta_b_sink->hook);
-  sink = add_method_r(ADD_CORE_SINK, T_INT, api.m_underscore, sink_fn);
+  /* RT-6b: `sink` is now the dyn fn itself, not a node pointer.
+   * Set the global BEFORE add_method_r so the caller (`intern()`)
+   * picks up the live value when it writes `t->sink_fn = sink`. */
+  sink = sink_fn;
+  add_method_r(ADD_CORE_SINK, T_INT, api.m_underscore, sink_fn);
 }
 
 

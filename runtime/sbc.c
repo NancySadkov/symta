@@ -453,20 +453,20 @@ int64_t mcache_hits = 0;
 #ifdef SBC_MCACHE
 
 //#define MCACHE_CALL(k,o,_mid) MCALL(k,o,_mid)
-/* The cache hit check has to validate the cached node belongs
+/* The cache hit check has to validate the cached entry belongs
  * to the same `(method_id, type_id)` pair as the current call.
  * Pre-RT-7 SBCs run with `mcache_cnt == 0` -> a single fallback
  * mcache slot that every cache site collides on, so a stale
  * cached entry from a different `m` could otherwise satisfy a
  * tid-only check and dispatch the wrong method.  For RT-7-
- * compiled SBCs each site has its own slot, so `node->mid == m`
+ * compiled SBCs each site has its own slot, so `mce->mid == m`
  * is always true on a hit -- the extra comparison costs ~1
  * cycle per call and the branch predicts cleanly.
  *
- * The third macro parameter is named `_mid` (not `mid`) to
- * avoid colliding with `method_node_t.mid`: a macro parameter
- * named `mid` would text-substitute into `node->mid` and break
- * the build. */
+ * RT-6b: the cache now carries `(tid, mid, fn)` inline (16 B,
+ * one cache line) instead of a `method_node_t*` indirection.
+ * Hit path is one load of fn; miss path probes the per-type
+ * slot table via get_method_for_tag and writes the triple. */
 #define MCACHE_CALL(k,o,_mid) do {            \
     int m = _mid;                            \
     api.method = m;                         \
@@ -474,13 +474,17 @@ int64_t mcache_hits = 0;
     uint32_t _mid_idx = (uint32_t)RD16;     \
     mcache_t *mce = &sbc->mcaches[_mid_idx];\
     uint32_t tid = O_TAG(o);                \
-    method_node_t *node = mce->node;        \
-    if (!node || node->tid != tid || node->mid != m) { \
-      node = get_method_node(m,tid);        \
-      mce->node = node;                     \
+    dyn mfn;                                \
+    if (mce->tid != tid || mce->mid != (uint32_t)m) { \
+      mfn = get_method_for_tag(m,tid);      \
+      mce->tid = tid;                       \
+      mce->mid = (uint32_t)m;               \
+      mce->fn = mfn;                        \
       MCACHE_MISS                           \
-    } else {MCACHE_HIT}                     \
-    dyn mfn = node->fn;                     \
+    } else {                                \
+      mfn = mce->fn;                        \
+      MCACHE_HIT                            \
+    }                                       \
     CALL(k,mfn);                            \
   } while (0)
 #else

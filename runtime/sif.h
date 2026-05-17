@@ -279,9 +279,22 @@ typedef struct sif_t { //Parsed Symta Instructions File
  * code on call-heavy modules); cache writes go to a clean
  * D-side region that the L1 prefetcher and the bytecode dispatch
  * loop don't fight over. */
+/* RT-6b: mcache wire format -- carries (tid, mid, fn) directly
+ * instead of a pointer into the (now retired) stable method-node
+ * arena.  16 bytes per slot, fits in a single cache line for any
+ * normal mcache layout.  The dispatch hot path becomes:
+ *   tid_match = (mce->tid == O_TAG(o));
+ *   mid_match = (mce->mid == m);
+ *   if (hit) CALL(mce->fn) else fill via get_method_for_tag.
+ * Pre-RT-6b SBCs that depended on the 8-byte node-pointer
+ * mcache slot still re-execute correctly because mcache_cnt
+ * (RT-7 wire-format field) only describes how many slots to
+ * allocate -- the slot size is a runtime-internal detail. */
 typedef struct {
-  method_node_t *node; //this can be replaced with an int index to method page
-} __attribute__((packed)) mcache_t;
+  uint32_t tid;
+  uint32_t mid;
+  dyn fn;
+} mcache_t;
 
 #define SBC_MCACHE
 

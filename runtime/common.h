@@ -201,15 +201,6 @@ uint32_t sbc_hook(psf_t fn, uint8_t *payload);
 #define BYTES_DATA(o) ((uint8_t*)&O_HDR(o) + 4)
 
 
-typedef struct method_node_t method_node_t;
-
-struct method_node_t {
-  int mid; //method id
-  int tid; //type id
-  dyn fn;  //closure
-  method_node_t *next; //RT-6: unused (kept for ABI compat with mcache)
-};
-
 /* RT-6: per-type method slot.  The dispatch table used to be a
  * fixed 512-bucket head-pointer array (`method_node_t
  * *methods[512]` = 4096 bytes per type) with chained
@@ -218,14 +209,20 @@ struct method_node_t {
  * three disjoint cache lines (type header + far-away
  * `methods[hid]` + chain node).
  *
- * RT-6 swaps the bucket array for a packed open-addressed probe
- * table sized to the actual method count per type (initial cap
- * 8, doubled on >= 75 % load).  Empty slots are marked by
- * `mid == 0`; the `""` (null) method id reserved at
+ * RT-6 swapped the bucket array for a packed open-addressed
+ * probe table sized to the actual method count per type
+ * (initial cap 8, doubled on >= 75 % load).  Empty slots are
+ * marked by `mid == 0`; the `""` (null) method id reserved at
  * `init_types()` time guarantees no real method ever uses 0.
- * Each slot stores the method id and a pointer into the stable
- * `method_pages` arena, so the cached node pointers held by
- * `mcache_t` survive any per-type table resize.
+ * RT-6 stored each slot as `(mid, node*)` and kept a stable
+ * `method_pages` arena so the cached node pointers held by
+ * `mcache_t` survived any per-type table resize.
+ *
+ * RT-6b folds `fn` directly into the slot.  The mcache wire
+ * format (sif.h: `mcache_t`) carries `(tid, mid, fn)` instead
+ * of a node pointer, so the stable-arena indirection is no
+ * longer load-bearing.  Dispatch hot path drops one cache-line
+ * load (was: mcache → node → fn; now: mcache.fn directly).
  *
  * Typical small types now hold ~16-64 slots = 256-1024 bytes;
  * heavy types (T_OBJECT plus everything that inherits from it)
@@ -234,19 +231,16 @@ struct method_node_t {
 typedef struct {
   uint32_t mid;       /* 0 = empty slot */
   uint32_t _pad;      /* alignment */
-  method_node_t *node;
+  dyn fn;             /* RT-6b: handler closure (was method_node_t*) */
 } method_slot_t;
 
 #define INITIAL_METHOD_CAP 8
-#define METHODS_PAGE_BITS 10
-#define METHODS_PAGE_SIZE (1<<METHODS_PAGE_BITS)
-#define METHODS_PAGE_MASK (METHODS_PAGE_SIZE-1)
 
 #define END_TAG (-1)
 typedef struct type_t type_t;
 struct type_t {
   intptr_t size; // number of data slots in type
-  method_node_t *sink;   // sink method: `type.__ Method Args = @Body`
+  dyn sink_fn;   // sink method handler: `type.__ Method Args = @Body`
   char *name;
   void *sname;   // name in symta's format
   int super;     // parent type
@@ -343,9 +337,7 @@ extern char *main_path;
 extern void *main_args;
 extern dyn single_chars[];
 extern void **method_names;
-extern method_node_t **method_pages;
-extern int nmethods;
-extern method_node_t *sink;  //default sink method
+extern dyn sink;  //default sink method handler (RT-6b: was method_node_t*)
 extern text_table_t *text_tables;
 extern module_imp_t *module_imports;
 typedef struct { char *key; void *value; } *lib_expts_t;
@@ -369,7 +361,7 @@ char *text_to_cstring(dyn text);
 
 
 dyn get_method(int method_id, dyn object);
-method_node_t *get_method_node(int method_id, int tag);
+dyn get_method_for_tag(int method_id, int tag); /* RT-6b: returns fn for mcache fill */
 NOINLINE void print_stack_trace();
 NOINLINE void fatal(char *fmt, ...);
 NOINLINE void rterr_(char *msg);
@@ -380,10 +372,10 @@ dyn sbc_exec_fn(uint8_t *bytecode);
 void add_lib_folder(char *folder);
 void set_type_size_and_name(int tag, int size, void *name);
 void add_subtype(int tag, int subtag);
-method_node_t *add_method(int type_id, int method_id, void *handler);
+void add_method(int type_id, int method_id, void *handler);
 #define ADD_CORE_SINK -1
-method_node_t *add_method_r(int depth, int type_id
-                           ,int method_id, void *handler);
+void add_method_r(int depth, int type_id
+                 ,int method_id, void *handler);
 int resolve_method(char *name);
 dyn get_method_name(uint32_t method_id);
 NOINLINE intptr_t intern(char *name);

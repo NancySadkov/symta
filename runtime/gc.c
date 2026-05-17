@@ -9,6 +9,7 @@
 
 #include "common.h"
 #include "am.h"
+#include "sif.h"   /* RT-6b: need sbc_t for mcache GC tracing */
 #include "meta_table.h"
 
 static int gc_cycle = 0;
@@ -82,7 +83,7 @@ static void gcprint(char *fmt, ...) {
 static void gc_builtins(hg_t *src, hg_t *dst) {
   int i, j;
 
-  GC_REC(sink->fn,sink->fn);
+  GC_REC(sink, sink);  /* RT-6b: `sink` is now the dyn fn directly */
   GC_REC(api.empty_,api.empty_);
   GC_REC(main_args,main_args);
   GC_REC(api.jmp_return,api.jmp_return);
@@ -116,10 +117,31 @@ static void gc_builtins(hg_t *src, hg_t *dst) {
 
   if (src->dirty&DRT_TYPE_METHODS) {
     dst->dirty |= DRT_TYPE_METHODS;
-    for (i = 0; i < nmethods; i++) {
-      method_node_t *page = method_pages[i>>METHODS_PAGE_BITS];
-      method_node_t *m = page + (i&METHODS_PAGE_MASK);
-      GC_REC(m->fn, m->fn);
+    /* RT-6b: trace each type's packed slot table directly --
+     * method handler fns now live inline in method_slot_t.fn,
+     * not in a separate stable arena. */
+    for (i = 0; i < arrlen(types); i++) {
+      type_t *t = &types[i];
+      method_slot_t *ms = t->methods;
+      uint32_t cap = t->method_cap;
+      for (uint32_t k = 0; k < cap; k++) {
+        if (!ms[k].mid) continue;
+        GC_REC(ms[k].fn, ms[k].fn);
+      }
+    }
+    /* RT-6b: SBC mcaches carry inline fn dyns too; trace them
+     * so cached fns survive a closure relocation.  Cheap --
+     * mcaches are dense, contiguous arrays. */
+    extern sbc_t *sbcs[];
+    extern int sbcs_loaded;
+    for (int si = 0; si < sbcs_loaded; si++) {
+      sbc_t *sc = sbcs[si];
+      if (!sc || !sc->mcaches) continue;
+      uint32_t mc = sc->mcache_cnt ? sc->mcache_cnt : 1;
+      for (uint32_t k = 0; k < mc; k++) {
+        if (!sc->mcaches[k].mid) continue;
+        GC_REC(sc->mcaches[k].fn, sc->mcaches[k].fn);
+      }
     }
   }
 
@@ -127,9 +149,10 @@ static void gc_builtins(hg_t *src, hg_t *dst) {
     dst->dirty |= DRT_TYPES;
     for (i = 0; i < arrlen(types); i++) {
       type_t *t = &types[i];
-      //FIXME: no need to GC_REC t->sink->fn
-      //       since it points a place which already gets gc()'d
-      GC_REC(t->sink->fn, t->sink->fn);
+      /* RT-6b: t->sink_fn already gets traced via DRT_TYPE_METHODS
+       * for types where the user installed __ via add_method,
+       * but the default `sink` global goes here too -- trace to be safe. */
+      GC_REC(t->sink_fn, t->sink_fn);
       GC_REC(t->sname, t->sname);
     }
   }
