@@ -363,6 +363,12 @@ static int find_meta_tag(void) {
   for (int i = 0; i < arrlen(types); i++) {
     if (types[i].name && !strcmp(types[i].name, "meta")) {
       meta_tag_g = i;
+      /* OP-4: install the C-side direct-dispatch sink for
+       * meta.__ now that the type tag exists.  Replaces the
+       * Symta-side meta.__ defn (which paid 3 MCALLs per
+       * forwarded method call) with a single inline unwrap +
+       * re-dispatch.  Idempotent. */
+      install_meta_dispatch(i);
       return i;
     }
   }

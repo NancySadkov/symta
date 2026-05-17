@@ -367,6 +367,7 @@ void init_builtin_methods();
 void init_builtin_functions();
 void init_subtypes();
 void init_root_sink();
+void install_meta_dispatch(int tag);
 void init_builtins(int argc, char **argv);
 
 void *gc_alloc(uint32_t tag, uint32_t size);

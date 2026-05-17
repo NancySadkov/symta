@@ -985,9 +985,10 @@ type macro @new_macro N E: name!N expander!E
 // 0 by default from the auto-generated `type meta` predicate.
 type meta.~ O M: object_!O meta_!M
 _.meta_ = No
-meta.__ Method Args =
-  Args.0 = $object_
-  Args.apply_method(Method)
+// `meta.__` (the universal-sink forwarder that unwraps `object_`
+// and re-dispatches) is installed C-side as a direct builtin --
+// see OP-4 in runtime/bltin.c (`b_meta_apply`).  Symta-side defn
+// removed because the 3-MCALL forward dominated cold compile.
 
 
 LCG_Seed  No

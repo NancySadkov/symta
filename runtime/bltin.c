@@ -2666,14 +2666,67 @@ BUILTIN3("ffi_memcmp",ffi_memcmp,C_ANY,ptr_a,C_ANY,ptr_b,C_INT,size)
   R = FXN(memcmp((void*)ptr_a, (void*)ptr_b, UNFXN(size)));
 RETURNS(R)
 
-/*
-// here is how a method can be reapplied to other type:
-type meta.~ O M: object_!O meta_!M
-_.meta_ = No
-meta.__ Method Args =
-| Args.0 =  $object_
-| Args.apply_method(Method)
-*/
+/* OP-4: meta.__ direct-dispatch fast path.
+ *
+ * The reader (runtime/reader.c `make_meta_wrapper`) wraps every
+ * parse-stripped list in a `type meta` instance carrying the
+ * source-position info.  The old Symta-side definition was:
+ *
+ *   type meta.~ O M: object_!O meta_!M
+ *   _.meta_ = No
+ *   meta.__ Method Args =
+ *   | Args.0 = $object_
+ *   | Args.apply_method(Method)
+ *
+ * Forwarding cost 3 MCALLs per call: entry to `__`, body's
+ * MCALL into `apply_method`, then the actual MCALL on the
+ * unwrapped receiver.  The compiler + macroexpander pay this on
+ * every method access on every meta-wrapped AST node -- which is
+ * most nodes -- so it dominates cold-compile profiles.
+ *
+ * The C builtin below collapses unwrap + re-dispatch into one:
+ *
+ *   api.args[0] is the meta wrapper (the receiver); slot 0 of
+ *   the wrapper is `object_`.  Overwrite api.args[0] with the
+ *   unwrapped object, get_method(api.method, unwrapped), CALL.
+ *
+ * Calling convention -- per MCACHE_CALL's sink path (sbc.c) --
+ * is:
+ *   getArg(0) = receiver = the meta wrapper.
+ *   api.args  = the original call's args list (length >= 1).
+ *   api.method = the missed method id (raw int, not FXN-wrapped).
+ *
+ * The Symta-side `meta.__` defn was removed from src/core_.s.
+ * Installation happens lazily from reader.c::find_meta_tag (the
+ * first parse_strip after `type meta` was registered) because
+ * the meta type tag doesn't exist at init_builtins time.
+ * add_method's redefinition guard whitelists `m_underscore` so
+ * pre-OP-4 bootstrap SBCs that still carry the Symta-side defn
+ * are silently overridden by this C handler.
+ */
+BUILTIN_VARARGS("meta.`__`", meta_apply)
+  dyn me = getArg(0);
+  dyn unwrapped = LGET(me, 0); /* meta.object_ */
+  lsetm(api.args, 0, unwrapped);
+  dyn fn = get_method(api.method, unwrapped);
+  CALL(R, fn);
+RETURNS(R)
+
+/* One-shot install of meta.__ on the `meta` type tag.  Called
+ * by reader.c::find_meta_tag the first time the tag is located.
+ * Idempotent: subsequent calls no-op. */
+static int meta_dispatch_installed_g = 0;
+void install_meta_dispatch(int tag) {
+  if (meta_dispatch_installed_g) return;
+  GC_DISABLE();
+  setup_b_meta_apply();
+  void *met;
+  BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_meta_apply)->hook);
+  add_method(tag, api.m_underscore, met);
+  meta_dispatch_installed_g = 1;
+  GC_ENABLE();
+}
+
 BUILTIN_VARARGS("__",sink)
   void *o = getArg(0);
   dyn name = get_method_name(api.method);
