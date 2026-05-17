@@ -286,6 +286,43 @@ static NOINLINE void bad_call(char *method_name, char *msg) {
 
 #define BAD_CALL(method_name, ...) bad_call(method_name,fmt(__VA_ARGS__))
 
+/* CORE-1 / RT-9: resolve a saved bytecode pin to (sbc, row, col).
+ * Returns the owning sbc_t* (or NULL if not in any loaded SBC's
+ * code section) and writes row/col via out-params.  Used by both
+ * print_stack_trace (frame->pin -> caller source line) and the
+ * RT-9 alloc-attribution dump (alloc-site pin -> source line). */
+static sbc_t *resolve_pin(void *pin, int *row_out, int *col_out) {
+  extern int sbcs_loaded;
+  extern sbc_t *sbcs[];
+  if (!pin) return 0;
+  sbc_t *owner = 0;
+  for (int s = 0; s < sbcs_loaded; s++) {
+    sbc_t *sc = sbcs[s];
+    if (pin >= (void*)sc->code && pin < (void*)(sc->code + sc->code_sz)) {
+      owner = sc;
+      break;
+    }
+  }
+  if (!owner || !owner->lineno_table || !owner->lineno_sz) return owner;
+  uint32_t target = (uint32_t)((uint8_t*)pin - owner->code);
+  uint8_t *t = owner->lineno_table;
+  int lo = 0, hi = owner->lineno_sz;
+  int best = -1;
+  /* Each entry: u32 pc, u32 row, u16 col, u16 pad = 12B. */
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    uint32_t pc = *(uint32_t*)(t + mid*12);
+    if (pc <= target) { best = mid; lo = mid + 1; }
+    else hi = mid;
+  }
+  if (best >= 0) {
+    uint8_t *e = t + best*12;
+    *row_out = (int)(*(uint32_t*)(e + 4));
+    *col_out = (int)(*(uint16_t*)(e + 8));
+  }
+  return owner;
+}
+
 static int inside_stack_trace = 0;
 void print_stack_trace() {
   /* `fn` was originally meant to be the per-frame function pointer
@@ -330,36 +367,7 @@ void print_stack_trace() {
        * on the hot path. */
       row = meta->row;
       col = meta->col;
-      if (frm->pin) {
-        extern int sbcs_loaded;
-        extern sbc_t *sbcs[];
-        sbc_t *owner = 0;
-        for (int s = 0; s < sbcs_loaded; s++) {
-          sbc_t *sc = sbcs[s];
-          if (frm->pin >= sc->code && frm->pin < sc->code + sc->code_sz) {
-            owner = sc;
-            break;
-          }
-        }
-        if (owner && owner->lineno_table && owner->lineno_sz) {
-          uint32_t target = (uint32_t)(frm->pin - owner->code);
-          uint8_t *t = owner->lineno_table;
-          int lo = 0, hi = owner->lineno_sz;
-          int best = -1;
-          /* Each entry: u32 pc, u32 row, u16 col, u16 pad = 12B. */
-          while (lo < hi) {
-            int mid = (lo + hi) >> 1;
-            uint32_t pc = *(uint32_t*)(t + mid*12);
-            if (pc <= target) { best = mid; lo = mid + 1; }
-            else hi = mid;
-          }
-          if (best >= 0) {
-            uint8_t *e = t + best*12;
-            row = (int)(*(uint32_t*)(e + 4));
-            col = (int)(*(uint16_t*)(e + 8));
-          }
-        }
-      }
+      resolve_pin(frm->pin, &row, &col);
     }
     fprintf(stderr, "  %016llx:%s:%d,%d,%s\n",
             (unsigned long long)fn, name, row, col, origin);
@@ -1811,6 +1819,52 @@ static void show_alloc_stats() {
       fprintf(stderr, "  size %-3u  %lu\n", b, (unsigned long)alloc_stats.list_size_bucket[b]);
     else
       fprintf(stderr, "  size 15+  %lu\n", (unsigned long)alloc_stats.list_size_bucket[b]);
+  }
+
+  /* RT-9: top-N caller-pin attribution for T_LIST.  Walk the
+   * open-addressed hash, copy populated entries to a flat array,
+   * sort by count descending, print top 20 with resolved source. */
+  uint32_t live = 0;
+  alloc_pin_count_t *flat = 0;
+  for (uint32_t i = 0; i < ALLOC_ATTRIB_BUCKETS; i++) {
+    if (alloc_stats.pin_counts[i].pin) live++;
+  }
+  if (live) {
+    flat = (alloc_pin_count_t*)malloc(live * sizeof(alloc_pin_count_t));
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < ALLOC_ATTRIB_BUCKETS; i++) {
+      if (alloc_stats.pin_counts[i].pin) {
+        flat[k++] = alloc_stats.pin_counts[i];
+      }
+    }
+    /* Simple in-place insertion sort by count desc -- only the
+     * top-20 ordering matters; full sort is fine for tens of
+     * thousands of entries (one-shot at exit). */
+    for (uint32_t i = 1; i < live; i++) {
+      alloc_pin_count_t cur = flat[i];
+      int32_t j = (int32_t)i - 1;
+      while (j >= 0 && flat[j].count < cur.count) {
+        flat[j+1] = flat[j];
+        j--;
+      }
+      flat[j+1] = cur;
+    }
+    fprintf(stderr, "top-20 T_LIST alloc sites (by caller pin):\n");
+    uint64_t total = alloc_stats.by_tag[T_LIST];
+    uint32_t n = live < 20 ? live : 20;
+    for (uint32_t i = 0; i < n; i++) {
+      int row = -1, col = -1;
+      sbc_t *sc = resolve_pin(flat[i].pin, &row, &col);
+      char *origin = sc ? sc->filename : "???";
+      double pct = total ? (100.0 * (double)flat[i].count / (double)total) : 0.0;
+      fprintf(stderr, "  %10lu  %5.1f%%  %s:%d,%d\n",
+              (unsigned long)flat[i].count, pct, origin, row, col);
+    }
+    uint64_t covered = 0;
+    for (uint32_t i = 0; i < live; i++) covered += flat[i].count;
+    fprintf(stderr, "(%u distinct sites covered %lu of %lu allocs)\n",
+            live, (unsigned long)covered, (unsigned long)total);
+    free(flat);
   }
   fprintf(stderr, "\n");
 }

@@ -339,10 +339,23 @@ extern type_t *types;
  * cycles).  Printed by `rtstat`.  Used to answer "how much does
  * CONS dominate?" empirically before committing to a specific
  * RT-9 implementation strategy. */
+/* RT-9 caller-PC attribution: open-addressed hash from
+ * (bytecode pin) -> alloc count.  16 K entries gives < 50 %
+ * load factor for typical workloads (a `./game/` compile uses
+ * ~5 K distinct SBC_LIST sites).  Saturates silently on
+ * overflow -- the top-N emitters are what we want, and they
+ * land first. */
+typedef struct {
+  void *pin;
+  uint64_t count;
+} alloc_pin_count_t;
+#define ALLOC_ATTRIB_BUCKETS 16384
+
 typedef struct {
   uint64_t by_tag[32];  /* indexed by O_TAG; tags top out at ~22 */
   uint64_t list_size_bucket[16]; /* [0]=size 0, [1]=1, ..., [14]=14,
                                     [15]=15+ (saturating bucket) */
+  alloc_pin_count_t pin_counts[ALLOC_ATTRIB_BUCKETS]; /* T_LIST only */
 } alloc_stats_t;
 extern alloc_stats_t alloc_stats;
 
