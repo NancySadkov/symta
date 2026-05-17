@@ -6,6 +6,26 @@
 #include "fs.h"
 #include "sffi/sffi.h"
 
+/* RT-1: threaded dispatch (computed gotos) is on by default for
+ * compilers that support GCC's address-of-label extension --
+ * gcc, clang, MinGW.  The earlier measurement that flagged it as
+ * ~8 % slower was tainted by Windows EcoQoS background throttling
+ * and agent-CPU competition (both addressed in bench/bench.md's
+ * workaround pattern); a clean rebench is owed before judging it
+ * again, but the literature unanimously favours threaded dispatch
+ * and "default on" matches every other JITless interpreter we
+ * compare against.
+ *
+ * MSVC and any other compiler without computed-goto support
+ * falls through to the portable switch dispatch.  Build with
+ * `-DSBC_NO_THREADED_DISPATCH` to force the switch even on
+ * GCC / Clang.  See sbc_exec_fn below for the dispatch macros. */
+#if !defined(SBC_NO_THREADED_DISPATCH) && !defined(SBC_THREADED_DISPATCH)
+  #if defined(__GNUC__) || defined(__clang__)
+    #define SBC_THREADED_DISPATCH 1
+  #endif
+#endif
+
 #define MCACHE_DIV 4
 
 sbc_t *sbc_new(uint8_t *pin, int64_t size, char *path) {
