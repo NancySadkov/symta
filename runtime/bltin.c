@@ -1083,6 +1083,26 @@ BUILTIN2("list.apply_method",list_apply_method,C_ANY,as,C_ANY,m)
   CALL(R,fn);
 RETURNS(R)
 
+/* RT-9: C-side `list.l` for T_VIEW.  The Symta-side dispatch
+ * `list.l = | N $n | Ys dup N | times I N: Ys.I = pop Me | Ys`
+ * was the #2 emitter of T_LIST allocations on the ./game
+ * compile (36 M+ calls).  The dup-macro generates _listn +
+ * .clear + while loop, each call allocates LIST(N) AND incurs
+ * the dispatch + clear + iteration overhead.  The C variant
+ * allocates once and memcpy's the underlying slots.  Same
+ * allocation count, much lower per-call overhead. */
+BUILTIN1("list.l", view_l, C_ANY, o)
+  uint32_t n = VIEW_SIZE(o);
+  uint32_t start = VIEW_START(o);
+  dyn base = VIEW_STRIP_SHARED(VIEW_BASE(o));
+  GC_DISABLE();
+  LIST(R, n);
+  dyn *src = &LGET(base, start);
+  dyn *dst = &LGET(R, 0);
+  for (uint32_t i = 0; i < n; i++) dst[i] = src[i];
+  GC_ENABLE();
+RETURNS(R)
+
 /* RT-9: C-side replacement for the Symta-side `fn.\`()\` @As =
  * As.apply(Me)`.  The Symta-side defn was the top emitter of
  * size-1 LIST allocations on the ./game compile -- every
@@ -3119,6 +3139,14 @@ void init_builtin_methods() {
    * Replaces the Symta-side `fn.\`()\` @As = As.apply(Me)` whose
    * @As collection was the top emitter of size-1 LIST allocs. */
   METHOD_FN1("()", T_CLOSURE, b_fn_call);
+
+  /* RT-9: C-side list.l for T_VIEW (replaces Symta-side
+   * `list.l = ... Ys dup N | times I N: Ys.I = pop Me | Ys`).
+   * T_CONS keeps the Symta-side because cons chains can be
+   * IMPROPER (tail is a non-cons value that needs flattening),
+   * and the dispatch-based pop in Symta handles that correctly. */
+  METHOD_FN1("l", T_VIEW, b_view_l);
+
 
   m_add = resolve_method("+");
   m_sub = resolve_method("-");
