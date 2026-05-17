@@ -175,6 +175,34 @@ expand_hole_keywords Key Hit Xs =
                  | KWVar = V)
             Hit
 
+// OP-5: map a `case X type?:` predicate name like "int" to the
+// runtime type-tag constant (runtime/symta.h).  Returns No for
+// predicates that aren't a single-tag test (multi-tag ones like
+// "text" / "list", or non-tag ones like "keyword") so the caller
+// falls back to the regular `_.is_T` MCALL dispatch.
+//
+// Hot single-tag predicates (`int?` / `float?` / `fn?` / `fixtext?`)
+// in `case` arms previously paid one MCALL per dispatch -- worst
+// case a megamorphic mcache miss at ~50 ns.  Inlining them as
+// `_eq (_tag Key) $TAG` lowers to SBC_FXNTAG + SBC_IMMEQ (both
+// ~5 ns each, IMMEQ's int-int fast path applies since both sides
+// are tagged ints), trading ~45 ns of dispatch for two opcodes.
+//
+// Caveat: this changes the call semantics from "dispatch through
+// MCALL and respect any user-side override" to "raw tag check".
+// In practice the four predicates listed below are tag-bound by
+// definition; user code overriding e.g. `mytype.is_int = 1` to
+// claim int-ness would no longer be recognised by `case X int?:`
+// patterns.  If anyone genuinely needs override-respecting checks,
+// `if X.is_int then ...` (the explicit MCALL form, used widely in
+// core_.s) is unaffected.
+tag_for_predicate Name =
+  if Name >< "int"     then 0
+  else if Name >< "float"   then 1
+  else if Name >< "fixtext" then 2
+  else if Name >< "fn"      then 8
+  else No
+
 expand_hole_term Key Hole Hit Miss =
 | when Hole >< '_': ret Hit
 | when Hole >< '~':
@@ -182,7 +210,11 @@ expand_hole_term Key Hole Hit Miss =
    ret: form: if Key >< No then Miss else Hit
 | when Hole.is_keyword:
   | when Hole.n and Hole.~ >< '?':
-    | ret: form: _if (@$"is_[Hole.lead]" Key) Hit Miss
+    | Lead Hole.lead
+    | Tag tag_for_predicate Lead
+    | if got Tag
+        then ret: form: _if (_eq (_tag Key) $Tag) Hit Miss
+        else ret: form: _if (@$"is_[Lead]" Key) Hit Miss
   | Hole =  [_quote Hole]
 | ret: if Hole.is_text then [let_ [[Hole Key]] Hit]
        else [_if ['><' Hole Key] Hit Miss]
