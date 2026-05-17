@@ -106,12 +106,38 @@ typedef void *dyn;
 #define O_THEAP(o) api.theap0[O_GID(o)-1]
 #define O_PAGE(o) api.pgmod[O_GID(o)>>PAGE_SHIFT]
 #define O_RELOC(o) (*(void**)&O_HDR(o))
-#define O_AGE(o) O_THEAP(o)
+
+/* RT-4: age inline in the high byte of O_HDR.code -- EXCEPT for
+ * T_CONS, which overlays its CAR value onto the gc_head_t
+ * bytes (see CAR() macro in common.h).  CONS construction
+ * clobbers any inline age the moment CAR is written, so cons
+ * cells fall back to the theap0-based age that gc_alloc still
+ * maintains at theap0[gid-1].
+ *
+ * The branch costs one tag comparison per O_AGE read.  Tag is
+ * computed from the dyn's bit pattern (no memory access), so
+ * the branch is predicted near-perfectly for monomorphic call
+ * sites (the LSET barrier is overwhelmingly non-CONS).
+ *
+ * GC_REDIR is the other place that destroys the inline age --
+ * it overwrites the header with the redirect pointer.  The
+ * theap0[gid-1] == GC_MOVED check in O_IS_MOVED stays the
+ * authoritative "is this object relocated" query and is what
+ * GC_REC3 / GC_IS_MOVED key off. */
+#define O_AGE(o) (O_TAG(o) == T_CONS \
+  ? (uint32_t)O_THEAP(o) \
+  : (((uint32_t)O_HDR(o).code >> 24) & 0xFFu))
+#define O_SET_AGE(o, age) (O_THEAP(o) = (age))
+#define O_IS_MOVED(o) (O_THEAP(o) == GC_MOVED)
 #define O_HG(o) (api.hg0 + O_AGE(o))
 
 
 
-#define O_CODE(o) O_HDR(o).code
+/* RT-4: O_CODE masks off the inline age byte; O_SET_CODE
+ * preserves the age byte. */
+#define O_CODE(o) (O_HDR(o).code & 0x00FFFFFFu)
+#define O_SET_CODE(o, c) (O_HDR(o).code = \
+  (O_HDR(o).code & 0xFF000000u) | ((uint32_t)(c) & 0x00FFFFFFu))
 #define O_HOOK(o) hooks_heap[(uint64_t)O_CODE(o)]
 #define O_META(o) O_HOOK(o).meta
 #define O_SIZE(o) O_HDR(o).size
@@ -404,7 +430,7 @@ typedef struct {
   uint32_t _code = (uint32_t)(uint64_t)(code); \
   OBJECT(dst, T_CLOSURE, _cnt + 2); \
   O_HDR(dst).size = _cnt; \
-  O_CODE(dst) = _code; \
+  O_SET_CODE(dst, _code); \
   hook_t *_hk = &hooks_heap[_code]; \
   void **_slots = (void**)O_PTR(dst); \
   _slots[_cnt    ] = (void*)_hk->handler; \

@@ -53,7 +53,12 @@ uint32_t sbc_hook(psf_t fn, uint8_t *payload);
 #define IS_TEXT(o) (IS_FIXTEXT(o) || IS_BIGTEXT(o))
 
 #define BIGTEXT_SIZE(o) O_SIZE(o)
-#define BIGTEXT_DATA(o) ((char*)&O_CODE(o))
+/* RT-4 prep: bigtext data starts at LGET(o, 0) rather than
+ * &O_CODE(o).  Loses 4 bytes of "free" inline storage that
+ * overlapped with the code field, in exchange for not having
+ * text bytes occupy the high byte of code (which becomes the
+ * inline age slot in the next stage). */
+#define BIGTEXT_DATA(o) ((char*)&LGET(o,0))
 
 #define C_ANY(o,arg_index,meta)
 
@@ -191,14 +196,16 @@ uint32_t sbc_hook(psf_t fn, uint8_t *payload);
 
 #define VIEW(dst,base,start,size) \
   OBJECT(dst, T_VIEW, 1); \
-  VIEW_START(dst) = (uint32_t)(start); \
+  O_SET_CODE(dst, (uint32_t)(start)); /* VIEW_START -- low 24 bits */ \
   VIEW_SIZE(dst) = (uint32_t)(size); \
   VIEW_BASE(dst) = base;
 #define VIEW_LGET(o,start,i) LGET(VIEW_BASE(o), (start)+(i))
 
 
 #define BYTES_SIZE(o) O_SIZE(o)
-#define BYTES_DATA(o) ((uint8_t*)&O_HDR(o) + 4)
+/* RT-4: bytes data origin moved to LGET(o, 0) -- same reason as
+ * BIGTEXT_DATA below. */
+#define BYTES_DATA(o) ((uint8_t*)&LGET(o,0))
 
 
 typedef struct method_node_t method_node_t;
