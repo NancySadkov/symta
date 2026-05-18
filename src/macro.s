@@ -1,7 +1,7 @@
 export macroexpand 'mexlet' 'let_' 'let' 'default_ret_' 'ret'
        'if' 'case'
        '[]' '\\' 'form'
-       'mtx' 'rows' 'rowz' 'list_' 'no' 'got' 'not' 'and' 'or'
+       'mtx' 'rows' 'rowz' 'no' 'got' 'not' 'and' 'or'
        'when' 'less' 'while' 'till'
        'dup' 'times' 'map' 'for' 'type'
        'named' 'export' 'export_' 'pop' 'push' 'as' 'callcc' 'fin'
@@ -351,10 +351,12 @@ as_bytes @As =
 // game/src/view_render.s:1106 `fn I = "..."`).  For "is X a
 // fn" semantics use `_the fn X` / `X^fn`.
 
-// TS-1.3+ phase 3 (list-transition.md): `list` is now a
-// type-constructor instead of the variadic list-builder.
-// Callers that build lists use `[X Y Z]` literal or the
-// `list_ @Xs` builder defined below.
+// TS-1.3+ phase 5 (list-transition.md): `list` is a pure
+// type-constructor.  Construction uses the native `[X Y Z]`
+// literal or its underlying `` `[]` X Y Z `` form.  The
+// `list_` alias is gone -- all 47 call sites identified in
+// list-transition.md have moved to `[...]` literal or
+// `` `[]` `` form.
 //
 // `list X` semantics: assertion across all 4 concrete tags
 // (T_LIST | T_VIEW | T_CONS | T_BYTES) via the multi-tag
@@ -363,21 +365,17 @@ as_bytes @As =
 // (`[...]`, `Xs.pre H`, `Xs[S:E]`, `N.bytes`) when building.
 // `as_list X` (above) is the explicit converter via `.l`.
 //
-// Multi-arg `list X Y Z` callers are gone after phase 2 of
-// the transition.  If any survive, they'll trip the
-// Else-branch error here, which is the desired migration
-// signal.
+// Multi-arg `list X Y Z` is no longer the variadic builder.
+// If any survive, they trip the Else-branch fallback which
+// delegates to the `[]` list-builder macro -- still produces
+// the expected list, but emits a deprecation-style fall-back
+// rather than the direct path.
 list @As =
-  less As.is_list: ret [\list_ As]
+  less As.is_list: ret [`[]` As]
   case As
     [] | [`_the` \list []]
     [E] | [`_the` \list E]
-    // Multi-arg `list X Y Z` -- legacy variadic-builder
-    // shape.  Delegate to `list_` for backward compat with
-    // anything that survived list-transition phase 2 (FFI
-    // type-spec lists, internal AST construction, etc.).
-    // User code should migrate to `[X Y Z]` literal.
-    Else | [\list_ @As]
+    Else | [`[]` @As]
 
 // OP-5b helper: right-fold a list of tag values into a nested
 // `_if` chain that tests each tag against `(_tag Key)`.  Hit
@@ -2432,12 +2430,10 @@ macroexpand Expr Macros ModuleCompiler ModuleFolders =
   | R mex Expr
   | R,GExports
 
-// `list_ @Xs = ...` is the variadic list-builder (the legacy
-// `list @Xs` form).  After list-transition.md phase 3, `list`
-// is reserved as a type-constructor; `list_` is the new name
-// for the variadic builder.  See list-transition.md for the
-// migration history.
-list_ @Xs = form [$@Xs]
+// `list_` was the temporary alias for `list @Xs = form [$@Xs]`
+// during the list-transition.  After phase 5, all call sites
+// use `[...]` literal or `` `[]` `` form directly; the alias
+// is gone.  `list` is the pure type-constructor (see line 370).
 
 mtx @Xs =
 | Ys map X Xs: case X [`|` @Zs] (Zs{[`[]` @?]}) X [X]

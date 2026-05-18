@@ -16,12 +16,13 @@
 // runtime tag.  Struct types (introduced by `type Foo: ...`,
 // often cls / ECS component interfaces) follow the same triple.
 //
-// `list` is a UNION (T_LIST | T_VIEW | T_CONS | T_BYTES).  The
-// variadic `list 1 2 3 -> [1 2 3]` builder is preserved; for
-// "is X a list" use `_the list X` or `X^list`; for "convert X
-// to a list" use `as_list X` (delegates to the universal `.l`
-// method).  Concrete subtypes built via method forms:
-// `N.bytes`, `Xs.pre H`, `Xs[S:E]`.
+// `list` is a UNION type (T_LIST | T_VIEW | T_CONS | T_BYTES).
+// For "is X a list" use `_the list X` / `X^list`; for "convert
+// X to a list" use `as_list X` (delegates to the universal `.l`
+// method).  Construction is via the native `[X Y Z]` literal
+// (or `` `[]` X Y Z `` -- the underlying form).  Concrete
+// subtypes built via method forms: `N.bytes`, `Xs.pre H`,
+// `Xs[S:E]`.
 //
 // Run:  symta -f examples/37-the.s
 
@@ -64,7 +65,7 @@ say "D = [D]"                          // D = (a b c)
 L _the list [1 2 3]                    // T_LIST flat
 say "L.is_list = [L.is_list]"          // 1
 
-M list 1 2 3                           // variadic builder (unchanged)
+M [1 2 3]                              // native list literal
 say "M = [M]"                          // M = (1 2 3)
 
 
