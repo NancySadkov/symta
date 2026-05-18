@@ -1,7 +1,7 @@
 export macroexpand 'mexlet' 'let_' 'let' 'default_ret_' 'ret'
        'if' 'case'
        '[]' '\\' 'form'
-       'mtx' 'rows' 'rowz' 'list' 'list_' 'no' 'got' 'not' 'and' 'or'
+       'mtx' 'rows' 'rowz' 'list_' 'no' 'got' 'not' 'and' 'or'
        'when' 'less' 'while' 'till'
        'dup' 'times' 'map' 'for' 'type'
        'named' 'export' 'export_' 'pop' 'push' 'as' 'callcc' 'fin'
@@ -15,7 +15,7 @@ export macroexpand 'mexlet' 'let_' 'let' 'default_ret_' 'ret'
        'ffi_begin' 'ffi' 'min' 'max' 'swap' 'have' 'source_' 'compile_when' 
        'nullary_' 'hcase' 'hcase_go' 'mac' 'prx' 'mdbg'
        'help'
-       \int \float \text \fixtext
+       \int \float \text \fixtext \list
        \as_int \as_float \as_text \as_fixtext \as_list \as_bytes
 
 
@@ -346,12 +346,38 @@ as_bytes @As =
   less As.is_list: ret [\as_bytes As]
   case As [E]: ret [`_mcall` E [`_quote` \bytes]]
   [\as_bytes @As]
-// `fn` and `list` are NOT registered as type-constructors:
-//   `fn` collides with user code (e.g. game/src/view_render.s
-//        line 1106: `fn I = "..."` declares a local fn).
-//   `list` is the list-builder (`list 1 2 3 -> [1 2 3]`).
-// For "is X a fn / list" semantics use `_the fn X` / `X^fn`
-// or `_the list X` / `X^list`.
+// `fn` is NOT registered as a type-constructor: it collides
+// with user code that declares local fns (e.g.
+// game/src/view_render.s:1106 `fn I = "..."`).  For "is X a
+// fn" semantics use `_the fn X` / `X^fn`.
+
+// TS-1.3+ phase 3 (list-transition.md): `list` is now a
+// type-constructor instead of the variadic list-builder.
+// Callers that build lists use `[X Y Z]` literal or the
+// `list_ @Xs` builder defined below.
+//
+// `list X` semantics: assertion across all 4 concrete tags
+// (T_LIST | T_VIEW | T_CONS | T_BYTES) via the multi-tag
+// `is_list` predicate.  No coercion -- the list union is
+// flat at the surface; choose a concrete representation
+// (`[...]`, `Xs.pre H`, `Xs[S:E]`, `N.bytes`) when building.
+// `as_list X` (above) is the explicit converter via `.l`.
+//
+// Multi-arg `list X Y Z` callers are gone after phase 2 of
+// the transition.  If any survive, they'll trip the
+// Else-branch error here, which is the desired migration
+// signal.
+list @As =
+  less As.is_list: ret [\list_ As]
+  case As
+    [] | [`_the` \list []]
+    [E] | [`_the` \list E]
+    // Multi-arg `list X Y Z` -- legacy variadic-builder
+    // shape.  Delegate to `list_` for backward compat with
+    // anything that survived list-transition phase 2 (FFI
+    // type-spec lists, internal AST construction, etc.).
+    // User code should migrate to `[X Y Z]` literal.
+    Else | [\list_ @As]
 
 // OP-5b helper: right-fold a list of tag values into a nested
 // `_if` chain that tests each tag against `(_tag Key)`.  Hit
@@ -2406,13 +2432,12 @@ macroexpand Expr Macros ModuleCompiler ModuleFolders =
   | R mex Expr
   | R,GExports
 
-// `list_ @Xs = ...` is the variadic list-builder.  Migration
-// target for callers of the legacy `list @Xs` builder (now an
-// alias) -- see list-transition.md.  Once all call sites move
-// to `list_`, the `list` name will be freed for the type
-// system (`list X` as union type-constructor).
+// `list_ @Xs = ...` is the variadic list-builder (the legacy
+// `list @Xs` form).  After list-transition.md phase 3, `list`
+// is reserved as a type-constructor; `list_` is the new name
+// for the variadic builder.  See list-transition.md for the
+// migration history.
 list_ @Xs = form [$@Xs]
-list @Xs = form [$@Xs]
 
 mtx @Xs =
 | Ys map X Xs: case X [`|` @Zs] (Zs{[`[]` @?]}) X [X]
