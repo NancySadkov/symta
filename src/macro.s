@@ -258,20 +258,41 @@ is_known_type Name =
   | when got tags_for_predicate Name: ret 1
   | got GTypes.Name
 
-// TS-3.1: compile-time type inference for a mex-expanded
-// expression.  Returns the type name (text) if statically
-// known, else No.  Conservative -- only fires when we can
-// prove the type without execution.  Used by `_the` to raise
-// compile errors on obvious mismatches.
+// TS-3.1: compile-time type inference for an expression.
+// Returns the type name (text) if statically known, else No.
+// Conservative -- only fires when we can prove the type
+// without execution.  Used by `_the` to raise compile errors
+// on obvious mismatches, and by the var-flow propagation
+// path in `_set` / expand_block_helper.
 //
-// Shapes recognised (from the post-mex AST):
-//   int literal       -- `5`               -> "int"
-//   float literal     -- `1.5`             -> "float"
-//   [_quote T]        -- text or list quote -> "text"/"list"
-//   [_the T _]        -- already-typed expr -> T
-//   [_unsafe T _]     -- trust-me cast      -> T
-//   [_type T _ _]     -- scoped-type form   -> T
-//   variable in scope -- via GVarsTypes
+// Shapes recognised:
+//
+// Post-mex literals + AST nodes:
+//   `5`                              -> "int"
+//   `1.5`                            -> "float"
+//   [_quote V] V.is_text             -> "text"
+//   [_quote V] V.is_list             -> "list"
+//   [_the T _]                       -> T  (TS-1)
+//   [_unsafe T _]                    -> T  (TS-1)
+//   [_type T _ _]                    -> T  (existing scoped form)
+//   variable ref via GVarsTypes
+//
+// Pre-mex user forms (so the var-flow path can catch
+// `X int 5` and `X 5^int` declarations):
+//   [T @_] where T is a known type   -> T  (TS-1.2 constructor)
+//   [`^` _ T]                        -> T  (TS-1.1 ascription)
+//
+// Anything else returns No -- the runtime check stays the
+// fallback for cases we can't prove statically.
+// TS-3.3 helper: peek through a single 1-element-list wrapper
+// that expand_block_item / expand_assign put around pre-mex
+// RHS values.  Only used for the "find a typed shape" cases
+// below -- we don't propagate the unwrapped form, just check
+// if a typed shape is inside.
+infer_peek_inner Expr =
+  case Expr [E] | E
+              X | X
+
 infer_type Expr =
   | when Expr.is_int: ret "int"
   | when Expr.is_float: ret "float"
@@ -291,7 +312,22 @@ infer_type Expr =
       [`_the` T _] | ret T
       [`_unsafe` T _] | ret T
       [`_type` T _ _] | ret T
-      Else | ret No
+      // TS-3.3: detect pre-mex typed shapes INSIDE a 1-element
+      // wrapper.  expand_block_item / expand_assign put `[ ... ]`
+      // around the RHS value, so the typed shape sits one level
+      // deeper than the post-mex case.  We peek non-destructively.
+      //
+      // Catches:
+      //   [`^` E T]      -- TS-1.1 ascription, lowers to _the T E
+      //   [T @_] where T is a known type -- TS-1.2 constructor
+      Else
+        | Inner infer_peek_inner Expr
+        | when Inner.is_list:
+          | case Inner
+            [`^` _ T] | when T.is_text and T^is_known_type: ret T
+            [Head @_]
+              | when Head.is_text and Head^is_known_type: ret Head
+        | ret No
   | No
 
 // TS-3.1: are two type names compatible for a static check?

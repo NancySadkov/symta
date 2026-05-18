@@ -68,6 +68,25 @@ N = _the int 100
 say "N = [N]"                          // N = 100
 
 
+// --- TS-3.3: typed-shape propagation through any form --------
+//
+// The infer_type pass also recognises pre-mex typed shapes
+// inside the declaration RHS, so all three TS-1 forms make
+// the var's type visible to later refs:
+
+K 5^int                                // ^-ascription
+say "K = [K]"                          // K = 5
+// L _the text K                       // would COMPILE-ERROR
+
+P int 5                                // T-constructor
+say "P = [P]"                          // P = 5
+// Q _the text P                       // would COMPILE-ERROR
+
+R text "hi"
+say "R = [R]"                          // R = hi
+// S _the int R                        // would COMPILE-ERROR
+
+
 // --- statically invalid: uncomment to see the compile error --
 
 // X _the int 1.5
