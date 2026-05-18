@@ -87,6 +87,34 @@ say "R = [R]"                          // R = hi
 // S _the int R                        // would COMPILE-ERROR
 
 
+// --- TS-3.5: case-arm narrowing -----------------------------
+//
+// Inside a `case X T?:` arm, X is statically known to be T --
+// the runtime predicate test that selects the arm doubles as a
+// type assertion for the body.  Composes with the static check:
+// any `_the U X` inside the arm is verified against T.
+
+classify X =
+  case X
+    int?   | _the int X        // X is int here -- OK
+    float? | _the float X      // X is float here -- OK
+    text?  | _the text X       // X is text here -- OK
+    Else   | "other"
+
+say "classify 5 = [classify 5]"
+say "classify 1.5 = [classify 1.5]"
+say "classify 'hi' = [classify 'hi']"
+
+// To see the static catch, uncomment any of these:
+// buggy X = case X
+//   int? | _the text X        // COMPILE-ERROR: X is int, not text
+//   Else | "?"
+//
+// buggy2 X = case X
+//   list? | _the int X        // COMPILE-ERROR: X is list, not int
+//   Else | "?"
+
+
 // --- statically invalid: uncomment to see the compile error --
 
 // X _the int 1.5

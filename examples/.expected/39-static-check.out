@@ -9,3 +9,6 @@ N = 100
 K = 5
 P = 5
 R = hi
+classify 5 = 5
+classify 1.5 = 1.5
+classify 'hi' = hi

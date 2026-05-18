@@ -611,17 +611,39 @@ expand_hole Key Hole Hit Miss =
   Else | mex_error "bad match case: [Hole]"
 
 // FIXME: use `coma_list_normalize`
+
+// TS-3.5: case-arm type narrowing.  For a predicate-arm
+// pattern like `int?` / `text?` / `list?`, return the
+// narrowing type name (without the `?`).  Else No.
+// Used by expand_match to wrap the arm body in `[_type T X _]`
+// so the matched variable's type is visible inside the arm.
+case_narrow_type Pattern =
+  | when Pattern.is_keyword and Pattern.is_text and Pattern.n >> 1:
+    | when Pattern.~ >< '?':
+      | Lead Pattern.lead
+      | when Lead^is_known_type: ret Lead
+  | No
+
 expand_match Keyform Cases Default Key =
 | when no Key: Key =  @rand 'Key'
 | E @rand end
 | D @rand default
 | R @rand 'R'
+| NarrowVar if Keyform^is_var_sym: Keyform else No
 | Ys:
 | for Case Cases.f
   | Name @rand c
   | NextLabel if Ys.end then D else Ys.0.1
   | Miss: _goto NextLabel
-  | Hit: _progn [_set R [_progn @Case.tail]] [_goto E]
+  // TS-3.5: when matched value is a bare var AND this case
+  // arm is a single-predicate pattern (`int?` etc.), wrap the
+  // arm body in `[_type T Var body]` so refs to Var inside
+  // see Var as T.  Composes with TS-3.1's mex-time check.
+  | Body Case.tail
+  | NarrowT if got NarrowVar then case_narrow_type Case.head else No
+  | when got NarrowT:
+    | Body = [[`_type` NarrowT NarrowVar [`_progn` @Body]]]
+  | Hit: _progn [_set R [_progn @Body]] [_goto E]
   | Ys = [[_label Name] (expand_hole Key Case.head Hit Miss) @Ys]
 | [let_ [[Key Keyform]
          [R 0]]
