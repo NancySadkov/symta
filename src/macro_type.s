@@ -131,6 +131,21 @@ infer_type Expr =
       // dispatch we can't statically resolve.
       [`_mcall` _ [`_quote` M] @_]
         | when M.is_text and M^is_known_type: ret M
+      // TS-3.7: `_if cond Then Else` (post-mex `if`-form) --
+      // if both branches have the same inferable type, the
+      // if-expression has that type.  Used by `if`, `when`,
+      // `less`, and any other macros that lower to `_if`.
+      //
+      // For `when X.is_int X No` (else branch is No):
+      //   Then = X (typed int if X is) ; Else = No (dyn).
+      //   Treat `No` as "dyn"-compatible so the if-expr
+      //   takes Then's type.  Same for `less ... No ...`.
+      [`_if` _ Then Else]
+        | T1 infer_type Then
+        | T2 infer_type Else
+        | when Then >< \No: T1 = T2
+        | when Else >< \No: T2 = T1
+        | when got T1 and got T2 and T1 >< T2: ret T1
       // TS-3.6: pre-mex text literal `"abc"` parses to
       // `[`"` "abc"]` (backtick-`"` operator).  Recognise it
       // so the mismatch check sees `_the int "abc"` as text.

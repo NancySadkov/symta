@@ -101,6 +101,24 @@ say "V = [V]"                          // V = 5.0
 //   error: type mismatch: expected `int`, got `float`
 
 
+// --- TS-3.7: if-branch type unification ----------------------
+//
+// `if cond E1 else E2` -- if both branches have the same
+// inferable type, the if-expression has that type.  Composes
+// with TS-3.1's mex check so `_the U (if ...)` catches when
+// the branches' shared type doesn't match U.
+
+IfRes _the int (if 1: 10 else 20)      // both int -- OK
+say "IfRes = [IfRes]"                  // IfRes = 10
+
+WhenRes _the text (when 1: "yes")      // text + No (dyn) -- OK
+say "WhenRes = [WhenRes]"              // WhenRes = yes
+
+// To see the static catch, uncomment:
+// _the int (if 1: "a" else "b")
+//   error: type mismatch: expected `int`, got `text`
+
+
 // --- TS-3.6: reassignment type-check -------------------------
 //
 // Once a variable is typed (via `_the T`, `^T`, or `T E`
