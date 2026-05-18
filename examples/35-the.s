@@ -1,40 +1,71 @@
-// 35-the.s -- TS-1 substrate: `_the` and `_unsafe`.
+// 35-the.s -- TS-1 + TS-1.1: types-as-functions via overloaded `^`.
 //
-// `_the T E` is the DYN -> typed boundary: runtime-checks that E
-// is of type T and propagates T statically for downstream
-// type-aware fast-paths.  Raises a runtime error on mismatch.
+// Substrate (TS-1, from runtime/sbc.c via mex):
 //
-// `_unsafe T E` is the C-style trust-me cast: skips the runtime
-// check, propagates T statically.  Undefined behaviour if the
-// value isn't really of type T.
+//   _the T E      DYN -> typed boundary.  Runtime-checks E is
+//                 of type T; propagates T statically for fast-
+//                 paths.  Mismatch raises an error via `bad`.
+//   _unsafe T E   C-style trust-me cast.  Same propagation
+//                 minus the runtime check.  UB if E isn't T.
 //
-// Surface sugar (`X^T = E`, `f^Ret A^T1 ... = body`) will be
-// layered on top in a later phase that introduces a non-`^`
-// operator for typed declarations (`^` already binds the
-// apply-on-left operator -- see `\`^\` A B = ...` in macro.s).
+// Surface sugar (TS-1.1):
+//
+//   X^T           When T is a known type (primitive recognised
+//                 by tag_for_predicate / tags_for_predicate, or
+//                 user-defined via `type Foo:...`), the `^`
+//                 macro emits `_the T X` instead of the regular
+//                 apply-on-left `T(X)`.  `^` keeps its existing
+//                 semantics for non-type RHS.
+//   X Expr^T      Declaration with typed value.  The RHS goes
+//                 through the overloaded `^`; downstream sees
+//                 X as typed.
+//   X = Expr^T    Reassignment with typed value (X must be
+//                 declared first).
+//
+// `X^T = E` and `X^T 5` (with `^` on the LHS) do NOT work --
+// they'd collide with the `\`^\` A B = body` operator-def form,
+// which has the same AST shape.  Use the `X Expr^T` /
+// `X = Expr^T` forms instead.
 //
 // Run:  symta -f examples/35-the.s
 
 
-// --- _the: inline ascription ---------------------------------
+// --- ^ overload: typed ascription (expression position) ------
 
-X _the int 5
-say "X = [X]"                          // X = 5
+A 5^int                                // _the int 5 = 5
+say "A = [A]"                          // A = 5
 
-S _the text "hello"
+S "hello"^text                         // text is multi-tag (FIXTEXT|TEXT)
 say "S = [S]"                          // S = hello
 
-
-// --- _unsafe: trust-me cast (skip the check) -----------------
-// Here 7 really IS an int, so no UB.
-
-U _unsafe int 7
-say "U = [U]"                          // U = 7
+// Chained: parens to apply ^ before assignment
+Z (3 + 4)^int
+say "Z = [Z]"                          // Z = 7
 
 
-// --- _the catches mismatches at runtime ----------------------
-// Wrap in btrap so the test driver doesn't see the bterror as
-// an unhandled error.
+// --- Reassignment with typed RHS -----------------------------
 
-Caught btrap: => _the int "not an int"
+B 0                                    // declare B
+B = 42^int                             // reassign via typed expr
+say "B = [B]"                          // B = 42
+
+
+// --- ^ STILL apply-on-left for non-type RHS ------------------
+
+5^say                                  // 5
+"world"^say                            // world
+
+
+// --- Bare _the and _unsafe still work ------------------------
+
+Y _the int 7
+say "Y = [Y]"                          // Y = 7
+
+U _unsafe int 9                        // skip the runtime check
+say "U = [U]"                          // U = 9
+
+
+// --- Runtime check fires on mismatch -------------------------
+
+Caught btrap: => 42^text               // 42.is_text = 0, bad fires
 say "caught: [Caught.is_bterror]"      // caught: 1

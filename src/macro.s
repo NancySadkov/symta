@@ -239,6 +239,23 @@ tags_for_predicate Name =
   else if Name >< "list" then [9 10 11 18]
   else No
 
+// TS-1.1: is `Name` a recognised type-name at this point in
+// macroexpansion?  Used by `^` and by expand_block_item to
+// decide whether `X^T` / `X^T = E` is a typed-decl / assertion
+// (T is a type) or a regular apply-on-left / function-def
+// (T is just a variable name).  Checks:
+//   - primitive types via the tag predicates above
+//   - user-defined types via GTypes (populated by `type Foo:...`)
+// Per-translation-unit visibility -- a `type Foo:...` earlier
+// in the same file (or in an imported macro library) makes Foo
+// a known type for all uses below it.
+//
+is_known_type Name =
+  | when no Name.is_text: ret 0
+  | when got tag_for_predicate Name: ret 1
+  | when got tags_for_predicate Name: ret 1
+  | got GTypes.Name
+
 // OP-5b helper: right-fold a list of tag values into a nested
 // `_if` chain that tests each tag against `(_tag Key)`.  Hit
 // duplicates per branch (typically a small body or label-jump in
@@ -772,6 +789,11 @@ norm_infix_arg A =
 
 `^` A B =
   if:
+    // TS-1.1: when B is a known type, `X^T` is a typed
+    // assertion -- runtime-checked unbox via `_the T X`.
+    // Falls through to the original apply-on-left semantics
+    // when B is just a function/value name.
+    B^is_known_type = [`_the` B A]
     B.is_keyword = [B A]
     A.is_keyword =
       case B
