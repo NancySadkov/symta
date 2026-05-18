@@ -1,7 +1,7 @@
 export macroexpand 'mexlet' 'let_' 'let' 'default_ret_' 'ret'
        'if' 'case'
        '[]' '\\' 'form'
-       'mtx' 'rows' 'rowz' 'list' 'no' 'got' 'not' 'and' 'or'
+       'mtx' 'rows' 'rowz' 'list' 'list_' 'no' 'got' 'not' 'and' 'or'
        'when' 'less' 'while' 'till'
        'dup' 'times' 'map' 'for' 'type'
        'named' 'export' 'export_' 'pop' 'push' 'as' 'callcc' 'fin'
@@ -2406,6 +2406,12 @@ macroexpand Expr Macros ModuleCompiler ModuleFolders =
   | R mex Expr
   | R,GExports
 
+// `list_ @Xs = ...` is the variadic list-builder.  Migration
+// target for callers of the legacy `list @Xs` builder (now an
+// alias) -- see list-transition.md.  Once all call sites move
+// to `list_`, the `list` name will be freed for the type
+// system (`list X` as union type-constructor).
+list_ @Xs = form [$@Xs]
 list @Xs = form [$@Xs]
 
 mtx @Xs =
