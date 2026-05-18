@@ -1,91 +1,87 @@
-// 37-the.s -- TS-1 + TS-1.1 + TS-1.2: types-as-functions.
+// 37-the.s -- TS-1 + TS-1.1 + TS-1.2 + TS-1.3: types-as-functions.
 //
-// Substrate (TS-1):
+// Three semantically distinct forms cover the type-system surface:
 //
-//   _the T E      DYN -> typed boundary.  Runtime-checks E is
-//                 of type T; propagates T statically for fast-
-//                 paths.  Mismatch raises an error via `bad`.
-//   _unsafe T E   C-style trust-me cast.  Same propagation
-//                 minus the runtime check.  UB if E isn't T.
+//   _the T X / X^T      ASSERT: runtime tag check, no conversion.
+//                       Fails fast if X isn't already T.
+//   T X                 CONSTRUCTOR: convert via `.T` method,
+//                       then `_the T`-check.  Identity if X is
+//                       already T.
+//   as_T X              PURE CONVERTER: call `.T` method, no
+//                       runtime check.  Just the conversion.
 //
-// Type-constructor macros (TS-1.2):
+// `_unsafe T X` -- C-style trust cast; UB if X isn't T.
 //
-//   int X       coerces X to int via X.int method (which is
-//               identity for int, b_float_int for float,
-//               text.int parse for text), then `_the int`
-//               runtime-checks the result.  Same form for
-//               float, text, fixtext.
+// Core types (int, float, text, fixtext) are primitives with
+// runtime tag.  Struct types (introduced by `type Foo: ...`,
+// often cls / ECS component interfaces) follow the same triple.
 //
-//     int 3      -> 3.int = 3 (identity)         -> 3
-//     int 3.5    -> 3.5.int = 3 (float.int)      -> 3
-//     int "42"   -> "42".int = 42 (text.int)     -> 42
-//
-// Surface sugar (TS-1.1):
-//
-//   X^T          When T is a known type, the `^` macro emits
-//                `_the T X` -- assertion form (no conversion).
-//                Falls through to apply-on-left for non-types.
-//
-//                Note: `X^int` is the ASSERTION form (E must
-//                already be int).  For coercion, write `int X`.
-//
-// `list` and `fn` are NOT registered as type-constructors --
-// `list` is the list-builder (`list 1 2 3` -> [1 2 3]) and
-// `fn` collides with user-code local-fn definitions.  For
-// "is X a fn/list" use `_the fn X` / `_the list X` or
-// `X^fn` / `X^list`.
+// `list` is a UNION (T_LIST | T_VIEW | T_CONS | T_BYTES).  The
+// variadic `list 1 2 3 -> [1 2 3]` builder is preserved; for
+// "is X a list" use `_the list X` or `X^list`; for "convert X
+// to a list" use `as_list X` (delegates to the universal `.l`
+// method).  Concrete subtypes built via method forms:
+// `N.bytes`, `Xs.pre H`, `Xs[S:E]`.
 //
 // Run:  symta -f examples/37-the.s
 
 
-// --- Type-constructor: coercion via .T method ----------------
+// --- _the / ^: assertion (no conversion) ---------------------
 
-X int 123                              // identity: 123.int = 123
-say "X = [X]"                          // X = 123
-
-Y int 3.5                              // coerce: 3.5.int = 3
-say "Y = [Y]"                          // Y = 3
-
-Z int "42"                             // coerce: "42".int = 42
-say "Z = [Z]"                          // Z = 42
-
-
-// --- ^ assertion: no coercion --------------------------------
-
-A 5^int                                // _the int 5 = 5 (assertion)
+A 5^int
 say "A = [A]"                          // A = 5
 
-S "hello"^text                         // _the text "hello" = "hello"
+S "hello"^text
 say "S = [S]"                          // S = hello
 
-// Chained: parens to apply ^ before assignment
-W (3 + 4)^int
+Caught btrap: => 42^text               // 42 isn't text -> bad fires
+say "caught: [Caught.is_bterror]"      // caught: 1
+
+
+// --- T X: type-constructor (convert via .T, then check) ------
+
+X int 3.5                              // 3.5.int = 3
+say "X = [X]"                          // X = 3
+
+Y int "42"                             // "42".int = 42
+say "Y = [Y]"                          // Y = 42
+
+W (3 + 4)^int                          // parens to apply ^
 say "W = [W]"                          // W = 7
 
 
-// --- Reassignment with typed RHS -----------------------------
+// --- as_T X: pure converter (no check) -----------------------
 
-B 0                                    // declare B
-B = 42^int                             // reassign via typed expr
-say "B = [B]"                          // B = 42
+C as_int 3.5                           // 3.5.int = 3 (no _the check)
+say "C = [C]"                          // C = 3
 
-
-// --- ^ STILL apply-on-left for non-type RHS ------------------
-
-5^say                                  // 5
-"world"^say                            // world
+D as_list "abc"                        // text -> char-list via .l
+say "D = [D]"                          // D = (a b c)
 
 
-// --- Bare _the and _unsafe still work ------------------------
+// --- list union: assertion across all 4 concrete tags --------
 
-P _the int 7
-say "P = [P]"                          // P = 7
+L _the list [1 2 3]                    // T_LIST flat
+say "L.is_list = [L.is_list]"          // 1
+
+M list 1 2 3                           // variadic builder (unchanged)
+say "M = [M]"                          // M = (1 2 3)
+
+
+// --- _unsafe: trust-me cast ----------------------------------
 
 U _unsafe int 9                        // skip the runtime check
 say "U = [U]"                          // U = 9
 
 
-// --- Assertion check fires on mismatch -----------------------
+// --- Reassignment ---------------------------------------------
 
-Caught btrap: => 42^text               // 42.is_text = 0, bad fires
-say "caught: [Caught.is_bterror]"      // caught: 1
+B 0
+B = 42^int
+say "B = [B]"                          // B = 42
+
+
+// --- ^ still apply-on-left for non-type RHS ------------------
+
+5^say                                  // 5
+"world"^say                            // world

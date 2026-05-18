@@ -15,7 +15,8 @@ export macroexpand 'mexlet' 'let_' 'let' 'default_ret_' 'ret'
        'ffi_begin' 'ffi' 'min' 'max' 'swap' 'have' 'source_' 'compile_when' 
        'nullary_' 'hcase' 'hcase_go' 'mac' 'prx' 'mdbg'
        'help'
-       \int \float \text \fixtext 'type_constructor'
+       \int \float \text \fixtext
+       \as_int \as_float \as_text \as_fixtext \as_list \as_bytes
 
 
 GExpansionDepth No
@@ -277,24 +278,74 @@ is_known_type Name =
 // build literal lists with the type-symbol as head -- e.g.
 // expand_ffi at macro.s:2097 emits `[int A B C]` as a
 // type-spec list, not a function call.
-type_constructor TypeName Args =
-  // Args may be a list (runtime varargs) or an atom (some
-  // edge cases pass a non-list).  Treat non-list as
-  // pass-through to avoid case-match crashes.
-  less Args.is_list:
-    ret [TypeName Args]
-  case Args
-    [] | [`_the` TypeName 0]
-    [E] | [`_the` TypeName [`.` E TypeName]]
-    // Multi-arg: pass through unchanged.  FFI type-spec
-    // lists emit `[int A B C]` literally as data, not as a
-    // function call -- this branch lets that survive intact.
-    Else | [TypeName @Args]
+// TS-1.3+ recovery: inline the body in each type-constructor.
+// Trying to factor it through a separate `type_constructor`
+// function broke when the exports list at load_macros time
+// gave `type_constructor` a callable interface that mex
+// invokes as a macro -- the args end up as raw AST atoms
+// (identifier `As`) instead of a runtime list, and case
+// patterns crash on the non-list.  Inlining avoids that
+// entirely: each `int`/`float`/etc. body emits its AST
+// directly without an intermediate call.
+int @As =
+  less As.is_list: ret [\int As]
+  case As
+    [] | [`_the` \int 0]
+    [E] | [`_the` \int [`_mcall` E [`_quote` \int]]]
+    Else | [\int @As]
+float @As =
+  less As.is_list: ret [\float As]
+  case As
+    [] | [`_the` \float 0.0]
+    [E] | [`_the` \float [`_mcall` E [`_quote` \float]]]
+    Else | [\float @As]
+text @As =
+  less As.is_list: ret [\text As]
+  case As
+    [] | [`_the` \text ""]
+    [E] | [`_the` \text [`_mcall` E [`_quote` \text]]]
+    Else | [\text @As]
+fixtext @As =
+  less As.is_list: ret [\fixtext As]
+  case As
+    [] | [`_the` \fixtext ""]
+    [E] | [`_the` \fixtext [`_mcall` E [`_quote` \fixtext]]]
+    Else | [\fixtext @As]
 
-int     @As = type_constructor \int     As
-float   @As = type_constructor \float   As
-text    @As = type_constructor \text    As
-fixtext @As = type_constructor \fixtext As
+// TS-1.3: `as_<T> X` -- **pure converter**.  Calls X's
+// conversion method directly (`.int`, `.l`, etc.) without
+// any assertion.  Distinct from `T X` (TS-1.2, convert-and-
+// check) and `_the T X` / `X^T` (assert only).  Use when
+// you want the conversion only and trust the source.
+//
+// `as_list X` delegates to `.l` (the existing universal
+// to-list method at core_.s:514+), not to a `.list` method
+// (which doesn't exist; `list` is the type-name, not a
+// per-type method name).
+as_int @As =
+  less As.is_list: ret [\as_int As]
+  case As [E]: ret [`_mcall` E [`_quote` \int]]
+  [\as_int @As]
+as_float @As =
+  less As.is_list: ret [\as_float As]
+  case As [E]: ret [`_mcall` E [`_quote` \float]]
+  [\as_float @As]
+as_text @As =
+  less As.is_list: ret [\as_text As]
+  case As [E]: ret [`_mcall` E [`_quote` \text]]
+  [\as_text @As]
+as_fixtext @As =
+  less As.is_list: ret [\as_fixtext As]
+  case As [E]: ret [`_mcall` E [`_quote` \fixtext]]
+  [\as_fixtext @As]
+as_list @As =
+  less As.is_list: ret [\as_list As]
+  case As [E]: ret [`_mcall` E [`_quote` \l]]
+  [\as_list @As]
+as_bytes @As =
+  less As.is_list: ret [\as_bytes As]
+  case As [E]: ret [`_mcall` E [`_quote` \bytes]]
+  [\as_bytes @As]
 // `fn` and `list` are NOT registered as type-constructors:
 //   `fn` collides with user code (e.g. game/src/view_render.s
 //        line 1106: `fn I = "..."` declares a local fn).
