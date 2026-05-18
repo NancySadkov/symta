@@ -68,23 +68,6 @@ N = _the int 100
 say "N = [N]"                          // N = 100
 
 
-// --- TS-3.4: method-return inference -------------------------
-//
-// Conversion methods (`.int`, `.float`, `.text`, ...) always
-// return a value of the named type, regardless of receiver.
-// `infer_type` recognises `[_mcall E [_quote M]]` (the post-mex
-// shape) and returns M when M is a known type name.
-//
-// Result: `_the U <expr>.M` catches statically when M's return
-// type doesn't match U.
-
-V _the float (5.float)                 // OK: .float returns float
-say "V = [V]"                          // V = 5.0
-
-// _the int (5.float)
-//   error: type mismatch: expected `int`, got `float`
-
-
 // --- TS-3.3: typed-shape propagation through any form --------
 //
 // The infer_type pass also recognises pre-mex typed shapes
