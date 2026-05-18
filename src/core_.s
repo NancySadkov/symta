@@ -1,4 +1,4 @@
-export say bad new_macro meta methods
+export say bad new_macro meta methods typeof subtype_of
        rand_get rand_set rand_push rand_pop zip setters_ getters_ atan2
        btland btjump bterror btrap `..`
 
@@ -90,6 +90,36 @@ methods Object =
 | @"Return the table of methods defined for the given value.
 Example:  methods 42          // table of int methods"
 | Object^methods_.t
+
+// TS-2: type-system introspection.  `typeof X` is the design's
+// chosen name for "what type is this value"; today it aliases
+// the existing `typename` builtin which returns the runtime
+// sname -- already normalised so that the four concrete list
+// tags (T_LIST | T_VIEW | T_CONS | T_BYTES) all return "list"
+// and the two text tags (T_TEXT | T_FIXTEXT) return "text",
+// matching the multi-tag union semantics the type system uses.
+//
+// `subtype_of X T` is a type-equality check at the `typename`
+// granularity (i.e. T_LIST and T_CONS both subtype-of `list`).
+// Inheritance walk along the runtime parent chain (so e.g.
+// `subtype_of P object` where P is an int returns 1) is a
+// TS-2.1 follow-up that needs a runtime primitive exposing
+// types[].super.
+//
+// T may be a text ("int") or a tag-symbol (\int) -- both compare
+// equal to typename's text result via the existing `><` overload.
+typeof X =
+| @"Return the type name of X as text.  Alias for `typename` --
+the type-system surface uses `typeof` as the canonical verb."
+| typename X
+
+subtype_of X T =
+| @"Return 1 if X is of type T, 0 otherwise.  T may be a text or
+tag-symbol naming a primitive (`int`, `text`, `list`, ...) or a
+user-defined type from `type Foo: ...`.  Currently checks the
+type-equality case (no inheritance walk -- that's TS-2.1)."
+| TN typename X
+| TN >< T
 
 _.`()` A = A.Me
 // RT-9: fn.`()` is now a C-side BUILTIN_VARARGS in runtime/bltin.c
