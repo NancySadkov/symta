@@ -15,6 +15,7 @@ export macroexpand 'mexlet' 'let_' 'let' 'default_ret_' 'ret'
        'ffi_begin' 'ffi' 'min' 'max' 'swap' 'have' 'source_' 'compile_when' 
        'nullary_' 'hcase' 'hcase_go' 'mac' 'prx' 'mdbg'
        'help'
+       \int \float \text \fixtext 'type_constructor'
 
 
 GExpansionDepth No
@@ -255,6 +256,51 @@ is_known_type Name =
   | when got tag_for_predicate Name: ret 1
   | when got tags_for_predicate Name: ret 1
   | got GTypes.Name
+
+// TS-1.2: type-functions for primitives.  `int X`, `float X`,
+// `text X`, etc. behave as **type constructors**: they coerce
+// X to the target type via the existing `.T` method (which is
+// identity when X is already T, a conversion when X has a
+// registered conversion method, runtime error otherwise),
+// then `_the T` runtime-checks the result.  In practice the
+// post-conversion check is redundant on success and trips on
+// failure -- exactly the dependent-type interface the user
+// asked for.  Same `^`-overload at line 838 unifies
+// `X^int` <-> `int X`.
+//
+//   int 3        -- 3.int = 3 (b_int_int identity); _the int 3 -> 3
+//   int 3.5      -- 3.5.int = 3 (b_float_int conversion)
+//   int "42"     -- "42".int = 42 (text.int parse)
+//   int "abc"    -- "abc".int errors at runtime (parse failure)
+//
+// Multi-arg fallback (`Else` branch) is for callers that
+// build literal lists with the type-symbol as head -- e.g.
+// expand_ffi at macro.s:2097 emits `[int A B C]` as a
+// type-spec list, not a function call.
+type_constructor TypeName Args =
+  // Args may be a list (runtime varargs) or an atom (some
+  // edge cases pass a non-list).  Treat non-list as
+  // pass-through to avoid case-match crashes.
+  less Args.is_list:
+    ret [TypeName Args]
+  case Args
+    [] | [`_the` TypeName 0]
+    [E] | [`_the` TypeName [`.` E TypeName]]
+    // Multi-arg: pass through unchanged.  FFI type-spec
+    // lists emit `[int A B C]` literally as data, not as a
+    // function call -- this branch lets that survive intact.
+    Else | [TypeName @Args]
+
+int     @As = type_constructor \int     As
+float   @As = type_constructor \float   As
+text    @As = type_constructor \text    As
+fixtext @As = type_constructor \fixtext As
+// `fn` and `list` are NOT registered as type-constructors:
+//   `fn` collides with user code (e.g. game/src/view_render.s
+//        line 1106: `fn I = "..."` declares a local fn).
+//   `list` is the list-builder (`list 1 2 3 -> [1 2 3]`).
+// For "is X a fn / list" semantics use `_the fn X` / `X^fn`
+// or `_the list X` / `X^list`.
 
 // OP-5b helper: right-fold a list of tag values into a nested
 // `_if` chain that tests each tag against `(_tag Key)`.  Hit
@@ -792,7 +838,10 @@ norm_infix_arg A =
     // TS-1.1: when B is a known type, `X^T` is a typed
     // assertion -- runtime-checked unbox via `_the T X`.
     // Falls through to the original apply-on-left semantics
-    // when B is just a function/value name.
+    // when B is just a function/value name.  When B IS a
+    // type, emits `[_the B A]` directly -- assertion form
+    // (no conversion).  For the conversion-form, use
+    // `T X` directly (e.g. `int 3.5` -> 3).
     B^is_known_type = [`_the` B A]
     B.is_keyword = [B A]
     A.is_keyword =

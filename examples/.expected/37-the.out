@@ -1,9 +1,12 @@
+X = 123
+Y = 3
+Z = 42
 A = 5
 S = hello
-Z = 7
+W = 7
 B = 42
 5
 world
-Y = 7
+P = 7
 U = 9
 caught: 1
