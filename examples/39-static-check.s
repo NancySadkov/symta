@@ -118,6 +118,25 @@ say "FRes = [FRes]"                    // FRes = 5
 //   error: type mismatch: expected `text`, got `int`
 
 
+// --- TS-3.10: multi-stmt body inference ---------------------
+//
+// `infer_type` recurses into pre-mex `|` blocks and post-mex
+// `_progn` blocks to find the LAST statement's type.  Lets a
+// fn with setup statements before the return-expr still
+// register a typed return.
+
+mkint2 X =
+  Setup 100                            // setup stmt -- ignored
+  _the int X                           // last expr -- propagates
+
+FRes2 _the int mkint2(7)               // OK: int <- mkint2 -> int
+say "FRes2 = [FRes2]"                  // FRes2 = 7
+
+// To see the static catch, uncomment:
+// _the text mkint2(0)
+//   error: type mismatch: expected `text`, got `int`
+
+
 // --- TS-3.7: if-branch type unification ----------------------
 //
 // `if cond E1 else E2` -- if both branches have the same

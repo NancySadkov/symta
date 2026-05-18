@@ -11,6 +11,7 @@ P = 5
 R = hi
 V = 5.0
 FRes = 5
+FRes2 = 7
 IfRes = 10
 WhenRes = yes
 Z = 10

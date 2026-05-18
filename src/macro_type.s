@@ -154,6 +154,12 @@ infer_type Expr =
         | when Then >< \No: T1 = T2
         | when Else >< \No: T2 = T1
         | when got T1 and got T2 and T1 >< T2: ret T1
+      // TS-3.10: `_progn s1 s2 ... last` -- block whose value
+      // is the LAST statement.  Recurse into last to find the
+      // block's type.  Lets fn bodies that have setup statements
+      // followed by a typed return-expr propagate their type.
+      [`_progn` @Stmts]
+        | when Stmts.n > 0: ret: infer_type Stmts.~
       // TS-3.6: pre-mex text literal `"abc"` parses to
       // `[`"` "abc"]` (backtick-`"` operator).  Recognise it
       // so the mismatch check sees `_the int "abc"` as text.
@@ -210,11 +216,20 @@ infer_declared_type Expr =
       [`_type` _ _ B] | ret: infer_declared_type B
       [`_mcall` _ [`_quote` M] @_]
         | when M.is_text and M^is_known_type: ret M
+      // TS-3.10: pre-mex `|` block and post-mex `_progn`: value
+      // is the LAST statement.  Recurse to find the block's
+      // declared type.
+      [`|` @Stmts]
+        | when Stmts.n > 0: ret: infer_declared_type Stmts.~
+      [`_progn` @Stmts]
+        | when Stmts.n > 0: ret: infer_declared_type Stmts.~
       Else
         | Inner infer_peek_inner Expr
         | when Inner.is_list:
           | case Inner
             [`^` _ T] | when T.is_text and T^is_known_type: ret T
+            [`|` @Stmts]
+              | when Stmts.n > 0: ret: infer_declared_type Stmts.~
             [Head @_]
               | when Head.is_text and Head^is_known_type: ret Head
         | ret No
