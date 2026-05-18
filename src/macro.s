@@ -2245,18 +2245,26 @@ hcase MexFormCases Expr ()
   // via the existing `_type T G G` mex form so the type-aware
   // fast-paths at macro.s:803 / :1518 fire for downstream uses.
   // If the check fails, `bad` raises a runtime error.
+  //
+  // `mex E` normalises the value expression -- in particular
+  // `normalize_nesting` unwraps a 1-element list wrapper that
+  // expand_block_item / `=` puts around the RHS of an assignment.
+  // Without this, `X^int = 5` would bind G to `[5]` (list) and
+  // the `is_int` check would always fail.
   [_the Type E]
     | G @rand 'G'
     | Mname "is_[Type]"
     | Msg "value not [Type]"
+    | E2 mex E
     | Check [`_if` [`.` G Mname] [`_type` Type G G] [bad Msg]]
-    | mex [`let_` [[G E]] Check]
+    | mex [`let_` [[G E2]] Check]
   // TS-1: `_unsafe T E` -- C-style trust-me cast.  Skips the
   // runtime check; propagates T statically.  UB if you lie.
   // Use only when the strict checker is provably wrong.
   [_unsafe Type E]
     | G @rand 'G'
-    | mex [`let_` [[G E]] [`_type` Type G G]]
+    | E2 mex E
+    | mex [`let_` [[G E2]] [`_type` Type G G]]
   [`&` O] | if O.is_keyword then O else bad "implement `&Var` ([O])" // [O^mex]
 
 mex ExprIn =
