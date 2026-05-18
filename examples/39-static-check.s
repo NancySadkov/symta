@@ -49,6 +49,25 @@ U _unsafe int 9                        // no checks at all
 say "U = [U]"                          // U = 9
 
 
+// --- TS-3.2: variable-flow propagation -----------------------
+//
+// A typed declaration / assignment records the variable's type
+// in GVarsTypes.  Subsequent uses inside a `_the` slot get
+// checked against that type:
+
+I _the int 5
+J _the int I                           // OK: I is known int
+say "J = [J]"                          // J = 5
+
+T _the text "hello"
+// _the int T                          // would COMPILE-ERROR: T is text
+
+// Reassignment via `=` also propagates:
+N _the int 0
+N = _the int 100
+say "N = [N]"                          // N = 100
+
+
 // --- statically invalid: uncomment to see the compile error --
 
 // X _the int 1.5
@@ -58,4 +77,9 @@ say "U = [U]"                          // U = 9
 //    error: type mismatch: expected `text`, got `int`
 //
 // Z _the int "no"
+//    error: type mismatch: expected `int`, got `text`
+//
+// // Variable-flow mismatch:
+// T _the text "hi"
+// W _the int T
 //    error: type mismatch: expected `int`, got `text`

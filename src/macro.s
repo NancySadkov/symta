@@ -2037,7 +2037,17 @@ expand_block_helper R A B =
   if no A then [B @R]
   else if A.is_keyword then [[_set A B] @R]
   else | R if R.n then [_progn @R] else No
-       | if A^is_var_sym then [[let_ [[A B]] R]]
+       // TS-3.2: declaration `A B` where A is a fresh var and B
+       // has a statically inferable type -- wrap the body in
+       // `_type T A R` so refs to A inside R are checked against
+       // T.  Builds on the existing `_type` mex arm which pushes
+       // T into GVarsTypes for the body's mex pass.
+       | if A^is_var_sym then
+           | TypedR | InferredType infer_type B
+                    | if got InferredType
+                        then [`_type` InferredType A R]
+                        else R
+           | [[let_ [[A B]] TypedR]]
          else
            | A coma_list_normalize A
            | if case A [`[]` @Bs] Bs.all(?^is_var_sym) then
@@ -2402,7 +2412,22 @@ imex Expr = mex Expr
 hcase MexFormCases Expr ()
   [_fn As Body] | [_fn As Body^imex]
   [_set Place Value]
-    | [_set Place (if Value.is_keyword: [_quote Value] else imex Value)]
+    // TS-3.2: when reassigning a var via `=`, detect Value's
+    // static type BEFORE imex (after imex the AST is a let_
+    // wrapper and infer_type can't see through it).  Record
+    // Place's type fact in GVarsTypes so later refs to Place
+    // are statically checked against this type.
+    //
+    // Note: this is the REASSIGNMENT path (`X = ...`).  The
+    // DECLARATION path (`X ...`) goes through expand_block_helper
+    // which wraps the body in `_type T X body` -- the existing
+    // `_type` arm above already pushes the type fact for the
+    // scoped body.
+    | OrigType infer_type Value
+    | NewValue if Value.is_keyword: [_quote Value] else imex Value
+    | when got OrigType and Place^is_var_sym:
+      | GVarsTypes.Place = OrigType
+    | [_set Place NewValue]
   [_label Name] | Expr
   [_goto Name] | Expr
   [_quote X] | if X.is_list: expand_quoted_list X else Expr
