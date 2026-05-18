@@ -87,6 +87,20 @@ say "R = [R]"                          // R = hi
 // S _the int R                        // would COMPILE-ERROR
 
 
+// --- TS-3.4: method-return inference -------------------------
+//
+// Conversion methods (`.int`, `.float`, `.text`, ...) always
+// return a value of the named type, regardless of receiver.
+// `infer_type` recognises `[_mcall E [_quote M]]` (the post-mex
+// shape) and returns M when M is a known type name.
+
+V _the float (5.float)                 // OK: .float returns float
+say "V = [V]"                          // V = 5.0
+
+// _the int (5.float)
+//   error: type mismatch: expected `int`, got `float`
+
+
 // --- TS-3.5: case-arm narrowing -----------------------------
 //
 // Inside a `case X T?:` arm, X is statically known to be T --

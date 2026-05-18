@@ -115,6 +115,15 @@ infer_type Expr =
       [`_the` T _] | ret T
       [`_unsafe` T _] | ret T
       [`_type` T _ _] | ret T
+      // TS-3.4: method call whose method name is a known type.
+      // Conversion methods (.int, .float, .text, .fixtext,
+      // .bytes) return a value of the named type regardless
+      // of receiver type -- they're the universal coercers
+      // defined per-type in core_.s.  The method name after
+      // mex is `[_quote M]`; bare text would mean a dynamic
+      // dispatch we can't statically resolve.
+      [`_mcall` _ [`_quote` M] @_]
+        | when M.is_text and M^is_known_type: ret M
       // TS-3.3: detect pre-mex typed shapes INSIDE a 1-element
       // wrapper.  expand_block_item / expand_assign put `[ ... ]`
       // around the RHS value, so the typed shape sits one level
