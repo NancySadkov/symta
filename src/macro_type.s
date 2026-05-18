@@ -188,17 +188,6 @@ infer_type Expr =
       [`_no` _] | ret "int"
       [`_got` _] | ret "int"
       [`_tag` _] | ret "int"
-      // TS-3.8: function-call return-type lookup.  When `H`
-      // was registered in `GFnReturns` (by
-      // expand_block_item_fn with an inferable body type),
-      // the call site `[H @args]` returns that type.  This
-      // lets `_the U (f X)` catch when f's return doesn't
-      // match U at mex time.
-      //
-      // MUST be last among list-shape cases since `[H @_]`
-      // matches any list with a text head.
-      [H @_]
-        | when H.is_text and got GFnReturns.H: ret GFnReturns.H
       // TS-3.6: pre-mex text literal `"abc"` parses to
       // `[`"` "abc"]` (backtick-`"` operator).  Recognise it
       // so the mismatch check sees `_the int "abc"` as text.
@@ -222,6 +211,10 @@ infer_type Expr =
             [`^` _ T] | when T.is_text and T^is_known_type: ret T
             [`"` @_] | ret "text"
             [Head @_]
+              // TS-3.8: fn-call return-type via GFnReturns.
+              | when Head.is_text and got GFnReturns.Head:
+                | ret GFnReturns.Head
+              // TS-1.2 constructor: known type-name as head.
               | when Head.is_text and Head^is_known_type: ret Head
         | ret No
   | No
