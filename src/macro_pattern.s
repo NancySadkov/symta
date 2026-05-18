@@ -261,36 +261,38 @@ expand_hole Key Hole Hit Miss =
 
 // FIXME: use `coma_list_normalize`
 
-// TS-3.5/3.8: case-arm type narrowing.  Inspect a case-arm
-// pattern and return the type that the matched value must
-// have for the arm to fire -- or No if the pattern doesn't
-// narrow.  Used by expand_match to wrap the arm body in
-// `[_type T X _]` so the matched variable's type is visible
-// inside the arm.
+// TS-3.5: case-arm type narrowing.  Inspect a case-arm pattern
+// and return the type that the matched value must have for the
+// arm to fire -- or No if the pattern doesn't narrow.  Used by
+// expand_match to wrap the arm body in `[_type T X _]` so the
+// matched variable's type is visible inside the arm.
 //
-// Patterns that narrow:
+// Patterns that narrow today:
 //   T?               (TS-3.5)  -- predicate-arm, narrows to T
-//   [...]            (TS-3.8)  -- list-shape, narrows to list
-//   ,X,Y,...         (TS-3.8)  -- comma-tuple, narrows to list
-//                                 (it lowers to a list-shape)
-//   "..."            (TS-3.8)  -- text-shape, narrows to text
+//
+// **List-shape patterns (`[a b]` / `[H @T]`)** would naturally
+// narrow the matched var to "list".  Initial implementation
+// attempts hit two problems:
+//   1. `ret` inside a case-arm body doesn't return from the
+//      enclosing function -- it just yields the value from the
+//      case-arm.  Workaround: bind `R case (...)` and `ret R`.
+//   2. Even with (1) fixed, drift fails at stage 3 ssa-gen
+//      (`produce_ssa:799` / `uniquify_form` infinite recursion)
+//      when narrow fires on `list.s`-style varargs case-arms
+//      (`case As [A] | ...; [] | ...`).  The cause is that
+//      narrow wraps the arm body in `_type list As body`,
+//      and `As` is the varargs param -- something about that
+//      var-flow interacts badly with the inner method
+//      definitions and reassignments that follow the case.
+//
+// Deferred to a TS-3.9 follow-up after the ssa-gen interaction
+// is understood.  Pattern-narrow for predicate-arms is enough
+// to demonstrate the design surface today.
 case_narrow_type Pattern =
   | when Pattern.is_keyword and Pattern.is_text and Pattern.n >> 1:
     | when Pattern.~ >< '?':
       | Lead Pattern.lead
       | when Lead^is_known_type: ret Lead
-  // TS-3.8: list-shape patterns narrow the matched var to
-  // list.  PARTIAL: works for simple `case X [A] | body` and
-  // similar destructure patterns in isolation, but currently
-  // breaks core_.s compilation (segfault in produce_ssa)
-  // for reasons not yet root-caused.  Deferred until a
-  // closer audit of how `_type list Xs Body` interacts with
-  // QLMB-substituted bodies or reassignments inside the arm.
-  // | when Pattern.is_list:
-  //   | case Pattern
-  //     [`[]` @_] | ret "list"
-  //     [`,` @_]  | ret "list"
-  //     [`"` @_]  | ret "text"
   | No
 
 expand_match Keyform Cases Default Key =
