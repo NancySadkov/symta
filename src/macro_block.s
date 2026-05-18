@@ -636,7 +636,10 @@ expand_block_helper R A B =
        // T.  Builds on the existing `_type` mex arm which pushes
        // T into GVarsTypes for the body's mex pass.
        | if A^is_var_sym then
-           | TypedR | InferredType infer_type B
+           // TS-3.6: use infer_declared_type so `X 0` doesn't
+           // narrow X to int.  Only EXPLICITLY-typed forms
+           // (`X _the int 5`, `X int 5`, `X 5^int`) propagate.
+           | TypedR | InferredType infer_declared_type B
                     | if got InferredType
                         then [`_type` InferredType A R]
                         else R

@@ -114,7 +114,14 @@ infer_type Expr =
         | ret No
       [`_the` T _] | ret T
       [`_unsafe` T _] | ret T
-      [`_type` T _ _] | ret T
+      // TS-3.6 fix: `_type T Var Body` scopes Var:T over Body,
+      // but the expression's value is Body's value, not T.
+      // (Common case: receiver-type wrap `[_type id Me body]`
+      // around a method body -- the body returns whatever it
+      // returns, NOT id.)  Recurse into Body to find the
+      // actual result type.  Terminates because each recursion
+      // strips an outer node.
+      [`_type` _ _ B] | ret: infer_type B
       // TS-3.4: method call whose method name is a known type.
       // Conversion methods (.int, .float, .text, .fixtext,
       // .bytes) return a value of the named type regardless
@@ -124,6 +131,10 @@ infer_type Expr =
       // dispatch we can't statically resolve.
       [`_mcall` _ [`_quote` M] @_]
         | when M.is_text and M^is_known_type: ret M
+      // TS-3.6: pre-mex text literal `"abc"` parses to
+      // `[`"` "abc"]` (backtick-`"` operator).  Recognise it
+      // so the mismatch check sees `_the int "abc"` as text.
+      [`"` @_] | ret "text"
       // TS-3.3: detect pre-mex typed shapes INSIDE a 1-element
       // wrapper.  expand_block_item / expand_assign put `[ ... ]`
       // around the RHS value, so the typed shape sits one level
@@ -132,6 +143,50 @@ infer_type Expr =
       // Catches:
       //   [`^` E T]      -- TS-1.1 ascription, lowers to _the T E
       //   [T @_] where T is a known type -- TS-1.2 constructor
+      //   [`"` @_]       -- text literal
+      //   bare int/float -- literal inside a 1-wrap
+      Else
+        | Inner infer_peek_inner Expr
+        | when Inner.is_int: ret "int"
+        | when Inner.is_float: ret "float"
+        | when Inner.is_list:
+          | case Inner
+            [`^` _ T] | when T.is_text and T^is_known_type: ret T
+            [`"` @_] | ret "text"
+            [Head @_]
+              | when Head.is_text and Head^is_known_type: ret Head
+        | ret No
+  | No
+
+// TS-3.6: like `infer_type` but only returns a type when the
+// expression EXPLICITLY declares one -- bare literals (`5`,
+// `"abc"`) return No.  Used by the var-flow propagation paths
+// (`_set` reassign-check and `expand_block_helper` _type wrap)
+// so `R 0` doesn't make R int-typed against the user's intent.
+//
+// Explicit-type forms:
+//   [_the T _]                       -- TS-1 assertion
+//   [_unsafe T _]                    -- TS-1 trust cast
+//   [_type _ _ B]                    -- recurse on body
+//   [_mcall E [_quote M]] (M known)  -- TS-3.4 conversion method
+//   [T @_] where T is known          -- TS-1.2 constructor call
+//   [`^` _ T] where T is known       -- TS-1.1 ascription
+//   variable ref via GVarsTypes      -- previously-declared
+//
+// Bare literals (`5`, `1.5`, `[_quote ...]`, `[`"` ...]`) are
+// deliberately NOT explicit.  `R 0` -> R is dyn, not int.
+infer_declared_type Expr =
+  | when Expr.is_text and not Expr.is_keyword:
+    | T GVarsTypes.Expr
+    | when got T: ret T
+    | ret No
+  | when Expr.is_list:
+    | case Expr
+      [`_the` T _] | ret T
+      [`_unsafe` T _] | ret T
+      [`_type` _ _ B] | ret: infer_declared_type B
+      [`_mcall` _ [`_quote` M] @_]
+        | when M.is_text and M^is_known_type: ret M
       Else
         | Inner infer_peek_inner Expr
         | when Inner.is_list:

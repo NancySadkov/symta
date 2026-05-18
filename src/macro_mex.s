@@ -307,21 +307,41 @@ imex Expr = mex Expr
 hcase MexFormCases Expr ()
   [_fn As Body] | [_fn As Body^imex]
   [_set Place Value]
-    // TS-3.2: when reassigning a var via `=`, detect Value's
-    // static type BEFORE imex (after imex the AST is a let_
-    // wrapper and infer_type can't see through it).  Record
-    // Place's type fact in GVarsTypes so later refs to Place
-    // are statically checked against this type.
+    // TS-3.2/3.7: when reassigning a var via `=`, detect
+    // Value's static type BEFORE imex (after imex the AST is
+    // a let_ wrapper and infer_type can't see through it).
+    //
+    // TS-3.7: if Place ALREADY has a tracked type from an
+    // earlier typed declaration / scoped narrowing, and the
+    // new value's static type is incompatible, raise a
+    // compile error.  Catches `X _the int 5; X = "hi"`.
+    // Falls through silently if either side is unknown -- the
+    // runtime check stays the safety net.
     //
     // Note: this is the REASSIGNMENT path (`X = ...`).  The
     // DECLARATION path (`X ...`) goes through expand_block_helper
     // which wraps the body in `_type T X body` -- the existing
     // `_type` arm above already pushes the type fact for the
     // scoped body.
+    // TS-3.6: use `infer_declared_type` for var-flow (skips
+    // bare-literal types) -- `R 0` shouldn't make R int-typed.
+    // But the reassign mismatch check uses the more permissive
+    // `infer_type` for the new value, so `X _the int 5; X = "hi"`
+    // catches text-literal mismatch.
+    // TS-3.6: only CHECK reassignment against PriorType (set
+    // by `_type T A Body` scoping from a typed declaration);
+    // do NOT propagate a new type onto Place.  Propagation
+    // here would leak types across function scopes -- e.g.
+    // `Dst = gfx $w $h` inside one method would falsely type
+    // Dst in another method's call.  Scoping must come from
+    // `_type` which has proper push/pop.
     | OrigType infer_type Value
     | NewValue if Value.is_keyword: [_quote Value] else imex Value
-    | when got OrigType and Place^is_var_sym:
-      | GVarsTypes.Place = OrigType
+    | when Place^is_var_sym:
+      | PriorType GVarsTypes.Place
+      | when got PriorType and got OrigType
+             and not types_compatible OrigType PriorType:
+        | mex_error "type mismatch on reassign: `[Place]` is `[PriorType]`, got `[OrigType]`"
     | [_set Place NewValue]
   [_label Name] | Expr
   [_goto Name] | Expr

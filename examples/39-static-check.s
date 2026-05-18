@@ -101,6 +101,27 @@ say "V = [V]"                          // V = 5.0
 //   error: type mismatch: expected `int`, got `float`
 
 
+// --- TS-3.6: reassignment type-check -------------------------
+//
+// Once a variable is typed (via `_the T`, `^T`, or `T E`
+// declaration), reassigning it to a value of incompatible
+// type is a compile error.  Caught via the prior-type info
+// pushed into GVarsTypes by the declaration's `_type` wrap.
+
+Z _the int 5
+Z = 10                                 // OK: int <- int
+say "Z = [Z]"                          // Z = 10
+
+// To see the static catch, uncomment:
+// Z = "hi"
+//   error: type mismatch on reassign: `Z` is `int`, got `text`
+
+// Untyped vars stay dyn -- no reassign check:
+W 0                                    // declaration, NOT typed
+W = "hello"                            // OK -- W is dyn
+say "W = [W]"                          // W = hello
+
+
 // --- TS-3.5: case-arm narrowing -----------------------------
 //
 // Inside a `case X T?:` arm, X is statically known to be T --
