@@ -35,7 +35,14 @@ say "A = [A]"                          // A = 5
 S "hello"^text
 say "S = [S]"                          // S = hello
 
-Caught btrap: => 42^text               // 42 isn't text -> bad fires
+// TS-3.1: the static checker catches `42^text` at MEX TIME -- a
+// compile error, not a runtime trap.  To demonstrate the runtime
+// `^T` path that btrap CAN catch, the value has to come from
+// somewhere the checker can't statically prove the type of:
+F (=> 42)                              // returns dyn
+Caught btrap: => F()^text              // F() type is dyn -> static
+                                       // check passes; runtime
+                                       // check fails; bad fires
 say "caught: [Caught.is_bterror]"      // caught: 1
 
 

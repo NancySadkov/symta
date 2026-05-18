@@ -258,6 +258,55 @@ is_known_type Name =
   | when got tags_for_predicate Name: ret 1
   | got GTypes.Name
 
+// TS-3.1: compile-time type inference for a mex-expanded
+// expression.  Returns the type name (text) if statically
+// known, else No.  Conservative -- only fires when we can
+// prove the type without execution.  Used by `_the` to raise
+// compile errors on obvious mismatches.
+//
+// Shapes recognised (from the post-mex AST):
+//   int literal       -- `5`               -> "int"
+//   float literal     -- `1.5`             -> "float"
+//   [_quote T]        -- text or list quote -> "text"/"list"
+//   [_the T _]        -- already-typed expr -> T
+//   [_unsafe T _]     -- trust-me cast      -> T
+//   [_type T _ _]     -- scoped-type form   -> T
+//   variable in scope -- via GVarsTypes
+infer_type Expr =
+  | when Expr.is_int: ret "int"
+  | when Expr.is_float: ret "float"
+  | when Expr.is_text and not Expr.is_keyword:
+    // Variable reference (uppercase-start text token).  Look
+    // up its tracked type in GVarsTypes.  If unknown, fall
+    // through to No.
+    | T GVarsTypes.Expr
+    | when got T: ret T
+    | ret No
+  | when Expr.is_list:
+    | case Expr
+      [`_quote` V]
+        | when V.is_text: ret "text"
+        | when V.is_list: ret "list"
+        | ret No
+      [`_the` T _] | ret T
+      [`_unsafe` T _] | ret T
+      [`_type` T _ _] | ret T
+      Else | ret No
+  | No
+
+// TS-3.1: are two type names compatible for a static check?
+// Compatible means: same name, or either side is `dyn` (the
+// gradual escape), or one is a known sub/super of the other.
+// Today: same-name equality only, with dyn as the universal
+// escape.  Inheritance walks will land in TS-3.2 when needed.
+types_compatible Have Want =
+  | when Have >< Want: ret 1
+  | when Have >< \dyn: ret 1
+  | when Want >< \dyn: ret 1
+  | when Have >< "dyn": ret 1
+  | when Want >< "dyn": ret 1
+  | 0
+
 // TS-1.2: type-functions for primitives.  `int X`, `float X`,
 // `text X`, etc. behave as **type constructors**: they coerce
 // X to the target type via the existing `.T` method (which is
@@ -2380,6 +2429,14 @@ hcase MexFormCases Expr ()
     | Mname "is_[Type]"
     | Msg "value not [Type]"
     | E2 mex E
+    // TS-3.1: static check.  If E2's type can be inferred at
+    // mex time and conflicts with Type, raise a compile error
+    // before we emit the runtime check.  Conservative: only
+    // fires when both sides are known.  Falls through to the
+    // runtime check for any case we can't prove statically.
+    | Inferred infer_type E2
+    | when got Inferred and not types_compatible Inferred Type:
+      | mex_error "type mismatch: expected `[Type]`, got `[Inferred]` (in `_the [Type] [E]`)"
     | Check [`_if` [`.` G Mname] [`_type` Type G G] [bad Msg]]
     | mex [`let_` [[G E2]] Check]
   // TS-1: `_unsafe T E` -- C-style trust-me cast.  Skips the
