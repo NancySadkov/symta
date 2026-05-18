@@ -11,7 +11,7 @@ SH="/usr/bin/bash"
 
 cd "$(dirname "$0")/.."
 
-for s in tokenizer reader macros runtime compiler gfx ffi am uim repl wh; do
+for s in tokenizer reader macros runtime compiler static-check gfx ffi am uim repl wh; do
   echo -n "$s: "
   "$SH" tests/$s/run.sh 2>&1 | grep "^Summary" || echo "(no summary)"
 done
