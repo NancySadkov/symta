@@ -101,6 +101,23 @@ say "V = [V]"                          // V = 5.0
 //   error: type mismatch: expected `int`, got `float`
 
 
+// --- TS-3.8: function-call return-type inference -------------
+//
+// When a function's body has a statically inferable return
+// type (single typed expression like `_the T E` or `T E`),
+// the function gets registered with that return type.  Call
+// sites then propagate the type, so `_the U (f X)` catches
+// when f's return doesn't match U.
+
+mkint X = _the int 5                   // returns int
+FRes _the int mkint(0)                 // OK: int <- mkint -> int
+say "FRes = [FRes]"                    // FRes = 5
+
+// To see the static catch, uncomment:
+// _the text mkint(0)
+//   error: type mismatch: expected `text`, got `int`
+
+
 // --- TS-3.7: if-branch type unification ----------------------
 //
 // `if cond E1 else E2` -- if both branches have the same

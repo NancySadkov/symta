@@ -28,6 +28,10 @@ GModuleFolders No
 GSrc: 0 0 unknown
 GTypes No
 GVarsTypes No // hash: Var -> Type.  Cleared per macroexpand via (!)
+GFnReturns No // TS-3.8: hash: fnname -> return-type-text.
+              // Populated by expand_block_item_fn when the
+              // function body has a statically inferable
+              // return.  Read by infer_type to type call sites.
 GMexLets No //verb mexlets
 GLastType 0
 FFI_Lib No

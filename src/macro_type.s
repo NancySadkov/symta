@@ -131,6 +131,14 @@ infer_type Expr =
       // dispatch we can't statically resolve.
       [`_mcall` _ [`_quote` M] @_]
         | when M.is_text and M^is_known_type: ret M
+      // TS-3.8: function-call return-type lookup.  When `H`
+      // was registered in `GFnReturns` (by
+      // expand_block_item_fn with an inferable body type),
+      // the call site `[H @args]` returns that type.  This
+      // lets `_the U (f X)` catch when f's return doesn't
+      // match U at mex time.
+      [H @_]
+        | when H.is_text and got GFnReturns.H: ret GFnReturns.H
       // TS-3.7: `_if cond Then Else` (post-mex `if`-form) --
       // if both branches have the same inferable type, the
       // if-expression has that type.  Used by `if`, `when`,

@@ -422,6 +422,7 @@ macroexpand Expr Macros ModuleCompiler ModuleFolders =
       GModuleFolders ModuleFolders
       GTypes (!)
       GVarsTypes (!)
+      GFnReturns (!)
       GMexLets (!)
       GLastType 0
   | R mex Expr

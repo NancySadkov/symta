@@ -261,16 +261,36 @@ expand_hole Key Hole Hit Miss =
 
 // FIXME: use `coma_list_normalize`
 
-// TS-3.5: case-arm type narrowing.  For a predicate-arm
-// pattern like `int?` / `text?` / `list?`, return the
-// narrowing type name (without the `?`).  Else No.
-// Used by expand_match to wrap the arm body in `[_type T X _]`
-// so the matched variable's type is visible inside the arm.
+// TS-3.5/3.8: case-arm type narrowing.  Inspect a case-arm
+// pattern and return the type that the matched value must
+// have for the arm to fire -- or No if the pattern doesn't
+// narrow.  Used by expand_match to wrap the arm body in
+// `[_type T X _]` so the matched variable's type is visible
+// inside the arm.
+//
+// Patterns that narrow:
+//   T?               (TS-3.5)  -- predicate-arm, narrows to T
+//   [...]            (TS-3.8)  -- list-shape, narrows to list
+//   ,X,Y,...         (TS-3.8)  -- comma-tuple, narrows to list
+//                                 (it lowers to a list-shape)
+//   "..."            (TS-3.8)  -- text-shape, narrows to text
 case_narrow_type Pattern =
   | when Pattern.is_keyword and Pattern.is_text and Pattern.n >> 1:
     | when Pattern.~ >< '?':
       | Lead Pattern.lead
       | when Lead^is_known_type: ret Lead
+  // TS-3.8: list-shape patterns narrow the matched var to
+  // list.  PARTIAL: works for simple `case X [A] | body` and
+  // similar destructure patterns in isolation, but currently
+  // breaks core_.s compilation (segfault in produce_ssa)
+  // for reasons not yet root-caused.  Deferred until a
+  // closer audit of how `_type list Xs Body` interacts with
+  // QLMB-substituted bodies or reassignments inside the arm.
+  // | when Pattern.is_list:
+  //   | case Pattern
+  //     [`[]` @_] | ret "list"
+  //     [`,` @_]  | ret "list"
+  //     [`"` @_]  | ret "text"
   | No
 
 expand_match Keyform Cases Default Key =

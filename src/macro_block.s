@@ -289,6 +289,14 @@ supply_ret Name Body =
   expand_lambda As [`|` Body]
 
 expand_block_item_fn Name As Body =
+// TS-3.8: register fn return type when body has a statically
+// inferable shape.  Used by `infer_type` to type call sites
+// of `Name` as the registered return type, so `_the U (Name
+// X)` catches mismatches at mex time.  Conservative: only
+// fires when the WHOLE body has a known declared type
+// (single typed expression like `_the T E` or `T E`).
+| RetT infer_declared_type Body
+| when got RetT: GFnReturns.Name = RetT
 | Body = expand_qlmb Body
 | Body = supply_ret Name Body
 | Body = [_progn [_mark Name] Body]
