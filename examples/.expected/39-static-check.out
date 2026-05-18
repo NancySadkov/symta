@@ -16,6 +16,7 @@ IfRes = 10
 WhenRes = yes
 Z = 10
 W = hello
+countX 0/1/2 = 0 / 1 / 2
 classify 5 = 5
 classify 1.5 = 1.5
 classify 'hi' = hi

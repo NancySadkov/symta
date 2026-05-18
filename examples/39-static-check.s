@@ -176,6 +176,31 @@ W = "hello"                            // OK -- W is dyn
 say "W = [W]"                          // W = hello
 
 
+// --- TS-3.9: list-shape case-arm narrowing -------------------
+//
+// Fixed-length 0/1/2-element list patterns narrow the matched
+// var to "list" inside the arm.  Splat and 3+ patterns are
+// deferred (see notes in macro_pattern.s).
+
+countX Xs =
+  case Xs
+    []      | _the int 0      // empty: 0 items
+    [A]     | _the int 1      // single: 1 item
+    [A B]   | _the int 2      // pair: 2 items
+    Else    | -1
+
+C0 countX []
+C1 countX [a]
+C2 countX [a b]
+say "countX 0/1/2 = [C0] / [C1] / [C2]"   // 0 / 1 / 2
+
+// To see the static catch, uncomment:
+// buggy Xs = case Xs
+//   [A B] | _the text Xs              // Xs is list, not text
+//   Else | "?"
+//   error: type mismatch: expected `text`, got `list`
+
+
 // --- TS-3.5: case-arm narrowing -----------------------------
 //
 // Inside a `case X T?:` arm, X is statically known to be T --
