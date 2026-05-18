@@ -118,6 +118,29 @@ say "FRes = [FRes]"                    // FRes = 5
 //   error: type mismatch: expected `text`, got `int`
 
 
+// --- TS-3.11: arithmetic + comparison return-types ----------
+//
+// Binary `+`/`-`/`*`/`/`/`%` and unary `-`/`abs` propagate
+// numeric types: int+int -> int, anything-with-float -> float.
+// Comparisons (`<`, `>`, `<<`, `>>`, `><`, `<>`, etc.) and
+// `no`/`got`/`tag` queries return int.  Composes with all
+// the other paths.
+
+A0 _the int (5 + 3)                    // OK -- both int
+say "5+3 = [A0]"                       // 5+3 = 8
+
+A1 _the float (1.5 * 2.0)              // OK -- both float
+say "1.5*2.0 = [A1]"                   // 1.5*2.0 = 3.0
+
+A2 _the int (10 << 3)                  // OK -- compare returns int
+say "10<<3 = [A2]"                     // 10<<3 = 1
+
+// To see the static catches, uncomment any:
+// _the text (5 + 3)            -- expected text, got int
+// _the int (1.5 + 2.0)         -- expected int, got float
+// _the text (10 << 3)          -- expected text, got int
+
+
 // --- TS-3.10: multi-stmt body inference ---------------------
 //
 // `infer_type` recurses into pre-mex `|` blocks and post-mex

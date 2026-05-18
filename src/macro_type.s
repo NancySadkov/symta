@@ -96,6 +96,19 @@ infer_peek_inner Expr =
   case Expr [E] | E
               X | X
 
+// TS-3.11 helpers.
+arith_result_type A B =
+  | T1 infer_type A
+  | T2 infer_type B
+  | when T1 >< "float" or T2 >< "float": ret "float"
+  | when T1 >< "int" and T2 >< "int": ret "int"
+  | No
+
+unary_numeric_type A =
+  | T1 infer_type A
+  | when T1 >< "int" or T1 >< "float": ret T1
+  | No
+
 infer_type Expr =
   | when Expr.is_int: ret "int"
   | when Expr.is_float: ret "float"
@@ -131,14 +144,6 @@ infer_type Expr =
       // dispatch we can't statically resolve.
       [`_mcall` _ [`_quote` M] @_]
         | when M.is_text and M^is_known_type: ret M
-      // TS-3.8: function-call return-type lookup.  When `H`
-      // was registered in `GFnReturns` (by
-      // expand_block_item_fn with an inferable body type),
-      // the call site `[H @args]` returns that type.  This
-      // lets `_the U (f X)` catch when f's return doesn't
-      // match U at mex time.
-      [H @_]
-        | when H.is_text and got GFnReturns.H: ret GFnReturns.H
       // TS-3.7: `_if cond Then Else` (post-mex `if`-form) --
       // if both branches have the same inferable type, the
       // if-expression has that type.  Used by `if`, `when`,
@@ -160,6 +165,40 @@ infer_type Expr =
       // followed by a typed return-expr propagate their type.
       [`_progn` @Stmts]
         | when Stmts.n > 0: ret: infer_type Stmts.~
+      // TS-3.11: arithmetic + comparison ops -- output type
+      // from operand types.  Conservative: only fires when
+      // operands have known numeric types.
+      [`_add` A B] | ret: arith_result_type A B
+      [`_sub` A B] | ret: arith_result_type A B
+      [`_mul` A B] | ret: arith_result_type A B
+      [`_div` A B] | ret: arith_result_type A B
+      [`_rem` A B] | ret: arith_result_type A B
+      [`_inc` A] | ret: unary_numeric_type A
+      [`_dec` A] | ret: unary_numeric_type A
+      [`_neg` A] | ret: unary_numeric_type A
+      [`_abs` A] | ret: unary_numeric_type A
+      [`_lt` @_] | ret "int"
+      [`_gt` @_] | ret "int"
+      [`_lte` @_] | ret "int"
+      [`_gte` @_] | ret "int"
+      [`_eq` @_] | ret "int"
+      [`_ne` @_] | ret "int"
+      [`_same` @_] | ret "int"
+      [`_vary` @_] | ret "int"
+      [`_no` _] | ret "int"
+      [`_got` _] | ret "int"
+      [`_tag` _] | ret "int"
+      // TS-3.8: function-call return-type lookup.  When `H`
+      // was registered in `GFnReturns` (by
+      // expand_block_item_fn with an inferable body type),
+      // the call site `[H @args]` returns that type.  This
+      // lets `_the U (f X)` catch when f's return doesn't
+      // match U at mex time.
+      //
+      // MUST be last among list-shape cases since `[H @_]`
+      // matches any list with a text head.
+      [H @_]
+        | when H.is_text and got GFnReturns.H: ret GFnReturns.H
       // TS-3.6: pre-mex text literal `"abc"` parses to
       // `[`"` "abc"]` (backtick-`"` operator).  Recognise it
       // so the mismatch check sees `_the int "abc"` as text.
