@@ -274,16 +274,39 @@ expand_hole Key Hole Hit Miss =
 //                                     list literal patterns; narrow
 //                                     to "list".
 //
-// **3+ element list patterns and splat patterns are still
-// deferred.**  Bisecting bootstrap drift showed that `_type list
-// X body` wraps with 3+ elements or `@`-splats cause a downstream
-// destructure mismatch deep in expand_match's compiled output --
-// the runtime fatal "couldnt match (case Expr (`[]` ...))" fires.
-// The exact interaction with `expand_block_helper`'s emission of
-// `_fatal "couldnt match [B] to [A]"` and the subsequent
-// `normalize_arg` -> `mex_extern` lookup (which treats the
-// fatal text as a `Pkg?Sym` keyword extern) isn't yet root-caused.
-// 0/1/2-element narrows fire safely in core_.s / game/ / voxpie/.
+// **TS-3.9 investigation findings (3+ patterns deferred):**
+//
+// 1. The bug is **the `_type` wrap itself**, not the type name.
+//    Bisected by changing the wrap-tag from "list" to "dyn" --
+//    same failure.  Then replacing the wrap with `[_progn @Body]`
+//    (no `_type` at all) -- drift PASSES.  So `_type Var Body`
+//    with certain Body shapes corrupts mex output.
+//
+// 2. The TRIGGER is `mexlet`'s 3-arg case-arm at macro_ops.s:69
+//    `[Expr Value Body] | form: mexlet ((Expr Value)) Body`
+//    The `form:` macro builds an AST template; wrapping its
+//    output in `[_type list As ...]` produces a corrupted mex
+//    output.
+//
+// 3. The runtime surface is "couldnt match (case Expr (`[]` ...))"
+//    -- a `_fatal` from `expand_block_helper` line 660 emitted
+//    as a destructure no-match default.  The text contains `?`
+//    (from `list?`), which `normalize_arg`'s `handle_extern`
+//    splits into a fake `Pkg?Sym` keyword.  Then `load_symbol`
+//    fails with "couldn't compile [Library]" where Library is
+//    that long fatal text.  So the fatal IS firing at mex time,
+//    meaning the corrupted bytecode has the fatal AT mex level
+//    instead of runtime.
+//
+// 4. The DEEP question is HOW `_type T Var Body` corrupts the
+//    form output.  `_type` is supposed to be transparent (push
+//    GVarsTypes, mex body, pop, return mexed body).  Possibly an
+//    interaction with the form macro's expand_form recursion,
+//    or with mex_normal's text-keyword extern path at line 254.
+//    Not yet root-caused.
+//
+// Pragmatic ship: 0/1/2-element narrows cover most case-arm
+// uses in practice.  3+ patterns fall through to runtime.
 //
 // `ret` inside a case-arm body doesn't return from the enclosing
 // function (it yields the arm value); the body below uses the
@@ -293,7 +316,7 @@ case_narrow_type Pattern =
     | when Pattern.~ >< '?':
       | Lead Pattern.lead
       | when Lead^is_known_type: ret Lead
-  // TS-3.9: 0..2-element list patterns (3+ deferred)
+  // TS-3.9: 0..2-element list patterns (3+ deferred).
   | when Pattern.is_list:
     | R case Pattern
         [`[]`] | "list"
