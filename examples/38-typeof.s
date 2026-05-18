@@ -6,8 +6,12 @@
 //                       T_TEXT | T_FIXTEXT -> "text".
 //   subtype_of X T   -> 1 if X is of type T, 0 otherwise.
 //                       T may be a text ("int") or tag-symbol (\int).
-//                       Equality at the `typename` granularity --
-//                       no inheritance walk yet (TS-2.1).
+//                       Walks the runtime super chain (TS-2.1):
+//                       `subtype_of 5 \_` is 1 (int <: _),
+//                       `subtype_of [1] \hard_list` is 1
+//                       (T_LIST <: T_HARD_LIST).
+//   parents_of_ X    -> list of type names from X's own type
+//                       up to the root.
 //
 // Run:  symta -f examples/38-typeof.s
 
@@ -53,3 +57,13 @@ A subtype_of P \list;    say "P :> list  = [A]"   // 0
 
 A subtype_of 5 "int";    say "text-arg  = [A]"    // 1
 A subtype_of 5 \int;     say "tag-arg   = [A]"    // 1
+
+
+// --- TS-2.1: inheritance walk via runtime super chain --------
+
+A subtype_of 5 \_;       say "5 :> _ (root) = [A]"      // 1
+A subtype_of L1 \hard_list; say "L_FLAT :> hard_list = [A]" // 1
+A subtype_of "ab" \_fixtext_; say "'ab' :> _fixtext_ = [A]"  // 1 (short text is fixtext)
+
+A parents_of_ 5;         say "parents_of 5 = [A]"      // (int _)
+A parents_of_ [1 2 3];   say "parents_of list = [A]"   // (_list_ hard_list list _)

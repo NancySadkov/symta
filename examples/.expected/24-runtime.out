@@ -12,7 +12,7 @@ typename 'hi'  = text
 typename a list = list
 typename P     = point
 P has 40 methods total
-first 5 names: (is_macro fields_ is_register is_fnmeta `{}`)
+first 5 names: (is_macro fields_ is_register `{}` is_fnmeta)
 
 allocating 3 handles, dropping refs immediately...
   using handle 1

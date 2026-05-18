@@ -114,12 +114,13 @@ the type-system surface uses `typeof` as the canonical verb."
 | typename X
 
 subtype_of X T =
-| @"Return 1 if X is of type T, 0 otherwise.  T may be a text or
-tag-symbol naming a primitive (`int`, `text`, `list`, ...) or a
-user-defined type from `type Foo: ...`.  Currently checks the
-type-equality case (no inheritance walk -- that's TS-2.1)."
-| TN typename X
-| TN >< T
+| @"Return 1 if X's type is T or T is an ancestor of X's
+type.  T may be a text or tag-symbol naming a primitive
+or a user-defined type.  Walks the runtime super chain
+via parents_of_ -- the list starts with X's own type-name
+then climbs through each ancestor up to the root."
+| Ps parents_of_ X
+| got Ps.find(? >< T)
 
 _.`()` A = A.Me
 // RT-9: fn.`()` is now a C-side BUILTIN_VARARGS in runtime/bltin.c

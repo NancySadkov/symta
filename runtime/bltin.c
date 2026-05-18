@@ -1710,6 +1710,35 @@ RETURNS(FXN(IMMEDIATE(o)))
 BUILTIN1("typename",typename,C_ANY,o)
 RETURNS(types[O_TAG(o)].sname);
 
+/* TS-2.1: Walk the runtime type-tag super chain (set up by
+ * add_subtype in main.c) and return a Symta list of text names,
+ * starting from the receiver's own tag, then its parent, then
+ * grandparent, up to the root.  Uses `types[tag].name` (the C
+ * string) rather than `sname` because many internal types
+ * (T_OBJECT, T_HARD_LIST, T_GENERIC_TEXT, ...) don't have an
+ * sname set but DO have a `name`.  The caller-facing
+ * `subtype_of X T` in core_.s walks this list. */
+BUILTIN1("parents_of_",parents_of_,C_ANY,o)
+  int tag = O_TAG(o);
+  int chain[32];
+  int n = 0;
+  while (tag != END_TAG && n < 32) {
+    chain[n++] = tag;
+    tag = types[tag].super;
+  }
+  GC_DISABLE();
+  R = Empty;
+  /* Build list with head = X's own type-name, tail = ancestors */
+  for (int i = n - 1; i >= 0; i--) {
+    dyn name_text;
+    TEXT(name_text, types[chain[i]].name);
+    void *c;
+    CONS(c, name_text, R);
+    R = c;
+  }
+  GC_ENABLE();
+RETURNS(R)
+
 
 #define PU3(name,s,m,x,y,z) \
 BUILTIN1(#name,name,C_ANY,o) \
@@ -2904,6 +2933,7 @@ static struct {
   B(inspect)
   B(halt)
   B(typename)
+  B(parents_of_)
   B(methods_)
   B(dbg)
   B(say_)
