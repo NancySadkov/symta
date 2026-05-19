@@ -353,6 +353,21 @@ hcase MexFormCases Expr ()
     | R mex Body
     | GVarsTypes.Var =  Old
     | R
+  // TS-3.9 KISS: flat typed binding for destructure splats.
+  // `[_let1 T V Val Body]` -- bind V to Val and narrow V to T over Body.
+  // Used by `expand_list_hole` to emit `Xs : list` at the binding
+  // site of a `[X@Xs]` pattern's splat-tail, instead of wrapping
+  // the outer case-arm body in `[_type T MatchedVar body]` (which
+  // bombs out for some 3+ element patterns, see macro_pattern.s
+  // failure-mode notes).  The narrow only touches the FRESH var
+  // introduced by the pattern matcher, never the user's outer
+  // matched value, so it avoids the recursion-via-`form` blowup.
+  [_let1 Type Var Value Body]
+    | Old GVarsTypes.Var
+    | GVarsTypes.Var =  Type
+    | R mex [`let_` [[Var Value]] Body]
+    | GVarsTypes.Var =  Old
+    | R
   // TS-1: `_the T E` -- DYN -> typed boundary.  Runtime-checks
   // that E's value is of type T, then propagates T statically
   // via the existing `_type T G G` mex form so the type-aware

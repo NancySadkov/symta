@@ -393,7 +393,13 @@ sbs What With Src = form: case Src What With ~Else ~Else
     | Type GVarsTypes.A
     | when got Type:
       | Fields GTypes.Type
-      | P | got Fields and Fields.locate(B)
+      // Subtle: `got Fields and Fields.locate(B)` short-circuits
+      // to 0 when Fields is No -- but `got 0` is 1 (0 != No),
+      // so the `when got P` below would fire with P=0 and emit a
+      // wrong-field `_dget A 0`.  Guard with `if got Fields` so
+      // P stays No for non-struct types like `list`/`int` that
+      // aren't registered in GTypes.
+      | P | if got Fields then Fields.locate(B) else No
       | when got P: ret [_dget A P]
   | ret ['()' ['.' A B]]
   case B [`:` ':'+'!'<Op Body]:

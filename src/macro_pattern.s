@@ -58,7 +58,19 @@ expand_list_hole Key Hole Hit Miss = case Hole
     | expand_list_hole Key [@Cs @More] Hit Miss
   [[`@` @Zs]] | case Zs.n
                   0 | expand_hole Key _ Hit Miss
-                  1 | expand_hole Key Zs.0 Hit Miss
+                  // TS-3.9 KISS splat-tail narrow: if user wrote
+                  // `[... @Xs]` with Xs a bare var, bind Xs : list
+                  // at the binding site via `_let1`.  Key is the
+                  // gensym standing in for the matched list tail,
+                  // which is a list by construction (we're inside
+                  // an is_list guard from `expand_hole`).  This is
+                  // the only narrow we emit -- the prior
+                  // case-arm-body wrap (`_type T MatchedVar body`)
+                  // bombs out for 3+ element patterns; see the
+                  // failure-mode notes below.
+                  1 | if Zs.0^is_var_sym
+                        then [`_let1` \list Zs.0 Key Hit]
+                        else expand_hole Key Zs.0 Hit Miss
                   Else | mex_error "bad match case: [Hole]"
   [[`@` Zs] @More] | expand_list_hole_advanced Zs More Key Hit Miss
   [[`*` Item] @Xs] | expand_kleene_star_hole Key _ Item Xs Hit Miss
@@ -268,71 +280,35 @@ expand_hole Key Hole Hit Miss =
 // `[_type T X _]` so the matched variable's type is visible
 // inside the arm.
 //
-// Patterns that narrow today:
+// Patterns that narrow the OUTER matched value today:
 //   T?                  (TS-3.5)  -- predicate-arm, narrows to T
 //   `[]` / `[A]` / `[A B]` (TS-3.9) -- fixed-length 0/1/2-element
 //                                     list literal patterns; narrow
 //                                     to "list".
 //
-// **TS-3.9 investigation findings (3+ patterns deferred):**
+// Additionally: the destructure splat-tail (`Xs` in `[X@Xs]`) is
+// always narrowed to "list" at its binding site (see the
+// `[[`@` @Zs]]` arm in `expand_list_hole` above) -- a flat
+// `_let1` emission that types the gensym tail directly without
+// wrapping the case-arm body, so it composes safely with any
+// outer pattern shape including 3+ patterns.
 //
-// 1. The bug is **the `_type` wrap itself**, not the type name.
-//    Bisected by changing the wrap-tag from "list" to "dyn" --
-//    same failure.  Then replacing the wrap with `[_progn @Body]`
-//    (no `_type` at all) -- drift PASSES.  So `_type Var Body`
-//    with certain Body shapes corrupts mex output.
-//
-// 2. The TRIGGER is `mexlet`'s 3-arg case-arm at macro_ops.s:69
-//    `[Expr Value Body] | form: mexlet ((Expr Value)) Body`
-//    The `form:` macro builds an AST template; wrapping its
-//    output in `[_type list As ...]` produces a corrupted mex
-//    output.
-//
-// 3. The runtime surface is "couldnt match (case Expr (`[]` ...))"
-//    -- a `_fatal` from `expand_block_helper` line 660 emitted
-//    as a destructure no-match default.  The text contains `?`
-//    (from `list?`), which `normalize_arg`'s `handle_extern`
-//    splits into a fake `Pkg?Sym` keyword.  Then `load_symbol`
-//    fails with "couldn't compile [Library]" where Library is
-//    that long fatal text.  So the fatal IS firing at mex time,
-//    meaning the corrupted bytecode has the fatal AT mex level
-//    instead of runtime.
-//
-// 4. The DEEP question is HOW `_type T Var Body` corrupts the
-//    form output.  `_type` is supposed to be transparent (push
-//    GVarsTypes, mex body, pop, return mexed body).  Possibly an
-//    interaction with the form macro's expand_form recursion,
-//    or with mex_normal's text-keyword extern path at line 254.
-//    Not yet root-caused.
-//
-// 5. **Things tried and they all failed for 3+ patterns:**
-//    a. `[_type list V B]` with different type names ("dyn",
-//       "int") -- same failure.  So it's not the name.
-//    b. Per-statement wraps `map S Body: [_type T V S]` --
-//       same failure.  So it's not the `_progn` interaction.
-//    c. Cloning `_type` as `_narrow` with identical mex arm --
-//       SAME failure.  So it's not name-clash with existing
-//       `_type` callers.  The bug is in HOW mex processes the
-//       body INSIDE the push/pop scope, regardless of arm name.
-//    d. `[let_ [[V [_the T V]]] body]` (let-binding shadow) --
-//       infinite recursion during bootstrap (mexlet's case-arm
-//       gets re-wrapped each pass, exponential blowup).
-//    e. Filtering out gensym Keyforms (vars ending in digits)
-//       and excluding "As" specifically -- failure shifts to
-//       another user-var, so it's not name-specific.
-//
-// Pragmatic ship: 0/1/2-element narrows cover most case-arm
-// uses in practice.  3+ patterns fall through to runtime.
-//
-// **The path forward** for the next investigator:
-//   - Instrument the `_type` arm to log GVarsTypes state
-//     before/after each invocation.
-//   - Compare mex outputs for the failing case-arm with and
-//     without the wrap, byte-by-byte.
-//   - Specifically inspect what `form` produces in both cases.
-//   - Check if `mex_error` or `bad` is firing somewhere inside
-//     the wrapped body's mex; that would bypass `_type`'s pop
-//     and leak GVarsTypes state into subsequent file compiles.
+// **TS-3.9 deferred -- 3+ element fixed-list patterns:**
+// `case L [A B C]: <body>` does not narrow L to "list" today.
+// The same `[_type list MatchedVar body]` wrap that works fine
+// for predicate arms (TS-3.5) and 0/1/2-element list patterns
+// corrupts mex output for 3+ element patterns.  Specifically,
+// mexlet's 3-arg case-arm at macro_ops.s:69
+// (`[Expr Value Body] | form: mexlet ((Expr Value)) Body`)
+// blows up when wrapped, surfacing as a `_fatal` from
+// expand_block_helper line 660 whose text contains `?` from
+// `list?` -- normalize_arg's `Pkg?Sym` extern split then
+// mistakes that text for a library import.  Things tried that
+// failed: different type names, per-statement wraps, cloned
+// `_narrow` form, let-binding shadow.  Root cause not isolated.
+// The splat-tail narrow above sidesteps the issue by typing only
+// the destructure-introduced gensym, which doesn't interact with
+// the outer match's body shape.
 //
 // `ret` inside a case-arm body doesn't return from the enclosing
 // function (it yields the arm value); the body below uses the

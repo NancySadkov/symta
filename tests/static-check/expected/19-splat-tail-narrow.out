@@ -1,0 +1,1 @@
+tests/static-check/cases/19-splat-tail-narrow.s:6,12: type mismatch: expected `int`, got `list` (in `_the int Rest`)
