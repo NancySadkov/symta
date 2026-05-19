@@ -265,6 +265,24 @@ infer_type Expr =
       [`_fsub` _ _] | ret "float"
       [`_fmul` _ _] | ret "float"
       [`_fdiv` _ _] | ret "float"
+      // TS-4.3: pre-mex arith / compares.  Mirrors the TS-4.3a
+      // peek-through in `infer_declared_type` but with the more
+      // permissive `arith_result_type` (counts bare literals).
+      // Used by `bin_op` to upgrade nested arith chains to the
+      // typed _iadd / _isub / ... family when an inner subtree
+      // proves a known numeric type.  Example: in
+      //   foo X^int Y^int = (X + Y) * 2
+      // the inner `+` infers int via this arm, so the outer `*`
+      // sees both operands as int and routes to _imul.
+      [`+` A B] | ret: arith_result_type A B
+      [`-` A B] | ret: arith_result_type A B
+      [`*` A B] | ret: arith_result_type A B
+      [`/` A B] | ret: arith_result_type A B
+      [`%` A B] | ret: arith_result_type A B
+      [`<` A B]  | when got (arith_result_type A B): ret "int"
+      [`>` A B]  | when got (arith_result_type A B): ret "int"
+      [`<<` A B] | when got (arith_result_type A B): ret "int"
+      [`>>` A B] | when got (arith_result_type A B): ret "int"
       [`_inc` A] | ret: unary_numeric_type A
       [`_dec` A] | ret: unary_numeric_type A
       [`_neg` A] | ret: unary_numeric_type A
