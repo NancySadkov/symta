@@ -109,6 +109,31 @@ unary_numeric_type A =
   | when T1 >< "int" or T1 >< "float": ret T1
   | No
 
+// TS-4.3a: declaration-style arith result.  Conservative
+// counterpart to `arith_result_type`: uses `infer_declared_type`
+// for the operands, so bare-literal operands (`X + 1`) don't
+// count -- only operands with an explicit type declaration (a
+// typed param via `_type` push, an `_the` wrap, a constructor
+// call, etc.).  Returned int / float follows the usual numeric
+// promotion rules.
+declared_arith_result_type A B =
+  | T1 infer_declared_type A
+  | T2 infer_declared_type B
+  | when T1 >< "float" or T2 >< "float": ret "float"
+  | when T1 >< "int" and T2 >< "int": ret "int"
+  | No
+
+// TS-4.3a: declaration-style numeric comparison.  Comparisons
+// return int (0/1) when both operands have a declared numeric
+// type; otherwise the result type isn't statically proven.
+declared_compare_result_type A B =
+  | T1 infer_declared_type A
+  | T2 infer_declared_type B
+  | NumA (T1 >< "int" or T1 >< "float")
+  | NumB (T2 >< "int" or T2 >< "float")
+  | when NumA and NumB: ret "int"
+  | No
+
 // TS-3.13: unify the types of a list of case-arm body expressions.
 // Returns the common type if every arm has the same statically-
 // known type, else No (== "can't prove").  Two skip-rules:
@@ -318,7 +343,26 @@ infer_declared_type Expr =
     | case Expr
       [`_the` T _] | ret T
       [`_unsafe` T _] | ret T
-      [`_type` _ _ B] | ret: infer_declared_type B
+      // TS-4.3a: push GVarsTypes.V=T for the duration of the
+      // recursion into Body, then pop.  Without this, a typed-
+      // param wrap like `[_type int X (X + Y)]` couldn't surface
+      // the int type through the inner pre-mex `+` arm below.
+      // Mirrors `_type`'s push/pop in mex's special-form dispatch.
+      [`_type` T V B]
+        | Old GVarsTypes.V
+        | GVarsTypes.V =  T
+        | R infer_declared_type B
+        | GVarsTypes.V =  Old
+        | ret R
+      // Same push/pop for `_let1` (TS-3.9c destructure splat-tail
+      // narrow): the binding establishes a typed var; recursion
+      // into Body needs to see it.
+      [`_let1` T V _ B]
+        | Old GVarsTypes.V
+        | GVarsTypes.V =  T
+        | R infer_declared_type B
+        | GVarsTypes.V =  Old
+        | ret R
       [`_mcall` _ [`_quote` M] @_]
         | when M.is_text and M^is_known_type: ret M
       // TS-3.10: pre-mex `|` block and post-mex `_progn`: value
@@ -361,6 +405,22 @@ infer_declared_type Expr =
             [`^` _ T] | when T.is_text and T^is_known_type: ret T
             [`|` @Stmts]
               | when Stmts.n > 0: ret: infer_declared_type Stmts.~
+            // TS-4.3a: pre-mex arith / compares on typed operands.
+            // Recognised AFTER `infer_peek_inner` unwraps the 1-elem
+            // value wrapper that expand_block_item puts around RHS
+            // values.  Requires BOTH operands to be declaration-
+            // typed (typed params via `_type` push, an explicit
+            // `_the` / `^T` / constructor) -- bare literals don't
+            // count, matching TS-3.6's bare-init rule.
+            [`+` A B]  | ret: declared_arith_result_type A B
+            [`-` A B]  | ret: declared_arith_result_type A B
+            [`*` A B]  | ret: declared_arith_result_type A B
+            [`/` A B]  | ret: declared_arith_result_type A B
+            [`%` A B]  | ret: declared_arith_result_type A B
+            [`<` A B]  | ret: declared_compare_result_type A B
+            [`>` A B]  | ret: declared_compare_result_type A B
+            [`<<` A B] | ret: declared_compare_result_type A B
+            [`>>` A B] | ret: declared_compare_result_type A B
             [Head @_]
               | when Head.is_text and Head^is_known_type: ret Head
         | ret No
