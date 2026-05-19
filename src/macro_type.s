@@ -109,6 +109,55 @@ unary_numeric_type A =
   | when T1 >< "int" or T1 >< "float": ret T1
   | No
 
+// TS-3.13: unify the types of a list of case-arm body expressions.
+// Returns the common type if every arm has the same statically-
+// known type, else No (== "can't prove").  Two skip-rules:
+//   * an arm whose type is No is treated as "unknown contribution"
+//     and disqualifies the whole unification (we can't claim T
+//     statically when even one arm is opaque).
+//   * the auto-generated default `0` (the case macro's third
+//     argument when the user doesn't supply an `Else`) gets
+//     filtered upstream -- the bare-0 fallthrough is a "no match"
+//     marker, not a typed contribution.
+//
+// Called from two places (case_branches_type helper below):
+//   - infer_type's `[`case` _ @_]` arm, for `_the T (case ...)`
+//     mismatch detection at mex time.
+//   - infer_declared_type's `[`case` _ @_]` arm, for
+//     `expand_block_item_fn`'s TS-3.8 fn-return registration.
+unify_case_types Types =
+  | when Types.end: ret No
+  | when Types.any(T => no T): ret No
+  | First Types.0
+  | when Types.tail.all(T => T >< First): ret First
+  | No
+
+// Returns the list of statically-known arm-body types for a
+// pre-mex `case KeyForm Pat1 Body1 Pat2 Body2 ...` shape.
+// `Infer` is the inference function to apply per body (infer_type
+// for the strict-mode case, infer_declared_type for the
+// fn-return path).  Wraps each body in `[`_progn` @Body]` when
+// Body is a single-expression so the helper can recurse via the
+// existing `_progn` arm.
+//
+// Pre-mex case-arms are always 2-element pairs `[Pat Body]` after
+// the case macro's `Cases.group(2)` normalisation -- but we run
+// BEFORE that macro runs, so the surface AST is the flat
+// `[`case` KeyForm Pat Body Pat Body ...]`.  We iterate pairs.
+case_branches_type Args Infer =
+  | when Args.n < 2: ret No
+  | when (Args.n % 2) >< 1: ret No
+  | Bodies:
+  | I 1
+  | N Args.n
+  | while I < N
+    | push Args.I Bodies
+    | I =  I+2
+  | Types map B Bodies.f:
+    | Wrap (if B.is_list then [`_progn` B] else B)
+    | Infer(Wrap)
+  | unify_case_types Types
+
 infer_type Expr =
   | when Expr.is_int: ret "int"
   | when Expr.is_float: ret "float"
@@ -188,6 +237,12 @@ infer_type Expr =
       [`_no` _] | ret "int"
       [`_got` _] | ret "int"
       [`_tag` _] | ret "int"
+      // TS-3.13: pre-mex `case` form.  Surface AST is
+      // `[`case` KeyForm Pat1 Body1 Pat2 Body2 ...]` (the macro's
+      // `Cases.group(2)` normalisation hasn't run yet).  Unify
+      // arm-body types via `case_branches_type`; return the
+      // common type when every arm proves the same T.
+      [`case` _ @Args] | ret: case_branches_type Args (E => infer_type E)
       // TS-3.6: pre-mex text literal `"abc"` parses to
       // `[`"` "abc"]` (backtick-`"` operator).  Recognise it
       // so the mismatch check sees `_the int "abc"` as text.
@@ -255,6 +310,13 @@ infer_declared_type Expr =
         | when Stmts.n > 0: ret: infer_declared_type Stmts.~
       [`_progn` @Stmts]
         | when Stmts.n > 0: ret: infer_declared_type Stmts.~
+      // TS-3.13: pre-mex `case` form, declaration-style.  Used by
+      // TS-3.8 fn-return registration: `foo X = case X int?: 5;
+      // Else: 10` -- when both arms have the same declared type,
+      // foo's return is registered as that type.  Conservative
+      // (uses infer_declared_type, so bare literals don't count;
+      // arms have to be explicitly typed via `_the` / `^` / etc).
+      [`case` _ @Args] | ret: case_branches_type Args (E => infer_declared_type E)
       Else
         | Inner infer_peek_inner Expr
         | when Inner.is_list:
