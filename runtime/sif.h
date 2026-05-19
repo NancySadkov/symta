@@ -217,11 +217,16 @@ enum {
                           only optimises the LITERAL subset
                           (runtime `_listn 1` from `dup N` still
                           goes through SBC_FXNLISTN). */
-/*A3*/ SBC_UNUSEDA3,
-/*A4*/ SBC_UNUSEDA4,
-/*A5*/ SBC_UNUSEDA5,
-/*A6*/ SBC_UNUSEDA6,
-/*A7*/ SBC_UNUSEDA7,
+/*A3*/ SBC_IADD,         /* TS-4.1: unboxed int add; both ops known-int
+                          * at compile time, no tag check, no MCALL
+                          * fallback.  Compiler emits this when the
+                          * static checker proves both operands have
+                          * type "int".  Same wire shape as SBC_FXNADD
+                          * (op + 3*16-bit regs). */
+/*A4*/ SBC_ISUB,
+/*A5*/ SBC_IMUL,
+/*A6*/ SBC_IDIV,
+/*A7*/ SBC_IREM,
 
 /*A8*/ SBC_SAME, //1 if handles equal
 /*A9*/ SBC_VARY, //0 if handles equal

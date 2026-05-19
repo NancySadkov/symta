@@ -503,11 +503,16 @@ ssa_fixed1 K Op X =
 
 ssa_fixed2 K Op A B =
   if A.is_int and B.is_int:
-    if Op >< 'fxnadd' then ssa_atom K (fadd_ A B)
-    elif Op >< 'fxnsub' then ssa_atom K (fsub_ A B)
-    elif Op >< 'fxnmul' then ssa_atom K (fmul_ A B)
-    elif Op >< 'fxndiv' and B <> 0 then ssa_atom K (fdiv_ A B)
-    elif Op >< 'fxnrem' and B <> 0 then ssa_atom K (frem_ A B)
+    // TS-4.1: the unboxed `iadd`/`isub`/... constant-fold the
+    // same way the tag-aware `fxnadd`/... do.  Listing both
+    // names per branch lets the macro layer feed either form
+    // without compiler.s caring whether the static checker
+    // upstream proved a type.
+    if Op >< 'fxnadd' or Op >< 'iadd' then ssa_atom K (fadd_ A B)
+    elif Op >< 'fxnsub' or Op >< 'isub' then ssa_atom K (fsub_ A B)
+    elif Op >< 'fxnmul' or Op >< 'imul' then ssa_atom K (fmul_ A B)
+    elif (Op >< 'fxndiv' or Op >< 'idiv') and B <> 0 then ssa_atom K (fdiv_ A B)
+    elif (Op >< 'fxnrem' or Op >< 'irem') and B <> 0 then ssa_atom K (frem_ A B)
     elif Op >< 'fxnand' then ssa_atom K (fand_ A B)
     elif Op >< 'fxnior' then ssa_atom K (fior_ A B)
     elif Op >< 'fxnxor' then ssa_atom K (fxor_ A B)
@@ -593,6 +598,15 @@ hcase SsaFormCases Xs (K)
   [_mul A B] | ssa_fixed2 K fxnmul A B
   [_div A B] | ssa_fixed2 K fxndiv A B
   [_rem A B] | ssa_fixed2 K fxnrem A B
+  // TS-4.1: typed-int arithmetic.  Emitted by macro_ops's `+`/`-`/
+  // `*`/`/`/`%` macros when infer_type proves both operands int.
+  // Same constant-folding path as the fxn variants when both are
+  // literals; the runtime opcode skips the tag check otherwise.
+  [_iadd A B] | ssa_fixed2 K iadd A B
+  [_isub A B] | ssa_fixed2 K isub A B
+  [_imul A B] | ssa_fixed2 K imul A B
+  [_idiv A B] | ssa_fixed2 K idiv A B
+  [_irem A B] | ssa_fixed2 K irem A B
   [_eq A B] | ssa_fixed2 K fxneq A B
   [_ne A B] | ssa_fixed2 K fxnne A B
   [_lt A B] | ssa_fixed2 K fxnlt A B

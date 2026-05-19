@@ -222,6 +222,14 @@ infer_type Expr =
       [`_mul` A B] | ret: arith_result_type A B
       [`_div` A B] | ret: arith_result_type A B
       [`_rem` A B] | ret: arith_result_type A B
+      // TS-4.1: the typed variants are only emitted when both
+      // operands proved int upstream, so the result is int by
+      // construction.  No need to re-prove.
+      [`_iadd` _ _] | ret "int"
+      [`_isub` _ _] | ret "int"
+      [`_imul` _ _] | ret "int"
+      [`_idiv` _ _] | ret "int"
+      [`_irem` _ _] | ret "int"
       [`_inc` A] | ret: unary_numeric_type A
       [`_dec` A] | ret: unary_numeric_type A
       [`_neg` A] | ret: unary_numeric_type A
@@ -310,6 +318,16 @@ infer_declared_type Expr =
         | when Stmts.n > 0: ret: infer_declared_type Stmts.~
       [`_progn` @Stmts]
         | when Stmts.n > 0: ret: infer_declared_type Stmts.~
+      // TS-4.1: typed-int arithmetic counts as "explicitly typed"
+      // since bin_op only emits these when the static checker
+      // already proved both operands int.  A function whose body
+      // is e.g. `X + Y` with X^int Y^int gets a TS-3.8 fn-return
+      // registration of int.
+      [`_iadd` _ _] | ret "int"
+      [`_isub` _ _] | ret "int"
+      [`_imul` _ _] | ret "int"
+      [`_idiv` _ _] | ret "int"
+      [`_irem` _ _] | ret "int"
       // TS-3.13: pre-mex `case` form, declaration-style.  Used by
       // TS-3.8 fn-return registration: `foo X = case X int?: 5;
       // Else: 10` -- when both arms have the same declared type,

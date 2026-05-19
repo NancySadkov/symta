@@ -682,6 +682,11 @@ uint8_t *sif2sbc(sif_t *sif) {
     case SBC_FXNSHR:
     case SBC_SAME:
     case SBC_VARY:
+    case SBC_IADD:   /* TS-4.1: same wire shape (dst, a, b) as FXN ops */
+    case SBC_ISUB:
+    case SBC_IMUL:
+    case SBC_IDIV:
+    case SBC_IREM:
     {
       if (!strcmp(as[1],"dummy")) break;
       EMIT8(ins->opcode);

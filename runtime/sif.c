@@ -146,6 +146,12 @@ void sif_loader_init() {
   shput(asmsbc,"fxnmul"    ,SBC_FXNMUL);
   shput(asmsbc,"fxndiv"    ,SBC_FXNDIV);
   shput(asmsbc,"fxnrem"    ,SBC_FXNREM);
+  // TS-4.1: unboxed int arithmetic.  No tag check, no fallback.
+  shput(asmsbc,"iadd"      ,SBC_IADD);
+  shput(asmsbc,"isub"      ,SBC_ISUB);
+  shput(asmsbc,"imul"      ,SBC_IMUL);
+  shput(asmsbc,"idiv"      ,SBC_IDIV);
+  shput(asmsbc,"irem"      ,SBC_IREM);
   shput(asmsbc,"fxneq"     ,SBC_IMMEQ);
   shput(asmsbc,"fxnne"     ,SBC_IMMNE);
   shput(asmsbc,"fxnlt"     ,SBC_FXNLT);

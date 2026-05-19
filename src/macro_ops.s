@@ -242,7 +242,27 @@ let @As =
 //bin_op A B Op Method = form: _mcall A Method B
 
 
-bin_op A B Op Method = form: Op A B
+// TS-4.1: when both operands prove int, upgrade `_add` -> `_iadd`
+// so compiler.s emits the unboxed runtime opcode.  Map per Op:
+//   _add -> _iadd, _sub -> _isub, _mul -> _imul,
+//   _div -> _idiv, _rem -> _irem
+// Names are `\`-quoted because `_iadd`/`_isub`/... aren't
+// special-form heads recognised by the OLD compiler bootstrapping
+// this source -- a bare `_iadd` in expression position would trip
+// "unknown symbol" before we get to install the new compiler arm.
+typed_binop_for Op =
+  if Op >< _add then \_iadd
+  elif Op >< _sub then \_isub
+  elif Op >< _mul then \_imul
+  elif Op >< _div then \_idiv
+  elif Op >< _rem then \_irem
+  else No
+
+bin_op A B Op Method =
+  TypedOp typed_binop_for Op
+  if got TypedOp and (infer_type A) >< "int" and (infer_type B) >< "int"
+    then [TypedOp A B]
+    else [Op A B]
 
 
 `+` @As = case As:

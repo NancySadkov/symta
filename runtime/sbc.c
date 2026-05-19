@@ -668,6 +668,14 @@ dyn sbc_exec_fn(uint8_t *pin) {
     [SBC_FXNXOR] = &&L_SBC_FXNXOR,
     [SBC_FXNSHL] = &&L_SBC_FXNSHL,
     [SBC_FXNSHR] = &&L_SBC_FXNSHR,
+    /* TS-4.1: typed-int arithmetic.  Both operands proven-int
+     * at mex time, so the runtime can skip the tag check and
+     * the MCALL/float fallbacks that SBC_FXNADD has to carry. */
+    [SBC_IADD] = &&L_SBC_IADD,
+    [SBC_ISUB] = &&L_SBC_ISUB,
+    [SBC_IMUL] = &&L_SBC_IMUL,
+    [SBC_IDIV] = &&L_SBC_IDIV,
+    [SBC_IREM] = &&L_SBC_IREM,
     [SBC_SAME] = &&L_SBC_SAME,
     [SBC_VARY] = &&L_SBC_VARY,
     [SBC_LIST2] = &&L_SBC_LIST2,
@@ -1575,6 +1583,43 @@ dyn sbc_exec_fn(uint8_t *pin) {
       ARGLIST2(L[a],L[b]);
       MCALL(L[dst],L[a],m_shr);
     }
+    BREAK;}
+  /* TS-4.1: typed-int arithmetic.  Mex proved both operands
+   * are int (via infer_type), so we skip the tag check and the
+   * MCALL/float fallback that SBC_FXNADD has to carry.  Same
+   * wire shape as FXNADD (dst + a + b, each 2 bytes).  Treat
+   * the C-side macros as authoritative: FXNADD/etc. operate on
+   * the bit-shifted tagged-int representation directly, so a
+   * tagged-int operand stays tagged through the arithmetic. */
+  OP(SBC_IADD) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNADD(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_ISUB) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNSUB(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IMUL) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNMUL(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IDIV) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    /* No explicit zero check -- the Windows SEH handler in
+     * w64/ctx.c catches EXCEPTION_INT_DIVIDE_BY_ZERO and routes
+     * it through Symta's `bad`-handling path the same way
+     * FXNDIV's bare `a/b` does.  An x86 backend would lower
+     * this to a direct IDIV with the same trap semantics. */
+    FXNDIV(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IREM) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNREM(L[dst], L[a], L[b]);
     BREAK;}
   OP(SBC_SAME) {
     int dst = RD16; int a = RD16; int b = RD16;

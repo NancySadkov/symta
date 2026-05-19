@@ -426,6 +426,11 @@ void sbc_dasm_sub(dasm_t *dasm) {
   case SBC_FXNXOR:
   case SBC_FXNSHL:
   case SBC_FXNSHR:
+  case SBC_IADD:   /* TS-4.1 */
+  case SBC_ISUB:
+  case SBC_IMUL:
+  case SBC_IDIV:
+  case SBC_IREM:
     arrput(as, afmt(0,"L[%d]",RD16));
     arrput(as, afmt(0,"L[%d]",RD16));
     arrput(as, afmt(0,"L[%d]",RD16));
@@ -974,6 +979,11 @@ sif_t *sbc2sif(char *filename) {
     case SBC_FXNXOR:
     case SBC_FXNSHL:
     case SBC_FXNSHR:
+    case SBC_IADD:   /* TS-4.1 */
+    case SBC_ISUB:
+    case SBC_IMUL:
+    case SBC_IDIV:
+    case SBC_IREM:
       arrput(as, afmt(0,"L[%d]",RD16));
       arrput(as, afmt(0,"L[%d]",RD16));
       arrput(as, afmt(0,"L[%d]",RD16));
