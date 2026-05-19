@@ -676,6 +676,15 @@ dyn sbc_exec_fn(uint8_t *pin) {
     [SBC_IMUL] = &&L_SBC_IMUL,
     [SBC_IDIV] = &&L_SBC_IDIV,
     [SBC_IREM] = &&L_SBC_IREM,
+    /* TS-4.2: typed-int comparisons + typed-float arithmetic. */
+    [SBC_ILT]  = &&L_SBC_ILT,
+    [SBC_IGT]  = &&L_SBC_IGT,
+    [SBC_ILTE] = &&L_SBC_ILTE,
+    [SBC_IGTE] = &&L_SBC_IGTE,
+    [SBC_FADD] = &&L_SBC_FADD,
+    [SBC_FSUB] = &&L_SBC_FSUB,
+    [SBC_FMUL] = &&L_SBC_FMUL,
+    [SBC_FDIV] = &&L_SBC_FDIV,
     [SBC_SAME] = &&L_SBC_SAME,
     [SBC_VARY] = &&L_SBC_VARY,
     [SBC_LIST2] = &&L_SBC_LIST2,
@@ -1620,6 +1629,69 @@ dyn sbc_exec_fn(uint8_t *pin) {
     int dst = RD16; int a = RD16; int b = RD16;
     CHKREG(dst); CHKREG(a); CHKREG(b);
     FXNREM(L[dst], L[a], L[b]);
+    BREAK;}
+  /* TS-4.2: typed-int comparisons.  Result is FXN-tagged 0/1.
+   * No tag check, no MCALL fallback -- caller guaranteed both
+   * operands are int.  x86 lowering: CMP + SETcc. */
+  OP(SBC_ILT) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNLT(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IGT) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNGT(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_ILTE) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNLTE(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IGTE) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNGTE(L[dst], L[a], L[b]);
+    BREAK;}
+  /* TS-4.2: typed-float arithmetic.  Both operands are
+   * MKIMM(T_FLOAT, ...) tagged 32-bit IEEE754 (in the high 32
+   * bits of the dyn).  Unbox via STFLT, compute, rebox via
+   * LDFLT.  x86 lowering: a tiny stub that runs the unbox/box
+   * around an ADDSS / SUBSS / MULSS / DIVSS on xmm. */
+  OP(SBC_FADD) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    LDFLT(L[dst], fa + fb);
+    BREAK;}
+  OP(SBC_FSUB) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    LDFLT(L[dst], fa - fb);
+    BREAK;}
+  OP(SBC_FMUL) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    LDFLT(L[dst], fa * fb);
+    BREAK;}
+  OP(SBC_FDIV) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    /* Match SBC_FXNDIV's float-fallback: avoid IEEE inf/nan
+     * by substituting FLT_MIN when the divisor is exactly 0. */
+    if (fb == 0.0f) fb = FLT_MIN;
+    LDFLT(L[dst], fa / fb);
     BREAK;}
   OP(SBC_SAME) {
     int dst = RD16; int a = RD16; int b = RD16;

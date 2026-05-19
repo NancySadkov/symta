@@ -231,7 +231,26 @@ enum {
 /*A8*/ SBC_SAME, //1 if handles equal
 /*A9*/ SBC_VARY, //0 if handles equal
 
-/*AA*/ SBC_END,
+/* TS-4.2: unboxed-int comparison opcodes.  Same wire shape as the
+ * arith family; no tag check or MCALL fallback.  Result is 0 or 1
+ * (already FXN-tagged).  A future x86 backend lowers these to a
+ * literal CMP + SETcc sequence.  Placed AFTER SAME/VARY so those
+ * keep their committed wire-byte values (A8/A9) and existing
+ * sbc/ files load with the new runtime without renumbering. */
+/*AA*/ SBC_ILT,
+/*AB*/ SBC_IGT,
+/*AC*/ SBC_ILTE,
+/*AD*/ SBC_IGTE,
+/* TS-4.2: unboxed-float arithmetic.  Operands are known to be
+ * float-tagged (struct-tagged 64-bit IEEE754).  Same wire shape;
+ * runtime uses STFLT/LDFLT for unbox/rebox.  An x86 backend
+ * lowers these to ADDSS / SUBSS / MULSS / DIVSS on xmm regs. */
+/*AE*/ SBC_FADD,
+/*AF*/ SBC_FSUB,
+/*B0*/ SBC_FMUL,
+/*B1*/ SBC_FDIV,
+
+/*B2*/ SBC_END,
 
 
   SBC_BS,

@@ -687,6 +687,14 @@ uint8_t *sif2sbc(sif_t *sif) {
     case SBC_IMUL:
     case SBC_IDIV:
     case SBC_IREM:
+    case SBC_ILT:    /* TS-4.2 */
+    case SBC_IGT:
+    case SBC_ILTE:
+    case SBC_IGTE:
+    case SBC_FADD:
+    case SBC_FSUB:
+    case SBC_FMUL:
+    case SBC_FDIV:
     {
       if (!strcmp(as[1],"dummy")) break;
       EMIT8(ins->opcode);

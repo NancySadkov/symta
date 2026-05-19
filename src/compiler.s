@@ -520,10 +520,15 @@ ssa_fixed2 K Op A B =
     elif Op >< 'fxnshr' and B >> 0 and 63 >> B then ssa_atom K (fshr_ A B)
     elif Op >< 'fxneq'  then ssa_atom K (if A >< B then 1 else 0)
     elif Op >< 'fxnne'  then ssa_atom K (if A <> B then 1 else 0)
-    elif Op >< 'fxnlt'  then ssa_atom K (if A <  B then 1 else 0)
-    elif Op >< 'fxngt'  then ssa_atom K (if A >  B then 1 else 0)
-    elif Op >< 'fxnlte' then ssa_atom K (if A << B then 1 else 0)
-    elif Op >< 'fxngte' then ssa_atom K (if A >> B then 1 else 0)
+    // TS-4.2: typed-int compares fold the same way the fxn
+    // variants do.  Result is int 0/1; the float-arith variants
+    // (fadd/fsub/fmul/fdiv) don't fold here because both
+    // operands being int rules out the typed-float path
+    // emitter -- only emitted when both prove float.
+    elif Op >< 'fxnlt'  or Op >< 'ilt'  then ssa_atom K (if A <  B then 1 else 0)
+    elif Op >< 'fxngt'  or Op >< 'igt'  then ssa_atom K (if A >  B then 1 else 0)
+    elif Op >< 'fxnlte' or Op >< 'ilte' then ssa_atom K (if A << B then 1 else 0)
+    elif Op >< 'fxngte' or Op >< 'igte' then ssa_atom K (if A >> B then 1 else 0)
     else ssa Op K A^ev B^ev
   else ssa Op K A^ev B^ev
   // NOTE: one-sided identity folds (X+0 → X, etc.) were tried
@@ -607,6 +612,15 @@ hcase SsaFormCases Xs (K)
   [_imul A B] | ssa_fixed2 K imul A B
   [_idiv A B] | ssa_fixed2 K idiv A B
   [_irem A B] | ssa_fixed2 K irem A B
+  // TS-4.2: typed-int comparisons + typed-float arithmetic.
+  [_ilt A B]  | ssa_fixed2 K ilt A B
+  [_igt A B]  | ssa_fixed2 K igt A B
+  [_ilte A B] | ssa_fixed2 K ilte A B
+  [_igte A B] | ssa_fixed2 K igte A B
+  [_fadd A B] | ssa_fixed2 K fadd A B
+  [_fsub A B] | ssa_fixed2 K fsub A B
+  [_fmul A B] | ssa_fixed2 K fmul A B
+  [_fdiv A B] | ssa_fixed2 K fdiv A B
   [_eq A B] | ssa_fixed2 K fxneq A B
   [_ne A B] | ssa_fixed2 K fxnne A B
   [_lt A B] | ssa_fixed2 K fxnlt A B

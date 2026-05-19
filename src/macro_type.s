@@ -230,6 +230,16 @@ infer_type Expr =
       [`_imul` _ _] | ret "int"
       [`_idiv` _ _] | ret "int"
       [`_irem` _ _] | ret "int"
+      // TS-4.2: typed-int compares produce int 0/1; typed-float
+      // arith produces float.
+      [`_ilt` _ _]  | ret "int"
+      [`_igt` _ _]  | ret "int"
+      [`_ilte` _ _] | ret "int"
+      [`_igte` _ _] | ret "int"
+      [`_fadd` _ _] | ret "float"
+      [`_fsub` _ _] | ret "float"
+      [`_fmul` _ _] | ret "float"
+      [`_fdiv` _ _] | ret "float"
       [`_inc` A] | ret: unary_numeric_type A
       [`_dec` A] | ret: unary_numeric_type A
       [`_neg` A] | ret: unary_numeric_type A
@@ -328,6 +338,15 @@ infer_declared_type Expr =
       [`_imul` _ _] | ret "int"
       [`_idiv` _ _] | ret "int"
       [`_irem` _ _] | ret "int"
+      // TS-4.2: typed compares + float arith count the same.
+      [`_ilt` _ _]  | ret "int"
+      [`_igt` _ _]  | ret "int"
+      [`_ilte` _ _] | ret "int"
+      [`_igte` _ _] | ret "int"
+      [`_fadd` _ _] | ret "float"
+      [`_fsub` _ _] | ret "float"
+      [`_fmul` _ _] | ret "float"
+      [`_fdiv` _ _] | ret "float"
       // TS-3.13: pre-mex `case` form, declaration-style.  Used by
       // TS-3.8 fn-return registration: `foo X = case X int?: 5;
       // Else: 10` -- when both arms have the same declared type,

@@ -242,27 +242,47 @@ let @As =
 //bin_op A B Op Method = form: _mcall A Method B
 
 
-// TS-4.1: when both operands prove int, upgrade `_add` -> `_iadd`
-// so compiler.s emits the unboxed runtime opcode.  Map per Op:
-//   _add -> _iadd, _sub -> _isub, _mul -> _imul,
-//   _div -> _idiv, _rem -> _irem
-// Names are `\`-quoted because `_iadd`/`_isub`/... aren't
-// special-form heads recognised by the OLD compiler bootstrapping
-// this source -- a bare `_iadd` in expression position would trip
-// "unknown symbol" before we get to install the new compiler arm.
-typed_binop_for Op =
+// TS-4.1/4.2: when both operands prove a common numeric type,
+// upgrade the bin_op's Op to the typed unboxed variant.
+//   int-only :  _add  -> _iadd, _sub  -> _isub, _mul  -> _imul,
+//               _div  -> _idiv, _rem  -> _irem
+//               _lt   -> _ilt,  _gt   -> _igt,
+//               _lte  -> _ilte, _gte  -> _igte
+//   float-only: _add  -> _fadd, _sub  -> _fsub,
+//               _mul  -> _fmul, _div  -> _fdiv
+// All names `\`-quoted -- bare `_iadd` etc. trip "unknown symbol"
+// during stage-1 bootstrap because the OLD compiler doesn't have
+// the corresponding ssa-form arm.
+
+typed_int_binop_for Op =
   if Op >< _add then \_iadd
   elif Op >< _sub then \_isub
   elif Op >< _mul then \_imul
   elif Op >< _div then \_idiv
   elif Op >< _rem then \_irem
+  elif Op >< _lt  then \_ilt
+  elif Op >< _gt  then \_igt
+  elif Op >< _lte then \_ilte
+  elif Op >< _gte then \_igte
+  else No
+
+typed_float_binop_for Op =
+  if Op >< _add then \_fadd
+  elif Op >< _sub then \_fsub
+  elif Op >< _mul then \_fmul
+  elif Op >< _div then \_fdiv
   else No
 
 bin_op A B Op Method =
-  TypedOp typed_binop_for Op
-  if got TypedOp and (infer_type A) >< "int" and (infer_type B) >< "int"
-    then [TypedOp A B]
-    else [Op A B]
+  TA infer_type A
+  TB infer_type B
+  IntOp typed_int_binop_for Op
+  FltOp typed_float_binop_for Op
+  if got IntOp and TA >< "int" and TB >< "int"
+    then [IntOp A B]
+  elif got FltOp and TA >< "float" and TB >< "float"
+    then [FltOp A B]
+  else [Op A B]
 
 
 `+` @As = case As:
