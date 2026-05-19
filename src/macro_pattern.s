@@ -305,8 +305,34 @@ expand_hole Key Hole Hit Miss =
 //    or with mex_normal's text-keyword extern path at line 254.
 //    Not yet root-caused.
 //
+// 5. **Things tried and they all failed for 3+ patterns:**
+//    a. `[_type list V B]` with different type names ("dyn",
+//       "int") -- same failure.  So it's not the name.
+//    b. Per-statement wraps `map S Body: [_type T V S]` --
+//       same failure.  So it's not the `_progn` interaction.
+//    c. Cloning `_type` as `_narrow` with identical mex arm --
+//       SAME failure.  So it's not name-clash with existing
+//       `_type` callers.  The bug is in HOW mex processes the
+//       body INSIDE the push/pop scope, regardless of arm name.
+//    d. `[let_ [[V [_the T V]]] body]` (let-binding shadow) --
+//       infinite recursion during bootstrap (mexlet's case-arm
+//       gets re-wrapped each pass, exponential blowup).
+//    e. Filtering out gensym Keyforms (vars ending in digits)
+//       and excluding "As" specifically -- failure shifts to
+//       another user-var, so it's not name-specific.
+//
 // Pragmatic ship: 0/1/2-element narrows cover most case-arm
 // uses in practice.  3+ patterns fall through to runtime.
+//
+// **The path forward** for the next investigator:
+//   - Instrument the `_type` arm to log GVarsTypes state
+//     before/after each invocation.
+//   - Compare mex outputs for the failing case-arm with and
+//     without the wrap, byte-by-byte.
+//   - Specifically inspect what `form` produces in both cases.
+//   - Check if `mex_error` or `bad` is firing somewhere inside
+//     the wrapped body's mex; that would bypass `_type`'s pop
+//     and leak GVarsTypes state into subsequent file compiles.
 //
 // `ret` inside a case-arm body doesn't return from the enclosing
 // function (it yields the arm value); the body below uses the
