@@ -314,7 +314,13 @@ expand_assign Place Value =
                      | Type GVarsTypes.A
                      | when got Type:
                        | Fields GTypes.Type
-                       | P | got Fields and Fields.locate(B)
+                       // Use `if got Fields then ... else No` rather than
+                       // `got Fields and Fields.locate(B)`: the latter
+                       // short-circuits to integer 0 (the `and` macro
+                       // returns 0 when the test is falsy), and `got 0 = 1`,
+                       // so the optimization would fire with P=0 for any
+                       // narrowed type that isn't a struct in GTypes.
+                       | P | if got Fields then Fields.locate(B) else No
                        | when got P: ret [_dset A P Value]
                    | [_mcall A "=[B]" Value]
               else [_lset A B Value]

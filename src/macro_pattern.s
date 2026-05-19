@@ -231,9 +231,24 @@ expand_hole Key Hole Hit Miss =
                              then [`()` [`.` Key B] @As]
                              else [`.` Key B])]]
                     (expand_hole G A Hit Miss)]
-  [`^` A B @As] | G @rand 'G'
-                | [let_ [[G [`()` B @As Key]]]
-                    (expand_hole G A Hit Miss)]
+  [`^` A B @As]
+    // TS-3.9d: typed element pattern `X^T` where T is a known
+    // type-name.  Reuse the existing `T Key` apply (which calls
+    // the type constructor: `int Key` is `_the int (Key.int)`,
+    // runtime-checking that Key is int) AND statically narrow
+    // A to T over the case-arm body via `_let1`.  Inside Body,
+    // `infer_type A` returns T, so downstream `_the T A` /
+    // arithmetic propagation knows A's static type.
+    //
+    // Reads "X is the int matched out of position N" -- consistent
+    // with Symta's typename-is-a-function ontology (`int X` is
+    // already the constructor; `X^int` is the same call rotated
+    // for postfix readability).
+    | when A^is_var_sym and B.is_text and B^is_known_type and As.end:
+      | ret: [`_let1` B A [`()` B Key] Hit]
+    | G @rand 'G'
+    | [let_ [[G [`()` B @As Key]]]
+        (expand_hole G A Hit Miss)]
   [`()` [Op A B] @As] | expand_hole Key [Op A B @As] Hit Miss
   [`=` A B] | [case Key A.0 [_if B Hit Miss] "Else".rand 0]
   [push V Var]
