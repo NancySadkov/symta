@@ -668,23 +668,6 @@ dyn sbc_exec_fn(uint8_t *pin) {
     [SBC_FXNXOR] = &&L_SBC_FXNXOR,
     [SBC_FXNSHL] = &&L_SBC_FXNSHL,
     [SBC_FXNSHR] = &&L_SBC_FXNSHR,
-    /* TS-4.1: typed-int arithmetic.  Both operands proven-int
-     * at mex time, so the runtime can skip the tag check and
-     * the MCALL/float fallbacks that SBC_FXNADD has to carry. */
-    [SBC_IADD] = &&L_SBC_IADD,
-    [SBC_ISUB] = &&L_SBC_ISUB,
-    [SBC_IMUL] = &&L_SBC_IMUL,
-    [SBC_IDIV] = &&L_SBC_IDIV,
-    [SBC_IREM] = &&L_SBC_IREM,
-    /* TS-4.2: typed-int comparisons + typed-float arithmetic. */
-    [SBC_ILT]  = &&L_SBC_ILT,
-    [SBC_IGT]  = &&L_SBC_IGT,
-    [SBC_ILTE] = &&L_SBC_ILTE,
-    [SBC_IGTE] = &&L_SBC_IGTE,
-    [SBC_FADD] = &&L_SBC_FADD,
-    [SBC_FSUB] = &&L_SBC_FSUB,
-    [SBC_FMUL] = &&L_SBC_FMUL,
-    [SBC_FDIV] = &&L_SBC_FDIV,
     [SBC_SAME] = &&L_SBC_SAME,
     [SBC_VARY] = &&L_SBC_VARY,
     [SBC_LIST2] = &&L_SBC_LIST2,
@@ -724,6 +707,28 @@ dyn sbc_exec_fn(uint8_t *pin) {
     [SBC_NSTS2] = &&L_SBC_NSTS2,
     [SBC_NSTS4] = &&L_SBC_NSTS4,
     [SBC_CTX] = &&L_SBC_CTX,
+    /* TS-4.1/4.2: typed unboxed-arithmetic opcodes are placed at
+     * the END of the dispatch table so their goto-label addresses
+     * cluster on their own cache lines.  The interleaved layout
+     * (originally grouped next to SBC_FXNSHR) made the typed-int
+     * hot path share a 64-byte line with the FXN fallbacks; the
+     * generic-mexed code that runs untyped arithmetic was then
+     * paying L1d misses against the typed code.  The same
+     * separation principle applies to the OP() handler bodies
+     * further down -- see end of switch. */
+    [SBC_IADD] = &&L_SBC_IADD,
+    [SBC_ISUB] = &&L_SBC_ISUB,
+    [SBC_IMUL] = &&L_SBC_IMUL,
+    [SBC_IDIV] = &&L_SBC_IDIV,
+    [SBC_IREM] = &&L_SBC_IREM,
+    [SBC_ILT]  = &&L_SBC_ILT,
+    [SBC_IGT]  = &&L_SBC_IGT,
+    [SBC_ILTE] = &&L_SBC_ILTE,
+    [SBC_IGTE] = &&L_SBC_IGTE,
+    [SBC_FADD] = &&L_SBC_FADD,
+    [SBC_FSUB] = &&L_SBC_FSUB,
+    [SBC_FMUL] = &&L_SBC_FMUL,
+    [SBC_FDIV] = &&L_SBC_FDIV,
   };
   goto *dt[*pin++];
 #else
@@ -1593,106 +1598,6 @@ dyn sbc_exec_fn(uint8_t *pin) {
       MCALL(L[dst],L[a],m_shr);
     }
     BREAK;}
-  /* TS-4.1: typed-int arithmetic.  Mex proved both operands
-   * are int (via infer_type), so we skip the tag check and the
-   * MCALL/float fallback that SBC_FXNADD has to carry.  Same
-   * wire shape as FXNADD (dst + a + b, each 2 bytes).  Treat
-   * the C-side macros as authoritative: FXNADD/etc. operate on
-   * the bit-shifted tagged-int representation directly, so a
-   * tagged-int operand stays tagged through the arithmetic. */
-  OP(SBC_IADD) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    FXNADD(L[dst], L[a], L[b]);
-    BREAK;}
-  OP(SBC_ISUB) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    FXNSUB(L[dst], L[a], L[b]);
-    BREAK;}
-  OP(SBC_IMUL) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    FXNMUL(L[dst], L[a], L[b]);
-    BREAK;}
-  OP(SBC_IDIV) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    /* No explicit zero check -- the Windows SEH handler in
-     * w64/ctx.c catches EXCEPTION_INT_DIVIDE_BY_ZERO and routes
-     * it through Symta's `bad`-handling path the same way
-     * FXNDIV's bare `a/b` does.  An x86 backend would lower
-     * this to a direct IDIV with the same trap semantics. */
-    FXNDIV(L[dst], L[a], L[b]);
-    BREAK;}
-  OP(SBC_IREM) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    FXNREM(L[dst], L[a], L[b]);
-    BREAK;}
-  /* TS-4.2: typed-int comparisons.  Result is FXN-tagged 0/1.
-   * No tag check, no MCALL fallback -- caller guaranteed both
-   * operands are int.  x86 lowering: CMP + SETcc. */
-  OP(SBC_ILT) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    FXNLT(L[dst], L[a], L[b]);
-    BREAK;}
-  OP(SBC_IGT) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    FXNGT(L[dst], L[a], L[b]);
-    BREAK;}
-  OP(SBC_ILTE) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    FXNLTE(L[dst], L[a], L[b]);
-    BREAK;}
-  OP(SBC_IGTE) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    FXNGTE(L[dst], L[a], L[b]);
-    BREAK;}
-  /* TS-4.2: typed-float arithmetic.  Both operands are
-   * MKIMM(T_FLOAT, ...) tagged 32-bit IEEE754 (in the high 32
-   * bits of the dyn).  Unbox via STFLT, compute, rebox via
-   * LDFLT.  x86 lowering: a tiny stub that runs the unbox/box
-   * around an ADDSS / SUBSS / MULSS / DIVSS on xmm. */
-  OP(SBC_FADD) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    float fa, fb;
-    STFLT(fa, L[a]);
-    STFLT(fb, L[b]);
-    LDFLT(L[dst], fa + fb);
-    BREAK;}
-  OP(SBC_FSUB) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    float fa, fb;
-    STFLT(fa, L[a]);
-    STFLT(fb, L[b]);
-    LDFLT(L[dst], fa - fb);
-    BREAK;}
-  OP(SBC_FMUL) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    float fa, fb;
-    STFLT(fa, L[a]);
-    STFLT(fb, L[b]);
-    LDFLT(L[dst], fa * fb);
-    BREAK;}
-  OP(SBC_FDIV) {
-    int dst = RD16; int a = RD16; int b = RD16;
-    CHKREG(dst); CHKREG(a); CHKREG(b);
-    float fa, fb;
-    STFLT(fa, L[a]);
-    STFLT(fb, L[b]);
-    /* Match SBC_FXNDIV's float-fallback: avoid IEEE inf/nan
-     * by substituting FLT_MIN when the divisor is exactly 0. */
-    if (fb == 0.0f) fb = FLT_MIN;
-    LDFLT(L[dst], fa / fb);
-    BREAK;}
   OP(SBC_SAME) {
     int dst = RD16; int a = RD16; int b = RD16;
     CHKREG(dst); CHKREG(a); CHKREG(b);
@@ -2002,6 +1907,109 @@ dyn sbc_exec_fn(uint8_t *pin) {
     } else {
       fprintf(stderr, "SBC_CTX: bad type=%d\n", type);
     }
+    BREAK;}
+  /* ============================================================
+   * TS-4 typed unboxed-arithmetic handlers.  Placed at the END
+   * of the switch so the generated machine code for these hot
+   * paths gets its OWN i-cache footprint -- the untyped FXN
+   * fallbacks above don't pull these in on every line fill, and
+   * a workload that's heavy on typed arithmetic doesn't keep
+   * evicting the FXN code.  Same for the goto-label dispatch
+   * table earlier in the file.
+   *
+   * All handlers share the same wire shape as SBC_FXNADD
+   * (op + 3*16-bit regs), so an x86 backend can lower them to
+   * native single-instruction sequences with the FXN bit-tag
+   * conventions:
+   *
+   *   IADD/ISUB/IMUL          -> ADD / SUB / IMUL (no tag check)
+   *   IDIV/IREM               -> IDIV (trap-on-zero via SEH)
+   *   ILT/IGT/ILTE/IGTE       -> CMP + SETcc
+   *   FADD/FSUB/FMUL/FDIV     -> ADDSS / SUBSS / MULSS / DIVSS
+   * ============================================================ */
+  OP(SBC_IADD) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNADD(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_ISUB) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNSUB(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IMUL) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNMUL(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IDIV) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    /* No explicit zero check -- the Windows SEH handler in
+     * w64/ctx.c catches EXCEPTION_INT_DIVIDE_BY_ZERO and routes
+     * it through Symta's `bad`-handling path the same way
+     * FXNDIV's bare `a/b` does. */
+    FXNDIV(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IREM) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNREM(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_ILT) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNLT(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IGT) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNGT(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_ILTE) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNLTE(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IGTE) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNGTE(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_FADD) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    LDFLT(L[dst], fa + fb);
+    BREAK;}
+  OP(SBC_FSUB) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    LDFLT(L[dst], fa - fb);
+    BREAK;}
+  OP(SBC_FMUL) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    LDFLT(L[dst], fa * fb);
+    BREAK;}
+  OP(SBC_FDIV) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    /* Match SBC_FXNDIV's float-fallback: avoid IEEE inf/nan
+     * by substituting FLT_MIN when the divisor is exactly 0. */
+    if (fb == 0.0f) fb = FLT_MIN;
+    LDFLT(L[dst], fa / fb);
     BREAK;}
   /* SBC_LSRC was the CORE-1 v1 per-line opcode.  CORE-1 v2
    * (commit 0b9e2c4) moved line/col into a sorted side table
