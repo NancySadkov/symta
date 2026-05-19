@@ -281,34 +281,35 @@ expand_hole Key Hole Hit Miss =
 // inside the arm.
 //
 // Patterns that narrow the OUTER matched value today:
-//   T?                  (TS-3.5)  -- predicate-arm, narrows to T
-//   `[]` / `[A]` / `[A B]` (TS-3.9) -- fixed-length 0/1/2-element
-//                                     list literal patterns; narrow
-//                                     to "list".
+//   T?                          (TS-3.5)  predicate-arm, narrows to T
+//   `[]` / `[A]` / `[A B C ...]` (TS-3.9) fixed-length non-splat list
+//                                         literal patterns; narrow to
+//                                         "list".  Any arity >= 0;
+//                                         a splat element (`[`@` _]`)
+//                                         disables length-narrowing.
 //
 // Additionally: the destructure splat-tail (`Xs` in `[X@Xs]`) is
 // always narrowed to "list" at its binding site (see the
 // `[[`@` @Zs]]` arm in `expand_list_hole` above) -- a flat
-// `_let1` emission that types the gensym tail directly without
-// wrapping the case-arm body, so it composes safely with any
-// outer pattern shape including 3+ patterns.
+// `_let1` emission that types the gensym tail directly.
 //
-// **TS-3.9 deferred -- 3+ element fixed-list patterns:**
-// `case L [A B C]: <body>` does not narrow L to "list" today.
-// The same `[_type list MatchedVar body]` wrap that works fine
-// for predicate arms (TS-3.5) and 0/1/2-element list patterns
-// corrupts mex output for 3+ element patterns.  Specifically,
-// mexlet's 3-arg case-arm at macro_ops.s:69
-// (`[Expr Value Body] | form: mexlet ((Expr Value)) Body`)
-// blows up when wrapped, surfacing as a `_fatal` from
-// expand_block_helper line 660 whose text contains `?` from
-// `list?` -- normalize_arg's `Pkg?Sym` extern split then
-// mistakes that text for a library import.  Things tried that
-// failed: different type names, per-statement wraps, cloned
-// `_narrow` form, let-binding shadow.  Root cause not isolated.
-// The splat-tail narrow above sidesteps the issue by typing only
-// the destructure-introduced gensym, which doesn't interact with
-// the outer match's body shape.
+// **Forensics on the prior "3+ patterns fail" mystery:**  Earlier
+// attempts to extend the narrow past 2 elements bombed during
+// stage-2 bootstrap with "int has no method `.`" originating in
+// `infer_declared_type` -> `list.>` -> `meta.__`.  Bisection
+// (commit 5d1af97 + later) traced the cause to a pre-existing
+// bug in macro_ops.s's `.` macro: `P | got Fields and Fields.locate(B)`
+// short-circuits to integer 0 when `Fields = No`, and `got 0 = 1`
+// (since `0 != No`), so the optimization fired with a bogus index
+// for non-struct narrowed types like `list` and emitted `_dget A 0`.
+// TS-3.5 happened not to surface this in practice (the predicate
+// narrows it produces don't hit keyword field access on the
+// matched var in the wild); TS-3.9c's splat-tail narrows hit it
+// immediately.  Once the `.` macro was guarded with
+// `if got Fields then Fields.locate(B) else No`, arbitrary-length
+// list narrows work and drift passes.  The "form/mexlet" theory
+// in the earlier failure-mode notes was downstream noise from the
+// real `.`-macro miscompile.
 //
 // `ret` inside a case-arm body doesn't return from the enclosing
 // function (it yields the arm value); the body below uses the
@@ -318,14 +319,15 @@ case_narrow_type Pattern =
     | when Pattern.~ >< '?':
       | Lead Pattern.lead
       | when Lead^is_known_type: ret Lead
-  // TS-3.9: 0..2-element list patterns (3+ deferred).
-  | when Pattern.is_list:
-    | R case Pattern
-        [`[]`] | "list"
-        [`[]` _] | "list"
-        [`[]` _ _] | "list"
-        Else | No
-    | when got R: ret R
+  // TS-3.9: any fixed-length list pattern narrows the matched
+  // value to "list".  Splat patterns (whose outer list contains
+  // a `[`@` ...]` element) are excluded -- the splat-tail narrow
+  // at the binding site in `expand_list_hole` already covers
+  // them at the destructured-var grain, which is finer.
+  | when Pattern.is_list and Pattern.n > 0 and Pattern.0 >< `[]`:
+    | HasSplat 0
+    | for P Pattern.tail: when P(:[`@` @_]): HasSplat = 1
+    | less HasSplat: ret "list"
   | No
 
 expand_match Keyform Cases Default Key =
