@@ -283,10 +283,46 @@ supply_ret Name Body =
   less got Name: Name =  'lmb_'.rand
   : default_ret_ Name (expand_named Name Body)
 
+// TS-3.14: typed parameters.  `foo Acc^account Amt^money = body`
+// strips the `^T` suffixes from the param list, wraps each
+// typed param in a runtime `_the T V` boundary check at body
+// entry, and a static `_type T V` scope so refs to V inside
+// the body see V as T (so `_the U (V.field)` type-checks at
+// mex time, no `_the T V` ceremony at every line).
+//
+// Composes with the existing TS-1.1 `X^T` ascription (which
+// only works in expression position) and TS-1.2 `T X`
+// constructor.  The user-facing surface stays "typename is a
+// function" -- `^T` everywhere.
+//
+// Returns a 2-list `[NewAs WrappedBody]`.  Recognises typed
+// params only when T resolves to a known type at macroexpand
+// time (`is_known_type`), so `X^Foo` where Foo is an arbitrary
+// fn-call-on-left stays untouched.
+strip_typed_params As Body =
+| TypedPairs []
+| NewAs []
+| for A As
+  | case A
+    [`^` V T] | if T.is_text and T^is_known_type and V^is_var_sym
+                  then | push [V T] TypedPairs
+                       | push V NewAs
+                  else push A NewAs
+    Else | push A NewAs
+| NewAs = NewAs.f
+| less TypedPairs.end:
+  | TypedPairs = TypedPairs.f
+  | Asserts map [V T] TypedPairs: [`_the` T V]
+  | Body = [`_progn` @Asserts Body]
+  | for [V T] TypedPairs.f
+    | Body = [`_type` T V Body]
+| [NewAs Body]
+
 `=>` As Body =
   Body = expand_qlmb Body
   Body = supply_ret No Body
-  expand_lambda As [`|` Body]
+  [As2 Body2] strip_typed_params As Body
+  expand_lambda As2 [`|` Body2]
 
 expand_block_item_fn Name As Body =
 // TS-3.8: register fn return type when body has a statically
@@ -295,12 +331,16 @@ expand_block_item_fn Name As Body =
 // X)` catches mismatches at mex time.  Conservative: only
 // fires when the WHOLE body has a known declared type
 // (single typed expression like `_the T E` or `T E`).
-| RetT infer_declared_type Body
+//
+// TS-3.14 typed-param strip runs FIRST so the body that
+// fn-return inference sees is the type-narrowed version.
+| [As2 Body2] strip_typed_params As Body
+| RetT infer_declared_type Body2
 | when got RetT: GFnReturns.Name = RetT
-| Body = expand_qlmb Body
-| Body = supply_ret Name Body
-| Body = [_progn [_mark Name] Body]
-| [Name (expand_lambda As Body)]
+| Body2 = expand_qlmb Body2
+| Body2 = supply_ret Name Body2
+| Body2 = [_progn [_mark Name] Body2]
+| [Name (expand_lambda As2 Body2)]
 
 expand_destructuring Value Bs Body =
 | O @rand 'O'
