@@ -1031,13 +1031,13 @@ LCG_A     16807
 LCG_B     0
 
 lcg_init Seed =
-| LCG_Seed =  Seed
-| 10.rand
-| No
+  LCG_Seed =  Seed
+  10.rand
+  No
 
 int.rand =
-| LCG_Seed =  (LCG_Seed*LCG_A + LCG_B) % LCG_M
-| @int: @round: LCG_Seed.float*$float/LCG_M_F
+  LCG_Seed =  (LCG_Seed*LCG_A + LCG_B) % LCG_M
+  @int: @round: LCG_Seed.float*$float/LCG_M_F
 
 rand_get = LCG_Seed
 rand_set V = LCG_Seed =  V
@@ -1046,19 +1046,19 @@ LCG_Stack    dup 32 0
 LCG_StackTop 0
 
 rand_push NewSeed =
-| LCG_Stack.LCG_StackTop =  LCG_Seed
-| LCG_StackTop += 1
-| LCG_Seed =  NewSeed
+  LCG_Stack.LCG_StackTop =  LCG_Seed
+  LCG_StackTop += 1
+  LCG_Seed =  NewSeed
 
 rand_pop =
-| R LCG_Seed
-| LCG_StackTop -= 1
-| LCG_Seed =  LCG_Stack.LCG_StackTop
-| R
+  R LCG_Seed
+  LCG_StackTop -= 1
+  LCG_Seed =  LCG_Stack.LCG_StackTop
+  R
 
 float.rand =
-| LCG_Seed =  (LCG_Seed*LCG_A + LCG_B) % LCG_M
-| LCG_Seed.float/LCG_M_F*Me
+  LCG_Seed =  (LCG_Seed*LCG_A + LCG_B) % LCG_M
+  LCG_Seed.float/LCG_M_F*Me
 
 int.randr B =
   A Me
@@ -1104,25 +1104,25 @@ ILeft   2
 IRight  3
 
 merge H1 H2 =
-| less H1: ret   H2
-| less H2: ret   H1
-| when H2.IValue < H1.IValue:
+  less H1: ret   H2
+  less H2: ret   H1
+  when H2.IValue < H1.IValue:
   | T H1
   | H1 =  H2
   | H2 =  T
-| if 1.rand
+  if 1.rand
   then | H1.ILeft =  merge H1.ILeft H2
        | when H1.ILeft: H1.ILeft.IParent =  H1
   else | H1.IRight =  merge H1.IRight H2
        | when H1.IRight: H1.IRight.IParent =  H1
-| H1
+  H1
 
 sort_asc Xs =
-| Root 0
-| for X Xs
+  Root 0
+  for X Xs
   | Root =  merge [X 0 0 0] Root
   | Root.IParent =  0
-| dup Xs.n
+  dup Xs.n
   | V Root.IValue
   | Root =  merge Root.ILeft Root.IRight
   | V
