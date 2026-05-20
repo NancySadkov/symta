@@ -35,8 +35,8 @@ _.bool = 1
 int.bool = if Me: 1 else 0
 float.bool = Me <> 0.0
 text.bool =
-| @"0 for the empty text, 1 otherwise."
-| if Me.end: 0 else 1
+  @"0 for the empty text, 1 otherwise."
+  if Me.end: 0 else 1
 no.bool = 0
 
 text.`+` B = "[Me][B]"
@@ -78,18 +78,18 @@ _.is_table = 0
 
 _.copy = Me
 list.copy =
-| @"Shallow copy of a list -- elements are shared."
-| map X Me X
+  @"Shallow copy of a list -- elements are shared."
+  map X Me X
 
 _.deep_copy = Me
 list.deep_copy =
-| @"Recursive deep copy of a list.  Nested lists are copied too."
-| map X Me X.deep_copy
+  @"Recursive deep copy of a list.  Nested lists are copied too."
+  map X Me X.deep_copy
 
 methods Object =
-| @"Return the table of methods defined for the given value.
+  @"Return the table of methods defined for the given value.
 Example:  methods 42          // table of int methods"
-| Object^methods_.t
+  Object^methods_.t
 
 // TS-2: type-system introspection.  `typeof X` is the design's
 // chosen name for "what type is this value"; today it aliases
@@ -109,9 +109,9 @@ Example:  methods 42          // table of int methods"
 // T may be a text ("int") or a tag-symbol (\int) -- both compare
 // equal to typename's text result via the existing `><` overload.
 typeof X =
-| @"Return the type name of X as text.  Alias for `typename` --
+  @"Return the type name of X as text.  Alias for `typename` --
 the type-system surface uses `typeof` as the canonical verb."
-| typename X
+  typename X
 
 subtype_of X T =
 | @"Return 1 if X's type is T or T is an ancestor of X's
