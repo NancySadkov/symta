@@ -205,10 +205,10 @@ Example:  \[\[1 2 3\] \[a b c\]\].zip   // ((1 a) (2 b) (3 c))"
   dup I Me.0.n: map Xs Me Xs.I
 
 text.`<` B =
-| less B.is_text: bad "cant compare string `[Me]` with [B]"
-| AS $n
-| BS B.n
-| if AS < BS
+  less B.is_text: bad "cant compare string `[Me]` with [B]"
+  AS $n
+  BS B.n
+  if AS < BS
   then | times I AS:
          | AC $I.code
          | BC B.I.code
@@ -223,34 +223,34 @@ text.`<` B =
 text.`*` N = @text: dup N: Me
 
 text.is_upcase =
-| @"Test whether every character is an uppercase ASCII letter."
-| times I $n:
+  @"Test whether every character is an uppercase ASCII letter."
+  times I $n:
   | C $I.code
   | when C < 'A'.code or 'Z'.code < C: ret   0
-| 1
+  1
 
 text.is_downcase =
-| @"Test whether every character is a lowercase ASCII letter."
-| times I $n:
+  @"Test whether every character is a lowercase ASCII letter."
+  times I $n:
   | C $I.code
   | when C < 'a'.code or 'z'.code < C: ret   0
-| 1
+  1
 
 text.is_digit =
-| @"Test whether every character is an ASCII digit (0-9)."
-| times I $n:
+  @"Test whether every character is an ASCII digit (0-9)."
+  times I $n:
   | C $I.code
   | when C < '0'.code or '9'.code < C: ret   0
-| 1
+  1
 
 text.is_alpha =
-| @"Test whether every character is an ASCII letter (a-z or A-Z)."
-| times I $n:
+  @"Test whether every character is an ASCII letter (a-z or A-Z)."
+  times I $n:
   | C $I.code
   | when C < 'a'.code or 'z'.code < C:
     | when C < 'A'.code or 'Z'.code < C:
       | ret   0
-| 1
+  1
 
 //shorthands to make text matching easier
 text.is_d = $is_digit
@@ -268,36 +268,36 @@ text.has F =
 */
 
 text.u =
-| @"Upcase a text.  Letters A-Z and a-z only; non-ASCII passes through.
+  @"Upcase a text.  Letters A-Z and a-z only; non-ASCII passes through.
 Example:  \"Hello\".u   // \"HELLO\""
-| Ys map Char $l
+  Ys map Char $l
   | C Char.code
   | if C < 'a'.code or 'z'.code < C then Char
     else (C - 'a'.code + 'A'.code).char
-| Ys.text
+  Ys.text
 
 text.d =
-| @"Downcase a text.  Letters A-Z and a-z only; non-ASCII passes through.
+  @"Downcase a text.  Letters A-Z and a-z only; non-ASCII passes through.
 Example:  \"Hello\".d   // \"hello\""
-| Ys map Char $l
+  Ys map Char $l
   | C Char.code
   | if C < 'A'.code or 'Z'.code < C then Char
     else (C - 'A'.code + 'a'.code).char
-| Ys.text
+  Ys.text
 
 
 text.title =
-| @"Capitalise the first character of a text.
+  @"Capitalise the first character of a text.
 Example:  \"hello world\".title   // \"Hello world\"   (first char only!)"
-| less $n: ret   Me
-| if $0.is_upcase then Me else "[$0.u][$tail]"
+  less $n: ret   Me
+  if $0.is_upcase then Me else "[$0.u][$tail]"
 
 _.is_keyword = 0
 text.is_keyword =
-| @"A text is a \"keyword\" (variable) if it starts with an uppercase letter.
+  @"A text is a \"keyword\" (variable) if it starts with an uppercase letter.
 Example:  \"Foo\".is_keyword   // 1
           \"foo\".is_keyword   // 0"
-| not: $n and $0.is_upcase
+  not: $n and $0.is_upcase
 
 text.trim s/' ' i/0 l/1 r/1 =
 | @"Strip leading and trailing instances of a separator (default space).
