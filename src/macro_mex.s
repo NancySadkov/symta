@@ -342,6 +342,14 @@ hcase MexFormCases Expr ()
       | when got PriorType and got OrigType
              and not types_compatible OrigType PriorType:
         | mex_error "type mismatch on reassign: `[Place]` is `[PriorType]`, got `[OrigType]`"
+      // TS-4.4: inside `static`, propagate the new value's type
+      // onto Place so subsequent ops on Place can route to the
+      // unboxed path.  Gensym filter keeps macro-internal
+      // R-registers (case-arm result, named-block result, etc.)
+      // out -- they legitimately get reassigned across types.
+      | when GStaticMode and no PriorType and got OrigType
+             and not Place^is_gensym_name:
+        | GVarsTypes.Place =  OrigType
     | [_set Place NewValue]
   [_label Name] | Expr
   [_goto Name] | Expr
@@ -440,6 +448,7 @@ macroexpand Expr Macros ModuleCompiler ModuleFolders =
       GFnReturns (!)
       GMexLets (!)
       GLastType 0
+      GStaticMode 0
   | R mex Expr
   | R,GExports
 
@@ -548,3 +557,40 @@ help @Args = case Args:
   []  = form: help_banner_
   [X] = [help_lookup_ [_quote ast_key(X)]]
   Else = mex_error "help takes 0 or 1 arg"
+
+// TS-4.4: `static Expr` opts the inner expression into strict
+// static type checking.  Two behavioural changes during Expr's
+// mex:
+//   1. `bin_op` requires both operands to have a statically-known
+//      numeric type.  `static (X + 5)` where X is dyn raises a
+//      compile-time error -- the whole point is to surface the
+//      missing annotation before it silently falls to FXNADD.
+//   2. `expand_block`'s sideband channel (TS-4.3c) uses the
+//      permissive `infer_type` instead of `infer_declared_type`,
+//      so bare-literal init like `Acc 0` now propagates Acc:int
+//      and subsequent ops on Acc route to the unboxed path.
+//
+// The mode is per-mex-frame: pushing GStaticMode applies to all
+// inner mex but NOT to lambdas defined inside Expr (those get
+// their own evaluation context at runtime).  Restored at exit.
+//
+// Macro-internal gensyms (`__N` suffix from `@rand`) are
+// filtered out of propagation so `case`/`for`/`let`/etc. still
+// work inside `static` -- those macros legitimately reassign
+// their result-register across types, which strict mode would
+// otherwise flag.  See `is_gensym_name` in macro.s for the
+// detection, and macro_block.s sideband for the filter use.
+//
+// Block-level `static` / `static end` (zone form) is deferred.
+static @Args =
+| case Args
+    [E]
+      | Old GStaticMode
+      | GStaticMode =  1
+      | R E^mex
+      | GStaticMode =  Old
+      | [_nomex R]
+    []
+      | mex_error "static: zero-arg (block-zone) form not yet implemented; use `static Expr`"
+    Else
+      | mex_error "static: takes exactly one expression, got [Args.n] args"

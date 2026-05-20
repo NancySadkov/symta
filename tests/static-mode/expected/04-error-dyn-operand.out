@@ -1,0 +1,1 @@
+tests/static-mode/cases/04-error-dyn-operand.s:4,20: static: `+` operands not provably numeric; lhs=No rhs=int

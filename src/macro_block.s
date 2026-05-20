@@ -693,7 +693,13 @@ expand_block_helper R A B =
            // TS-3.6: use infer_declared_type so `X 0` doesn't
            // narrow X to int.  Only EXPLICITLY-typed forms
            // (`X _the int 5`, `X int 5`, `X 5^int`) propagate.
-           | TypedR | InferredType infer_declared_type B
+           // TS-4.4: inside `static`, use the permissive
+           // `infer_type` so bare-literal init (`X 5`) yields
+           // a `_type int X body` wrap.  Outside, stay
+           // conservative (TS-3.6: `X 5` -> X stays dyn).
+           | TypedR | InferredType if GStaticMode
+                                     then infer_type B
+                                     else infer_declared_type B
                     | if got InferredType
                         then [`_type` InferredType A R]
                         else R
@@ -753,8 +759,14 @@ expand_block Xs =
     when X.is_meta: Rs =  map R Rs: meta R X.meta_
     for Item Rs:
       case Item [A B]:
-        when A.is_text and not A.is_keyword:
-          | InferredType infer_declared_type B
+        when A.is_text and not A.is_keyword and not A^is_gensym_name:
+          // TS-4.4: inside `static`, use permissive `infer_type`
+          // so bare-literal init (`Acc 0`) propagates as int --
+          // the user opted in.  Outside, stay conservative per
+          // TS-3.6 (bare 0 doesn't narrow Acc).
+          | InferredType if GStaticMode
+                          then infer_type B
+                          else infer_declared_type B
           | when got InferredType:
             | push [A GVarsTypes.A] Pushed
             | GVarsTypes.A =  InferredType

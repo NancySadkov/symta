@@ -1,0 +1,1 @@
+tests/static-mode/cases/05-error-mixed-types.s:7,1: type mismatch on reassign: `X` is `int`, got `text`

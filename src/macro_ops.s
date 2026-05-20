@@ -282,6 +282,13 @@ bin_op A B Op Method =
     then [IntOp A B]
   elif got FltOp and TA >< "float" and TB >< "float"
     then [FltOp A B]
+  // TS-4.4: inside `static`, refuse to fall back to the dyn
+  // path for numeric ops -- the whole point of opting in is to
+  // surface this gap at compile time.  Only fires for ops where
+  // a typed variant exists (got IntOp); ops without a typed
+  // form (e.g. `^^`) stay permissive.
+  elif GStaticMode and got IntOp
+    then mex_error "static: `[Method]` operands not provably numeric; lhs=[TA] rhs=[TB]"
   else [Op A B]
 
 

@@ -15,6 +15,7 @@ export macroexpand 'mexlet' 'let_' 'let' 'default_ret_' 'ret'
        'ffi_begin' 'ffi' 'min' 'max' 'swap' 'have' 'source_' 'compile_when' 
        'nullary_' 'hcase' 'hcase_go' 'mac' 'prx' 'mdbg'
        'help'
+       'static'
        \int \float \text \fixtext \list
        \as_int \as_float \as_text \as_fixtext \as_list \as_bytes
 
@@ -34,6 +35,16 @@ GFnReturns No // TS-3.8: hash: fnname -> return-type-text.
               // return.  Read by infer_type to type call sites.
 GMexLets No //verb mexlets
 GLastType 0
+GStaticMode No  // TS-4.4: when set, the surrounding `static Expr`
+                // tightens the rules: bin_op demands BOTH operands
+                // have a statically-known numeric type (else
+                // mex_error), and the sideband channel in
+                // expand_block enables type propagation through
+                // declarations using `infer_type` (permissive, so
+                // bare-literal init like `Acc 0` now narrows Acc).
+                // Macro-internal gensyms (`__N` suffix) are
+                // filtered out of propagation so case/for/etc.
+                // standard macros still work inside `static`.
 FFI_Lib No
 GExports No
 
@@ -81,6 +92,20 @@ mtrace_say Name X = say "[GExpansionDepth]> [Name]: [X]"
 #endif
 
 is_var_sym X = X.is_text and not X.is_keyword
+
+// TS-4.4: detect a macro-generated gensym name.  `text.rand`
+// (= `@rand`) appends a `__N` suffix: `"R".rand -> "R__123"`.
+// The `__` infix is reserved and never appears in user-written
+// identifiers, so a name containing two consecutive `_` is
+// unambiguously compiler-generated.  Walks the char-list once
+// using `text.locate` to find the first `_`, then peeks the
+// next char -- no qlmb / lambda allocation.
+is_gensym_name X =
+| less X.is_text: ret 0
+| P X.locate(\_)
+| less got P: ret 0
+| less P+1 < X.n: ret 0
+| X.(P+1) >< \_
 
 is_list_case V =
   V(:[_ _ @_]+[]+[['@'+'/' @_]+['+'+'*' _]+['<' _ ['+'+'*'+'/' _]]])
