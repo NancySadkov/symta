@@ -484,6 +484,16 @@ type Name @Fields =
 
 expand_block_item_method Type Name Args Body =
 | less Name >< __:
+  // TS-4.5 Phase 3: typed method params.  `list.+ Ys^list = ...`
+  // strips the `^list` and wraps Body with a runtime `_the list
+  // Ys` boundary check + a static `_type list Ys ...` scope, so
+  // `Ys.I` inside is typed list-access and `Ys.n + K` routes
+  // to _iadd.  Reuses the same helper TS-3.14 uses for regular
+  // fn defs.  Runs BEFORE pushing `Me` -- the receiver wrap
+  // comes from Phase 1 below.
+  | [Args2 Body2] strip_typed_params Args Body
+  | Args = Args2
+  | Body = Body2
   | push \Me Args
   // TS-4.5 Phase 1: also wrap for the whitelisted primitive
   // receivers (int/float/text/list/...).  Used to be gated on
