@@ -358,6 +358,8 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_NOP    0x00
 #define BC_LEAVE  0x02
 #define BC_LEAVE0 0x03
+#define BC_JMP    0x04
+#define BC_B      0x06
 #define BC_IADD   0xA3
 #define BC_ISUB   0xA4
 #define BC_IMUL   0xA5
@@ -383,17 +385,43 @@ static void emit_xor_rax_rax(jit_buf *b) {
   jit_emit_u8(b, 0xc0);
 }
 
+/* Read a 24-bit little-endian unsigned int from bc[off..off+2]. */
+static uint32_t bc_rd24(const uint8_t *p) {
+  return (uint32_t)p[0]
+       | ((uint32_t)p[1] << 8)
+       | ((uint32_t)p[2] << 16);
+}
+
+#define JIT_MAX_PATCHES 256
+
+typedef struct {
+  size_t jit_off;     /* offset of the 4-byte disp32 placeholder */
+  size_t bc_target;   /* target byte offset within the bc buffer */
+} jit_patch;
+
 jit_buf *jit_translate(const uint8_t *bc, size_t n) {
-  /* 16 bytes of x86 per SBC instruction is a generous upper bound
-   * (IDIV/IREM emit ~14, comparisons ~16, arith ~10).  Plus 6
-   * for prologue and 7 for epilogue. */
-  jit_buf *b = jit_buf_new(n * 16 + 64);
+  /* x86 expansion factor.  Worst case so far is the comparison
+   * sequence at ~16 bytes per opcode; B is ~12 bytes; prologue
+   * 6, epilogue 7.  Round up to 20/opcode to leave headroom. */
+  jit_buf *b = jit_buf_new(n * 20 + 64);
   if (!b) return NULL;
+
+  /* bc_to_x86[i] = x86 offset of the instruction starting at
+   * bc[i], or (size_t)-1 if bc[i] isn't an instruction start.
+   * Used by the patch pass to resolve branch targets. */
+  size_t *bc_to_x86 = (size_t*)malloc((n + 1) * sizeof(size_t));
+  if (!bc_to_x86) { jit_buf_free(b); return NULL; }
+  for (size_t k = 0; k <= n; k++) bc_to_x86[k] = (size_t)-1;
+
+  jit_patch patches[JIT_MAX_PATCHES];
+  size_t patches_n = 0;
+  int fail = 0;
 
   jit_emit_prologue(b);
 
   size_t i = 0;
   while (i < n) {
+    bc_to_x86[i] = b->len;
     uint8_t op = bc[i];
     switch (op) {
     case BC_NOP:
@@ -402,7 +430,7 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
 
     case BC_IADD: case BC_ISUB: case BC_IMUL: case BC_IDIV:
     case BC_IREM: case BC_ILT:  case BC_IGT:  case BC_ILTE: case BC_IGTE: {
-      if (i + 7 > n) { jit_buf_free(b); return NULL; }
+      if (i + 7 > n) { fail = 1; goto done; }
       int dst = bc_rd16(bc + i + 1);
       int a   = bc_rd16(bc + i + 3);
       int x   = bc_rd16(bc + i + 5);
@@ -421,32 +449,95 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
       break;
     }
 
+    case BC_JMP: {
+      /* SBC_JMP: opcode + 24-bit absolute bytecode offset. */
+      if (i + 4 > n) { fail = 1; goto done; }
+      uint32_t target = bc_rd24(bc + i + 1);
+      if (target >= n) { fail = 1; goto done; }
+      size_t patch_off = jit_emit_jmp(b);
+      if (patches_n >= JIT_MAX_PATCHES) { fail = 1; goto done; }
+      patches[patches_n].jit_off = patch_off;
+      patches[patches_n].bc_target = target;
+      patches_n++;
+      i += 4;
+      break;
+    }
+
+    case BC_B: {
+      /* SBC_B: opcode + 16-bit cnd slot + 24-bit absolute target. */
+      if (i + 6 > n) { fail = 1; goto done; }
+      int cnd = bc_rd16(bc + i + 1);
+      uint32_t target = bc_rd24(bc + i + 3);
+      if (target >= n) { fail = 1; goto done; }
+      /* SBC_B branches WHEN cnd is truthy; jnz_slot matches that. */
+      size_t patch_off = jit_emit_jnz_slot(b, cnd);
+      if (patches_n >= JIT_MAX_PATCHES) { fail = 1; goto done; }
+      patches[patches_n].jit_off = patch_off;
+      patches[patches_n].bc_target = target;
+      patches_n++;
+      i += 6;
+      break;
+    }
+
     case BC_LEAVE: {
-      if (i + 3 > n) { jit_buf_free(b); return NULL; }
+      if (i + 3 > n) { fail = 1; goto done; }
       int src = bc_rd16(bc + i + 1);
       emit_mov_rax_from_slot(b, src);
       jit_emit_epilogue(b);
-      return b;
+      i += 3;
+      break;
     }
 
     case BC_LEAVE0:
       emit_xor_rax_rax(b);
       jit_emit_epilogue(b);
-      return b;
+      i += 1;
+      break;
 
     default:
       /* Unsupported opcode -- bail out so the caller falls back
-       * to the interpreter.  Step 5 will widen coverage by
-       * trampolining unsupported opcodes through the C runtime. */
-      jit_buf_free(b);
-      return NULL;
+       * to the interpreter.  A later step will widen coverage
+       * via the C-runtime trampoline. */
+      fail = 1;
+      goto done;
+    }
+  }
+  /* Mark "one past the last instruction" so a JMP/B that
+   * jumps to the end of the function (defensive but unusual)
+   * resolves to the position right after the body. */
+  bc_to_x86[n] = b->len;
+
+  /* If the bytecode didn't end in an explicit LEAVE the function
+   * still needs a terminator.  Emit an implicit LEAVE0. */
+  if (i == n) {
+    /* Check the last emitted instruction wasn't already a ret
+     * (LEAVE/LEAVE0 just ran).  Simplest check: if the previous
+     * byte is 0xc3 we know epilogue's `ret` just landed. */
+    if (b->len == 0 || b->code[b->len - 1] != 0xc3) {
+      emit_xor_rax_rax(b);
+      jit_emit_epilogue(b);
     }
   }
 
-  /* Fell off the end without a LEAVE.  Real SBC functions always
-   * end in some flavour of LEAVE, but be defensive. */
-  emit_xor_rax_rax(b);
-  jit_emit_epilogue(b);
+done:
+  if (fail) {
+    free(bc_to_x86);
+    jit_buf_free(b);
+    return NULL;
+  }
+
+  /* Resolve patches.  Backward jumps already have their targets
+   * recorded; forward jumps get their targets filled in now. */
+  for (size_t p = 0; p < patches_n; p++) {
+    size_t tgt_bc = patches[p].bc_target;
+    if (tgt_bc > n) { fail = 1; break; }
+    size_t tgt_x86 = bc_to_x86[tgt_bc];
+    if (tgt_x86 == (size_t)-1) { fail = 1; break; }
+    jit_patch_jmp_to(b, patches[p].jit_off, tgt_x86);
+  }
+
+  free(bc_to_x86);
+  if (fail) { jit_buf_free(b); return NULL; }
   return b;
 }
 
@@ -983,6 +1074,107 @@ static int step4_translate(void) {
   return fail;
 }
 
+/* Step 5a proof: jit_translate handles SBC_JMP and SBC_B
+ * (conditional branch).  Verifies backward AND forward
+ * branch resolution via the patch list.
+ *
+ * Loop program (countdown-sum, same shape as step 2b but
+ * driven entirely from SBC bytecode):
+ *
+ *   bc[ 0..6 ]: IADD L[0] = L[0] + L[1]       7 bytes
+ *   bc[ 7..13]: ISUB L[1] = L[1] - L[2]       7 bytes
+ *   bc[14..19]: B    L[1], target=0           6 bytes
+ *   bc[20..22]: LEAVE L[0]                    3 bytes
+ *
+ * Forward-branch program (max-of-two via JMP):
+ *
+ *   bc[ 0..6 ]: IGT  L[3] = L[0] > L[1]
+ *   bc[ 7..12]: B    L[3], target=20         (skip else arm)
+ *   bc[13..19]: IADD L[2] = L[1] + L[4=0]    (else: L[2]=L[1])
+ *   bc[20..  ]: ...wait that's the target -> we need a JMP
+ *
+ * Actually rewrite cleaner:
+ *
+ *   bc[ 0..6 ]: IGT  L[3] = L[0] > L[1]      ; 7
+ *   bc[ 7..12]: B    L[3], target=20         ; 6  -> skip to "take_a"
+ *   bc[13..19]: IADD L[2] = L[1] + L[4]      ; 7  (else branch)
+ *   bc[20..23]: JMP  target=30               ; 4  -> end
+ *   bc[24..30]: IADD L[2] = L[0] + L[4]      ; 7  (take_a branch)
+ *   bc[31..33]: LEAVE L[2]                   ; 3
+ *
+ * (L[4] is initialized to 0 by the caller, used as identity
+ *  for the IADD-copy.)
+ */
+static int step5_branches(void) {
+  int fail = 0;
+
+  /* --- Backward branch: countdown loop. --- */
+  {
+    static const uint8_t bc[] = {
+      BC_IADD, 0,0, 0,0, 1,0,
+      BC_ISUB, 1,0, 1,0, 2,0,
+      BC_B,    1,0, 0,0,0,
+      BC_LEAVE, 0,0,
+    };
+    jit_buf *b = jit_translate(bc, sizeof(bc));
+    if (!b) { printf("FAIL  jit_translate (loop) returned NULL\n"); return 1; }
+    int64_t (*fn)(int64_t*) = (int64_t(*)(int64_t*))jit_buf_finalize(b);
+
+    int64_t L[10] = {0};
+    L[1] = TEST_FXN(10);
+    L[2] = TEST_FXN(1);
+    int64_t ret = fn(L);
+    fail += check("loop sum 1..10",  ret,  TEST_FXN(55));
+    fail += check("loop accumulator", L[0], TEST_FXN(55));
+
+    L[0] = 0; L[1] = TEST_FXN(100); L[2] = TEST_FXN(1);
+    ret = fn(L);
+    fail += check("loop sum 1..100", ret,  TEST_FXN(5050));
+
+    jit_buf_free(b);
+  }
+
+  /* --- Forward branch + unconditional jmp: max-of-two. --- */
+  {
+    /*  0..6   IGT  L[3] = L[0] > L[1]
+     *  7..12  B    L[3], target=24    (jump fwd to take_a)
+     * 13..19  IADD L[2] = L[1] + L[4]  (else: L[2] = L[1])
+     * 20..23  JMP  target=31           (skip take_a)
+     * 24..30  IADD L[2] = L[0] + L[4]  (take_a: L[2] = L[0])
+     * 31..33  LEAVE L[2]
+     */
+    static const uint8_t bc[] = {
+      BC_IGT,  3,0, 0,0, 1,0,             /*  0..6  */
+      BC_B,    3,0, 24,0,0,               /*  7..12 */
+      BC_IADD, 2,0, 1,0, 4,0,             /* 13..19 */
+      BC_JMP,  31,0,0,                    /* 20..23 */
+      BC_IADD, 2,0, 0,0, 4,0,             /* 24..30 */
+      BC_LEAVE, 2,0,                      /* 31..33 */
+    };
+    jit_buf *b = jit_translate(bc, sizeof(bc));
+    if (!b) { printf("FAIL  jit_translate (max) returned NULL\n"); return 1; }
+    int64_t (*fn)(int64_t*) = (int64_t(*)(int64_t*))jit_buf_finalize(b);
+
+    int64_t L[10] = {0};  /* L[4] = 0 (identity for IADD-copy) */
+
+    L[0] = TEST_FXN(10); L[1] = TEST_FXN(3);
+    int64_t ret = fn(L);
+    fail += check("max(10,3) via JIT bc", ret, TEST_FXN(10));
+
+    L[0] = TEST_FXN(-5); L[1] = TEST_FXN(7);
+    ret = fn(L);
+    fail += check("max(-5,7) via JIT bc", ret, TEST_FXN(7));
+
+    L[0] = TEST_FXN(4); L[1] = TEST_FXN(4);
+    ret = fn(L);
+    fail += check("max(4,4) via JIT bc", ret, TEST_FXN(4));
+
+    jit_buf_free(b);
+  }
+
+  return fail;
+}
+
 int main(void) {
   int fail = 0;
   printf("=== step 0: hand-coded add ===\n");
@@ -999,6 +1191,8 @@ int main(void) {
   fail += step3_call();
   printf("\n=== step 4: SBC -> x86 translator ===\n");
   fail += step4_translate();
+  printf("\n=== step 5a: branch resolution (loop + max) ===\n");
+  fail += step5_branches();
   if (fail) {
     fprintf(stderr, "\n%d check(s) failed\n", fail);
     return 1;
