@@ -422,6 +422,11 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_IGT    0xAB
 #define BC_ILTE   0xAC
 #define BC_IGTE   0xAD
+#define BC_SAME   0xA8
+#define BC_VARY   0xA9
+#define BC_LIST1  0xA2
+#define BC_LIST2  0xA1
+#define BC_FXNSIZE 0x37
 
 /* Little-endian uint16_t read.  SBC operands are encoded LE; the
  * RD16 macro in sbc.c does the same thing inline. */
@@ -535,6 +540,9 @@ void (*jit_rt_arglist5_helper)(int64_t *L, int packed, int u1, int u2) = NULL;
 void (*jit_rt_movetx_helper) (int64_t *L, struct sbc_t *sbc, uint64_t packed) = NULL;
 void (*jit_rt_closure_helper)(int64_t *L, struct sbc_t *sbc,
                               uint64_t packed) = NULL;
+void (*jit_rt_list1_helper)(int64_t *L, int dst, int x, int unused) = NULL;
+void (*jit_rt_list2_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fxnsize_helper)(int64_t *L, int dst, int src, int unused) = NULL;
 
 static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
                                    int have_sbc, int record_relocs);
@@ -735,6 +743,57 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       uint32_t size = (uint32_t)bc_rd16(bc + i + 3);
       b->pending_helper_id = JIT_HELPER_LIST;
       jit_emit_call_helper3(b, (void*)jit_rt_list_helper, dst, size, 0);
+      i += 5;
+      break;
+    }
+    case BC_LIST1: {
+      /* SBC_LIST1: opcode + dst(u16) + x(u16) = 5 bytes.  Fused
+       * LIST(L[dst], 1) + LGET(L[dst], 0) = L[x].  Trampolined
+       * to jit_rt_list1_helper which does both stores. */
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_list1_helper) { jit_last_fail_opcode = op;
+                                  jit_last_fail_offset = i;
+                                  fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t x   = (uint32_t)bc_rd16(bc + i + 3);
+      b->pending_helper_id = JIT_HELPER_LIST1;
+      jit_emit_call_helper3(b, (void*)jit_rt_list1_helper, dst, x, 0);
+      i += 5;
+      break;
+    }
+    case BC_LIST2: {
+      /* SBC_LIST2: opcode + dst(u16) + a(u16) + b(u16) = 7 bytes.
+       * Fused LIST(L[dst], 2) + LGET(L[dst], 0) = L[a] + LGET(L[dst], 1) = L[b]. */
+      if (i + 7 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_list2_helper) { jit_last_fail_opcode = op;
+                                  jit_last_fail_offset = i;
+                                  fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t a   = (uint32_t)bc_rd16(bc + i + 3);
+      uint32_t bb  = (uint32_t)bc_rd16(bc + i + 5);
+      b->pending_helper_id = JIT_HELPER_LIST2;
+      jit_emit_call_helper3(b, (void*)jit_rt_list2_helper, dst, a, bb);
+      i += 7;
+      break;
+    }
+    case BC_FXNSIZE: {
+      /* SBC_FXNSIZE: opcode + dst(u16) + src(u16) = 5 bytes.
+       * L[dst] = FXN(LIST_SIZE(L[src])).  No MCACHE fallback;
+       * the heap-header read is unconditional. */
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_fxnsize_helper) { jit_last_fail_opcode = op;
+                                    jit_last_fail_offset = i;
+                                    fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t src = (uint32_t)bc_rd16(bc + i + 3);
+      b->pending_helper_id = JIT_HELPER_FXNSIZE;
+      jit_emit_call_helper3(b, (void*)jit_rt_fxnsize_helper, dst, src, 0);
       i += 5;
       break;
     }
@@ -1106,7 +1165,12 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_IADD: case BC_ISUB: case BC_IMUL: case BC_IDIV:
-    case BC_IREM: case BC_ILT:  case BC_IGT:  case BC_ILTE: case BC_IGTE: {
+    case BC_IREM: case BC_ILT:  case BC_IGT:  case BC_ILTE: case BC_IGTE:
+    case BC_SAME: case BC_VARY: {
+      /* SAME/VARY join the I* block because they share the
+       * 7-byte (opcode + 3*u16) wire shape and inline as a
+       * single cmp + setcc + movzx + shl + store sequence --
+       * no runtime helper needed. */
       if (i + 7 > n) { fail = 1; goto done; }
       int dst = bc_rd16(bc + i + 1);
       int a   = bc_rd16(bc + i + 3);
@@ -1121,6 +1185,8 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
         case BC_IGT:  jit_emit_igt (b, dst, a, x); break;
         case BC_ILTE: jit_emit_ilte(b, dst, a, x); break;
         case BC_IGTE: jit_emit_igte(b, dst, a, x); break;
+        case BC_SAME: jit_emit_same(b, dst, a, x); break;
+        case BC_VARY: jit_emit_vary(b, dst, a, x); break;
       }
       i += 7;
       break;
@@ -1670,6 +1736,16 @@ void jit_emit_ilte(jit_buf *b, int dst, int a, int x) {
 }
 void jit_emit_igte(jit_buf *b, int dst, int a, int x) {
   emit_cmp_op(b, dst, a, x, 0x9d);  /* setge */
+}
+/* SBC_SAME / SBC_VARY: pointer-identity / pointer-vary on tagged
+ * dyns.  The interpreter uses the IMMEQ/IMMNE macros, which lower
+ * to `FXN((a) == (b))` -- bit-identical compare.  Same x86
+ * sequence as the I*-comparison family but with sete / setne. */
+void jit_emit_same(jit_buf *b, int dst, int a, int x) {
+  emit_cmp_op(b, dst, a, x, 0x94);  /* sete  */
+}
+void jit_emit_vary(jit_buf *b, int dst, int a, int x) {
+  emit_cmp_op(b, dst, a, x, 0x95);  /* setne */
 }
 
 size_t jit_here(jit_buf *b) { return b->len; }

@@ -67,6 +67,14 @@ typedef enum {
   JIT_HELPER_MCALL    = 21,
   JIT_HELPER_MCALLIR  = 22,
   JIT_HELPER_MOVETX   = 23,
+  /* Step 7b: RT-9 fused list allocators.  LIST1 = LIST+ST4_0,
+   * LIST2 = LIST+ST4_0+ST4_1.  Single trampoline call replaces
+   * the 2- or 3-call sequence the JIT would otherwise emit. */
+  JIT_HELPER_LIST1    = 24,
+  JIT_HELPER_LIST2    = 25,
+  /* Step 7c: SBC_FXNSIZE = `L[dst] = FXN(LIST_SIZE(L[src]))`.
+   * Pure heap-header read; no MCACHE fallback (unlike FXNLGET). */
+  JIT_HELPER_FXNSIZE  = 26,
   JIT_HELPER_MAX
 } jit_helper_id_t;
 
@@ -176,6 +184,13 @@ void jit_emit_ilt (jit_buf *b, int dst, int a, int x);
 void jit_emit_igt (jit_buf *b, int dst, int a, int x);
 void jit_emit_ilte(jit_buf *b, int dst, int a, int x);
 void jit_emit_igte(jit_buf *b, int dst, int a, int x);
+
+/* SBC_SAME / SBC_VARY: bit-identical pointer compare (same x86
+ * shape as the I* comparisons, just with sete / setne).  Used by
+ * `X >< No`, `case X No`, and the rest of the FXN-tagged identity
+ * checks the macroexpander emits. */
+void jit_emit_same(jit_buf *b, int dst, int a, int x);
+void jit_emit_vary(jit_buf *b, int dst, int a, int x);
 
 /* Current emit position -- used as a label target for back-jumps. */
 size_t jit_here(jit_buf *b);
@@ -304,6 +319,16 @@ extern void (*jit_rt_st4_helper)(int64_t *L, int dst, int src, int index);
  * index).  No sbc pointer needed, the LIST macro routes via
  * gc_alloc which uses thread-local heap state. */
 extern void (*jit_rt_list_helper)(int64_t *L, int dst, int size, int unused);
+
+/* SBC_LIST1 / SBC_LIST2 (RT-9 fused list literals).  LIST1
+ * allocates a size-1 list and stores L[x] at slot 0; LIST2
+ * allocates a size-2 list and stores L[a]/L[b] at slots 0/1. */
+extern void (*jit_rt_list1_helper)(int64_t *L, int dst, int x, int unused);
+extern void (*jit_rt_list2_helper)(int64_t *L, int dst, int a, int b);
+
+/* SBC_FXNSIZE: L[dst] = FXN(LIST_SIZE(L[src])).  No MCACHE
+ * fallback (unlike FXNLGET); pure heap-header field read. */
+extern void (*jit_rt_fxnsize_helper)(int64_t *L, int dst, int src, int unused);
 
 /* SBC_COPY: LSET(L[dst], dindex, LGET(L[src], sindex)).  Packs
  * the two 16-bit field indices into the third helper3 arg

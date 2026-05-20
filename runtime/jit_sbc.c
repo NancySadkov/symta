@@ -360,6 +360,30 @@ static void jit_rt_list_impl(int64_t *L, int dst, int size, int unused) {
   LIST(((dyn*)L)[dst], size);
 }
 
+/* SBC_LIST1 / SBC_LIST2 (RT-9 fused list literals).  Mirror the
+ * interpreter bodies in sbc.c:SBC_LIST1 / SBC_LIST2 -- allocate
+ * a size-1 or size-2 list and stash the source slot(s) into
+ * field 0 (and 1, for LIST2).  These compress the common
+ * `[A]` and `[A B]` patterns into a single trampoline call
+ * instead of 2-3 jit_emit_call_helper3 invocations. */
+static void jit_rt_list1_impl(int64_t *L, int dst, int x, int unused) {
+  (void)unused;
+  LIST(((dyn*)L)[dst], 1);
+  LGET(((dyn*)L)[dst], 0) = ((dyn*)L)[x];
+}
+static void jit_rt_list2_impl(int64_t *L, int dst, int a, int b) {
+  LIST(((dyn*)L)[dst], 2);
+  LGET(((dyn*)L)[dst], 0) = ((dyn*)L)[a];
+  LGET(((dyn*)L)[dst], 1) = ((dyn*)L)[b];
+}
+
+/* SBC_FXNSIZE: L[dst] = FXN(LIST_SIZE(L[src])).  Mirrors
+ * sbc.c:SBC_FXNSIZE exactly; no MCACHE fallback. */
+static void jit_rt_fxnsize_impl(int64_t *L, int dst, int src, int unused) {
+  (void)unused;
+  ((dyn*)L)[dst] = (dyn)(int64_t)FXN(LIST_SIZE(((dyn*)L)[src]));
+}
+
 /* Trampoline helper for SBC_ST4_0..SBC_ST4_F.  Mirrors the
  * interpreter body in sbc.c:1089:
  *   STOR(L[dst], index, L[src])  (== LSET / lsetm)
@@ -436,6 +460,9 @@ static void jit_install_helpers_once(void) {
   jit_rt_arglist4_helper = jit_rt_arglist4_impl;
   jit_rt_arglist5_helper = jit_rt_arglist5_impl;
   jit_rt_movetx_helper   = jit_rt_movetx_impl;
+  jit_rt_list1_helper    = jit_rt_list1_impl;
+  jit_rt_list2_helper    = jit_rt_list2_impl;
+  jit_rt_fxnsize_helper  = jit_rt_fxnsize_impl;
 }
 
 void jit_install_helpers_public(void) {
@@ -473,6 +500,9 @@ void *jit_helper_pointer(int helper_id) {
     case JIT_HELPER_MCALL:    return (void*)jit_rt_mcall_helper;
     case JIT_HELPER_MCALLIR:  return (void*)jit_rt_mcallir_helper;
     case JIT_HELPER_MOVETX:   return (void*)jit_rt_movetx_helper;
+    case JIT_HELPER_LIST1:    return (void*)jit_rt_list1_helper;
+    case JIT_HELPER_LIST2:    return (void*)jit_rt_list2_helper;
+    case JIT_HELPER_FXNSIZE:  return (void*)jit_rt_fxnsize_helper;
     default:                  return NULL;
   }
 }
