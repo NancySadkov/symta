@@ -899,52 +899,52 @@ _.textify_ = $as_text
 text.textify_ = Me
 
 say @As =
-| @"Print one or more values, separated by spaces, followed by a newline.
+  @"Print one or more values, separated by spaces, followed by a newline.
 Lists print as parenthesised forms; tables print as @-key-val groups.
 Double-quoted text with bracketed expressions is interpolated.
 See also: say_ (no newline), bad (raise an error)."
-| say_ "[As{"[?]"}.text(' ')]\n"
+  say_ "[As{"[?]"}.text(' ')]\n"
 
 bad @Text =
-| @"Raise a runtime error with the joined-text argument list as the message.
+  @"Raise a runtime error with the joined-text argument list as the message.
 Caught by `btrap` on the call path; otherwise terminates with the error and source location.
 Example:  less B: bad 'division by zero'
 See also: btrap (catch), bterror (test for error value)."
-| rterr_ "[Text.text ' ']"
+  rterr_ "[Text.text ' ']"
 
 tbl.__ Method Args =
-| if _gt Args.n 1
+  if _gt Args.n 1
   then Args.0.(Method^_method_name.tail) =  Args.1 // strip `assign indicator`
   else Me.(Method^_method_name)
 tbl.map F =
-| @"Apply a function to each key-value pair, collecting the results."
-| $l.map(F)
+  @"Apply a function to each key-value pair, collecting the results."
+  $l.map(F)
 tbl.as_text =
-| @"Render the table as its @-curly key!value literal text form."
-| "@{[$l{"[?0.as_text]![?1.as_text]"}.text(' ')]}"
+  @"Render the table as its @-curly key!value literal text form."
+  "@{[$l{"[?0.as_text]![?1.as_text]"}.text(' ')]}"
 tbl.copy =
-| @"Shallow copy of a table.  Values shared; keys are."
-| $l.t
+  @"Shallow copy of a table.  Values shared; keys are."
+  $l.t
 tbl.deep_copy =
-| @"Recursive deep copy of a table."
-| $l.t
+  @"Recursive deep copy of a table."
+  $l.t
 tbl.s @As =
-| @"Sort a tables key-value pairs the same way list.s does for a list of pairs."
-| $l.s @As
+  @"Sort a tables key-value pairs the same way list.s does for a list of pairs."
+  $l.s @As
 
 list.t =
-| @"Convert a list of pair-lists to a table.  Inverse of `tbl.l`."
-| T!
-| for [K V] Me: T.K =  V
-| T
+  @"Convert a list of pair-lists to a table.  Inverse of `tbl.l`."
+  T!
+  for [K V] Me: T.K =  V
+  T
 
 list.bag = Me{?,1}.t
 
 list.uniq =
-| @"Remove consecutive duplicates, preserving first occurrence.
+  @"Remove consecutive duplicates, preserving first occurrence.
 Use .s first if you want to dedupe over the whole list regardless of order."
-| Seen!
-| $skip(X => got Seen.X or (Seen.X = 1) and 0)
+  Seen!
+  $skip(X => got Seen.X or (Seen.X = 1) and 0)
 
 text.pad Count Item =
   X "[Item]"
