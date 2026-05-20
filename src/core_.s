@@ -845,36 +845,36 @@ list.has Item = bad "list.has is obsolete"
 HexChars '0123456789ABCDEF'
 
 int.x =
-| less Me: ret   '0'
-| Cs:
-| S ''
-| when Me < 0
+  less Me: ret   '0'
+  Cs:
+  S ''
+  when Me < 0
   | S =  '-'
   | Me =  -Me
-| while Me > 0
+  while Me > 0
   | Cs =  [HexChars.(Me%16) @Cs]
   | Me /= 16
-| [S@Cs].text
+  [S@Cs].text
 
 _.as_text = "#([Me^typename] [Me^gid_.x])"
 
 no.as_text = 'No'
 
 int.as_text =
-| less Me: ret   '0'
-| Cs:
-| S ''
-| when Me < 0
+  less Me: ret   '0'
+  Cs:
+  S ''
+  when Me < 0
   | S =  '-'
   | Me =  -Me
-| while Me > 0
+  while Me > 0
   | Cs =  [HexChars.(Me%10) @Cs]
   | Me /= 10
-| [S@Cs].text
+  [S@Cs].text
 
 plain_char C =
-| N C.code
-| if   ('a'.code << N and N << 'z'.code)
+  N C.code
+  if   ('a'.code << N and N << 'z'.code)
     or ('A'.code << N and N << 'Z'.code)
     or ('0'.code << N and N << '9'.code)
     or '_'.code >< N
@@ -882,16 +882,16 @@ plain_char C =
   else 0
 
 text.as_text =
-| less $n: ret '``'
-| case Me 'if'+'then'+'else'+'or'+'and': ret "`[Me]`"
-| Cs:
-| Q $0.is_digit
-| for C Me
+  less $n: ret '``'
+  case Me 'if'+'then'+'else'+'or'+'and': ret "`[Me]`"
+  Cs:
+  Q $0.is_digit
+  for C Me
   | less plain_char C: Q =  1
   | when '`' >< C: C =  '\\`'
   | when '\\' >< C: C =  '\\\\'
   | push C Cs
-| if Q then ['`' @['`' @Cs].f].text else Me
+  if Q then ['`' @['`' @Cs].f].text else Me
 
 list.as_text = "([(map X Me X.as_text).text(' ')])"
 
