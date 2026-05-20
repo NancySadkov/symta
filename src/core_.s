@@ -114,13 +114,13 @@ the type-system surface uses `typeof` as the canonical verb."
   typename X
 
 subtype_of X T =
-| @"Return 1 if X's type is T or T is an ancestor of X's
+  @"Return 1 if X's type is T or T is an ancestor of X's
 type.  T may be a text or tag-symbol naming a primitive
 or a user-defined type.  Walks the runtime super chain
 via parents_of_ -- the list starts with X's own type-name
 then climbs through each ancestor up to the root."
-| Ps parents_of_ X
-| got Ps.find(? >< T)
+  Ps parents_of_ X
+  got Ps.find(? >< T)
 
 _.`()` A = A.Me
 // RT-9: fn.`()` is now a C-side BUILTIN_VARARGS in runtime/bltin.c
@@ -130,29 +130,29 @@ _.`()` A = A.Me
 _.`{}` F = $map(F)
 
 int.sign =
-| @"-1 for negative, 0 for zero, 1 for positive."
-| if Me < 0 then -1
+  @"-1 for negative, 0 for zero, 1 for positive."
+  if Me < 0 then -1
   else if Me > 0 then 1
   else 0
 
 float.sign =
-| @"Same as int.sign but returns floats."
-| if Me < 0.0 then -1.0
+  @"Same as int.sign but returns floats."
+  if Me < 0.0 then -1.0
   else if Me > 0.0 then 1.0
   else 0.0
 
 list.sign =
-| @"Elementwise sign on a numeric list (each element -> -1, 0, or 1)."
-| map X Me X.sign
+  @"Elementwise sign on a numeric list (each element -> -1, 0, or 1)."
+  map X Me X.sign
 
 int.abs =
-| @"Absolute value of an integer.  Note: `abs(-5)` does NOT work because
+  @"Absolute value of an integer.  Note: `abs(-5)` does NOT work because
 `(-5)` is parsed as a function call.  Use `(0-5).abs` instead."
-| _abs Me
+  _abs Me
 
 float.abs =
-| @"Absolute value of a float."
-| _abs Me
+  @"Absolute value of a float."
+  _abs Me
 
 float.log2 = $log/2.0.log
 
@@ -171,8 +171,8 @@ list.normalize = Me / $abs
 list.orth = [$1 -$0].normalize //perpendicular vector to a given
 
 list.loop I =
-| S $n
-| if I<0 then Me.(S - I%S) else Me.(I%S)
+  S $n
+  if I<0 then Me.(S - I%S) else Me.(I%S)
 
 list.neg = dup I $n -$I
 list.`+` Ys = dup I $n $I+Ys.I
@@ -183,26 +183,26 @@ list.`*` Ys =
 list.`/` A = map X Me: X/A
 list.`%` A = map X Me: X%A
 list.float =
-| @"Convert every element of a numeric list to float."
-| map X Me: X.float
+  @"Convert every element of a numeric list to float."
+  map X Me: X.float
 list.int =
-| @"Convert every element of a numeric list to int."
-| map X Me: X.int
+  @"Convert every element of a numeric list to int."
+  map X Me: X.int
 list.round = Me{?round}
 
 zip Xs Ys =
-| @"Element-wise pair two lists into a list of 2-element lists.
+  @"Element-wise pair two lists into a list of 2-element lists.
 Example:  zip \[1 2 3\] \[a b c\]   // ((1 a) (2 b) (3 c))
 The result is truncated to the length of the shorter input."
-| Xs Xs.l
-| Ys Ys.l
-| Sz min Xs.n Ys.n
-| dup I Sz: Xs.I,Ys.I
+  Xs Xs.l
+  Ys Ys.l
+  Sz min Xs.n Ys.n
+  dup I Sz: Xs.I,Ys.I
 
 list.zip =
-| @"Transpose a list of equal-length lists.
+  @"Transpose a list of equal-length lists.
 Example:  \[\[1 2 3\] \[a b c\]\].zip   // ((1 a) (2 b) (3 c))"
-| dup I Me.0.n: map Xs Me Xs.I
+  dup I Me.0.n: map Xs Me Xs.I
 
 text.`<` B =
 | less B.is_text: bad "cant compare string `[Me]` with [B]"
