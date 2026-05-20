@@ -398,6 +398,22 @@ int sbc_jit_audit(struct sbc_t *sbc);
 int sbc_jit_install(struct sbc_t *sbc);
 
 /* ============================================================
+ * Step 6c: install pre-baked native code from the SBC's IA64
+ * section.  Like sbc_jit_install but consumes bytes the writer
+ * already produced (step 6b) instead of re-running the JIT.
+ *
+ * Returns the number of functions installed.  Skips functions
+ * with payload_offset=0 (writer judged untranslatable) and
+ * functions whose relocs reference an unknown helper_id (would
+ * mean the writer and loader disagree on the helper enum).
+ *
+ * Gated on SYMTA_AOT_RUN=1 in sbc_prepare; default builds leave
+ * the section unused (interpreter dispatch) until the AOT path
+ * is fully shaken out.
+ * ============================================================ */
+int sbc_install_ia64(struct sbc_t *sbc);
+
+/* ============================================================
  * Step 4: SBC bytecode -> x86 translator.
  *
  * Walks `n` bytes of SBC bytecode starting at `bc` and emits an

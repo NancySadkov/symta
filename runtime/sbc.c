@@ -431,6 +431,15 @@ void sbc_prepare(sbc_t *sbc) {
     sbc_jit_install(sbc);
   }
 
+  /* Step 6c: install pre-baked native code from the IA64 section
+   * if both the SBC carries one AND the user opted in.  Runs
+   * AFTER sbc_jit_install so SYMTA_AOT_RUN wins when both are
+   * set (rare; mostly useful as a "I trust the AOT writer's
+   * output more than runtime translation" override). */
+  if (sbc->ia64_table && sbc->ia64_sz && getenv("SYMTA_AOT_RUN")) {
+    sbc_install_ia64(sbc);
+  }
+
   sbc->ready = 1;
 }
 

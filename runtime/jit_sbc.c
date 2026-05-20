@@ -548,6 +548,150 @@ static dyn jit_adapter(uint8_t *payload_ptr) {
   return ((jit_fn_t)p->jit_body)((int64_t*)L, p->sbc);
 }
 
+/* Step 6c: install pre-baked native code from the SBC's IA64
+ * section.  Mirrors sbc_jit_install but consumes bytes the
+ * writer already produced instead of re-running the JIT.
+ *
+ * For each populated directory entry (payload_offset != 0):
+ *   1. Allocate a fresh executable mapping sized for code +
+ *      unwind blob + slack.
+ *   2. memcpy the code from the SBC file into the mapping.
+ *   3. Walk the reloc table embedded right after the code; for
+ *      each (offset, helper_id) entry, write the live helper
+ *      pointer into the imm64 slot at `mapping + offset`.
+ *   4. Register Windows SEH unwind info (no-op on POSIX).
+ *   5. Build a jit_adapter_payload_t and overwrite the
+ *      corresponding hooks_heap entry's handler+payload so
+ *      CALL/MCALL dispatches into the native code.
+ *
+ * Gated on SYMTA_AOT_RUN=1 to keep the default behaviour
+ * unchanged while the AOT path is stabilising.  Once
+ * confidence is high we can flip to default-on whenever the
+ * section is populated. */
+int sbc_install_ia64(struct sbc_t *sbc) {
+  if (!sbc || !sbc->ia64_table || !sbc->ia64_sz) return 0;
+  jit_install_helpers_once();
+
+  const uint8_t *sec = sbc->ia64_table;
+  /* Validate section header. */
+  if (sec[0] != 'I' || sec[1] != 'A' || sec[2] != '6' || sec[3] != '4') {
+    fprintf(stderr, "ia64-install: bad magic in %s\n", sbc->filename);
+    return 0;
+  }
+  uint16_t ver = (uint16_t)sec[4] | ((uint16_t)sec[5] << 8);
+  if (ver != 1) {
+    fprintf(stderr, "ia64-install: unsupported section version %u in %s\n",
+            ver, sbc->filename);
+    return 0;
+  }
+  uint32_t sec_nfns = (uint32_t)sec[6]
+                    | ((uint32_t)sec[7]  << 8)
+                    | ((uint32_t)sec[8]  << 16)
+                    | ((uint32_t)sec[9]  << 24);
+  uint32_t fntbl_nfns = sbc->fntbl_sz / 3;
+  if (sec_nfns != fntbl_nfns) {
+    fprintf(stderr, "ia64-install: nfn mismatch (sec=%u fntbl=%u) in %s\n",
+            sec_nfns, fntbl_nfns, sbc->filename);
+    return 0;
+  }
+
+  const uint8_t *dir = sec + 10;
+  int installed = 0;
+  for (uint32_t fi = 0; fi < sec_nfns; fi++) {
+    const uint8_t *e = dir + fi * 16;
+    uint32_t payload_off = (uint32_t)e[0]
+                         | ((uint32_t)e[1] << 8)
+                         | ((uint32_t)e[2] << 16)
+                         | ((uint32_t)e[3] << 24);
+    if (payload_off == 0) continue;  /* not translated; interpreter wins */
+
+    uint32_t code_size = (uint32_t)e[4]
+                       | ((uint32_t)e[5] << 8)
+                       | ((uint32_t)e[6] << 16)
+                       | ((uint32_t)e[7] << 24);
+    uint16_t reloc_count = (uint16_t)e[8]  | ((uint16_t)e[9]  << 8);
+    /* e[10..11] unwind_size -- 0; loader rebuilds via
+     * jit_register_unwind_2arg from the known prologue layout. */
+    uint16_t nvars = (uint16_t)e[12] | ((uint16_t)e[13] << 8);
+    /* e[14..15] flags -- reserved. */
+
+    /* Bound-check the blob inside the section. */
+    uint32_t blob_end = payload_off + code_size + (uint32_t)reloc_count * 8;
+    if (blob_end > sec - sbc->tbls + sbc->tbls_sz) {
+      fprintf(stderr, "ia64-install: blob fn[%u] out of bounds in %s\n",
+              fi, sbc->filename);
+      continue;
+    }
+
+    const uint8_t *code_src  = sec + payload_off;
+    const uint8_t *reloc_src = code_src + code_size;
+
+    /* Allocate executable memory.  jit_buf_new gives us a page-
+     * aligned mapping; reserve room for code + 32 bytes for the
+     * UNWIND_INFO + RUNTIME_FUNCTION the unwind registrar lays
+     * out after the code. */
+    jit_buf *jb = jit_buf_new((size_t)code_size + 64);
+    if (!jb) continue;
+    memcpy(jb->code, code_src, code_size);
+    jb->len = code_size;
+
+    /* Apply relocs: each entry says "the imm64 at jb->code+offset
+     * needs to point at the live address of helper_id".  Each
+     * relocation entry is 8 bytes: u32 offset, u8 helper_id, 3
+     * pad bytes. */
+    int reloc_fail = 0;
+    for (uint16_t ri = 0; ri < reloc_count; ri++) {
+      const uint8_t *r = reloc_src + ri * 8;
+      uint32_t off = (uint32_t)r[0]
+                   | ((uint32_t)r[1] << 8)
+                   | ((uint32_t)r[2] << 16)
+                   | ((uint32_t)r[3] << 24);
+      uint8_t hid = r[4];
+      if (off + 8 > code_size) {
+        fprintf(stderr, "ia64-install: reloc offset %u out of range "
+                "(code_size=%u) in fn[%u] of %s\n",
+                off, code_size, fi, sbc->filename);
+        reloc_fail = 1; break;
+      }
+      void *target = jit_helper_pointer((int)hid);
+      if (!target) {
+        fprintf(stderr, "ia64-install: unknown helper_id %u in fn[%u] "
+                "of %s\n", hid, fi, sbc->filename);
+        reloc_fail = 1; break;
+      }
+      uint64_t v = (uint64_t)(uintptr_t)target;
+      uint8_t *dst = jb->code + off;
+      for (int k = 0; k < 8; k++) dst[k] = (uint8_t)(v >> (k * 8));
+    }
+    if (reloc_fail) { jit_buf_free(jb); continue; }
+
+    /* Register SEH unwind BEFORE finalize -- the unwind blob is
+     * written into the same mapping (right after the code), and
+     * POSIX finalize drops write permission on the page. */
+    void *jit_code = jit_buf_finalize(jb);
+    jit_register_unwind_2arg(jit_code, jb->len);
+
+    jit_adapter_payload_t *payload =
+      (jit_adapter_payload_t*)malloc(sizeof(*payload));
+    if (!payload) continue;
+    payload->jit_body = jit_code;
+    payload->sbc      = sbc;
+    payload->nvars    = (int)nvars;
+
+    /* Overwrite the hook entry so dispatch lands on native code. */
+    uint32_t hook_idx = (uint32_t)sbc->hooks[fi];
+    hooks_heap[hook_idx].handler = (psf_t)&jit_adapter;
+    hooks_heap[hook_idx].payload = (uint8_t*)payload;
+    installed++;
+  }
+
+  if (getenv("SYMTA_AOT_VERBOSE")) {
+    fprintf(stderr, "ia64-install: %d/%u functions installed for %s\n",
+            installed, sec_nfns, sbc->filename);
+  }
+  return installed;
+}
+
 /* Rewrites hook entries for JIT'd functions so CALL/MCALL
  * dispatches through jit_adapter -> JIT'd body instead of
  * through sbc_exec_fn -> interpreter.
