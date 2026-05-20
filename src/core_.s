@@ -1374,16 +1374,16 @@ resolve_src_path Name Folders =
   No
 
 lexical_macro_expand SrcFile Text LexP =
-| [Name Paths] LexP
-| [Uses Exps HSz Row] parse_module_hdr_ Text
-| Hdr Text.take(HSz)
-| Body Text.drop(HSz)
-| SrcFolder normalize_folder SrcFile.url.0
-| Incs:
-| NameFolder Name.url.0
-| SrcFolder SrcFile.url.0
-| if SrcFolder.url.0.split^'/'(:@_ ui ''): Uses =: @Uses cls uim 
-| for U Uses:
+  [Name Paths] LexP
+  [Uses Exps HSz Row] parse_module_hdr_ Text
+  Hdr Text.take(HSz)
+  Body Text.drop(HSz)
+  SrcFolder normalize_folder SrcFile.url.0
+  Incs:
+  NameFolder Name.url.0
+  SrcFolder SrcFile.url.0
+  if SrcFolder.url.0.split^'/'(:@_ ui ''): Uses =: @Uses cls uim
+  for U Uses:
   | D U
   | when NameFolder<>'' and "[SrcFolder][D].s".exists: D = "[NameFolder][D]"
   | SrcPath resolve_src_path D Paths
@@ -1392,20 +1392,20 @@ lexical_macro_expand SrcFile Text LexP =
   | HF "[P][F].h"
   | less HF.exists: pass
   | Incs =: @Incs U
-| Incs = Incs{Inc => "#:[Inc]\n"}
-| Text [@Hdr @Incs "#line [Row+1] \"[SrcFile]\"\n" @Body].text
-| ncm_process_ SrcFile Text Paths.l
+  Incs = Incs{Inc => "#:[Inc]\n"}
+  Text [@Hdr @Incs "#line [Row+1] \"[SrcFile]\"\n" @Body].text
+  ncm_process_ SrcFile Text Paths.l
 
 //lexP provides paths for the lexical macro-processor
 //if macroexpansion without the paths is needed, just pass []
 text.parse Src!'<none>' LexP!No =
-| @"Parse text as Symta source code, returning the AST as nested lists.
+  @"Parse text as Symta source code, returning the AST as nested lists.
 Useful for DSL parsers and the JSON/XML examples that rewrite their syntax
 into Symta source and let the reader do the heavy lifting."
-| Text Me
-| when got LexP: Text = lexical_macro_expand Src Text LexP
-| R parse_strip_c_: parse_tokens_c_: add_bars_c_: Text.tokenize(Src)
-| if R.end then [[]] else R.0.tail
+  Text Me
+  when got LexP: Text = lexical_macro_expand Src Text LexP
+  R parse_strip_c_: parse_tokens_c_: add_bars_c_: Text.tokenize(Src)
+  if R.end then [[]] else R.0.tail
 
 // `text.sexp`: a simpler entry point than `text.parse` that
 // skips the `add_bars_c_` toplevel-wrapping pass.  Used by
@@ -1415,9 +1415,9 @@ into Symta source and let the reader do the heavy lifting."
 // first expression by default; pass `list!1` to get the full
 // list of parsed expressions.
 text.sexp Src!'<none>' LexP!No List!0 =
-| Text Me
-| when got LexP: Text = lexical_macro_expand Src Text LexP
-| R parse_strip_c_: parse_tokens_c_: Text.tokenize(Src)
-| if List: ret R
-| if R.end: No else R.0
+  Text Me
+  when got LexP: Text = lexical_macro_expand Src Text LexP
+  R parse_strip_c_: parse_tokens_c_: Text.tokenize(Src)
+  if List: ret R
+  if R.end: No else R.0
 
