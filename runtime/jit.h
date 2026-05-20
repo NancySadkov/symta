@@ -263,6 +263,14 @@ extern void (*jit_rt_calltir_helper)(int64_t *L, int fn,  int u1, int u2);
 extern void (*jit_rt_mcall_helper)  (int64_t *L, struct sbc_t *sbc, uint64_t packed);
 extern void (*jit_rt_mcallir_helper)(int64_t *L, struct sbc_t *sbc, uint64_t packed);
 
+/* ARGLIST4/5: pack the 4 or 5 u8 slot indices into one int32. */
+extern void (*jit_rt_arglist4_helper)(int64_t *L, int packed, int u1, int u2);
+extern void (*jit_rt_arglist5_helper)(int64_t *L, int packed, int u1, int u2);
+
+/* SBC_MOVETX / MOVETX8: L[dst] = sbc->tx[src] (text constant
+ * table lookup).  Needs sbc context. */
+extern void (*jit_rt_movetx_helper) (int64_t *L, struct sbc_t *sbc, uint64_t packed);
+
 /* SBC_CLOSURE.  Builds a closure object via the CLOSURE
  * allocator macro.  The third arg packs (dst<<32|idx<<16|size)
  * so the call fits in three integer-arg registers; the helper

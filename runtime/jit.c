@@ -379,6 +379,16 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_MCALL    0x0D  /* opcode + dst(u16) + obj(u16) + met(u16) + mcache_idx(u16) */
 #define BC_MCALLIR  0x0E  /* opcode + obj(u16) + met(u16) + mcache_idx(u16) */
 #define BC_MCALL8   0x0F  /* opcode + dst(u8) + obj(u8) + met(u8) + mcache_idx(u16) */
+#define BC_IFFXN    0x13  /* opcode + cnd(u8) + diff(int16); branch if O_TAG(L[cnd])==0 */
+#define BC_MOVETX   0x1D  /* opcode + dst(u16) + src(u24); L[dst] = sbc->tx[src] */
+#define BC_MOVETX8  0x1E  /* opcode + dst(u8)  + src(u8);  L[dst] = sbc->tx[src] */
+#define BC_FXT8     0x90  /* opcode + dst(u8) + imm(u8);  L[dst] = FIXTEXT(imm) */
+#define BC_FXT16    0x91  /* opcode + dst(u8) + imm(u16) */
+#define BC_FXT24    0x92  /* opcode + dst(u8) + imm(u24) */
+#define BC_FXT32    0x93  /* opcode + dst(u8) + imm(u32) */
+#define BC_FXT40    0x94  /* opcode + dst(u8) + imm(u40) */
+#define BC_ARGLIST4 0x8E  /* opcode + a..d (u8 each) */
+#define BC_ARGLIST5 0x8F  /* opcode + a..e (u8 each) */
 #define BC_JMP    0x04
 #define BC_JMP16  0x05    /* opcode + int16 PC-relative diff */
 #define BC_B      0x06
@@ -520,6 +530,9 @@ void (*jit_rt_callt_helper)  (int64_t *L, int dst, int fn, int u) = NULL;
 void (*jit_rt_calltir_helper)(int64_t *L, int fn,  int u1, int u2) = NULL;
 void (*jit_rt_mcall_helper)  (int64_t *L, struct sbc_t *sbc, uint64_t packed) = NULL;
 void (*jit_rt_mcallir_helper)(int64_t *L, struct sbc_t *sbc, uint64_t packed) = NULL;
+void (*jit_rt_arglist4_helper)(int64_t *L, int packed, int u1, int u2) = NULL;
+void (*jit_rt_arglist5_helper)(int64_t *L, int packed, int u1, int u2) = NULL;
+void (*jit_rt_movetx_helper) (int64_t *L, struct sbc_t *sbc, uint64_t packed) = NULL;
 void (*jit_rt_closure_helper)(int64_t *L, struct sbc_t *sbc,
                               uint64_t packed) = NULL;
 
@@ -750,6 +763,41 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       i += 4;
       break;
     }
+    case BC_ARGLIST4: {
+      /* opcode + 4 u8 slot indices (5 bytes total).  Pack the
+       * four 8-bit indices into one 32-bit immediate. */
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_arglist4_helper) { jit_last_fail_opcode = op;
+                                     jit_last_fail_offset = i;
+                                     fail = 1; goto done; }
+      uint32_t packed = (uint32_t)bc[i + 1]
+                      | ((uint32_t)bc[i + 2] << 8)
+                      | ((uint32_t)bc[i + 3] << 16)
+                      | ((uint32_t)bc[i + 4] << 24);
+      jit_emit_call_helper3(b, (void*)jit_rt_arglist4_helper, packed, 0, 0);
+      i += 5;
+      break;
+    }
+    case BC_ARGLIST5: {
+      /* opcode + 5 u8 slot indices (6 bytes).  Pack 4 into one
+       * int, the 5th into the second helper3 arg. */
+      if (i + 6 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_arglist5_helper) { jit_last_fail_opcode = op;
+                                     jit_last_fail_offset = i;
+                                     fail = 1; goto done; }
+      uint32_t packed4 = (uint32_t)bc[i + 1]
+                       | ((uint32_t)bc[i + 2] << 8)
+                       | ((uint32_t)bc[i + 3] << 16)
+                       | ((uint32_t)bc[i + 4] << 24);
+      uint32_t a4 = bc[i + 5];
+      jit_emit_call_helper3(b, (void*)jit_rt_arglist5_helper, packed4, a4, 0);
+      i += 6;
+      break;
+    }
     case BC_CALL: {
       /* SBC_CALL: opcode + dst(u16) + fn(u16).  The interpreter
        * also writes `api.frame->pin = pin` for stack traces --
@@ -952,6 +1000,71 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       break;
     }
 
+    case BC_MOVETX: {
+      /* SBC_MOVETX: opcode + dst(u16) + src(u24); 6 bytes.
+       * L[dst] = sbc->tx[src] -- text-constant table lookup.
+       * Pack dst (16) + src (24) into one 40-bit imm. */
+      if (i + 6 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_movetx_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t dst = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t src = (uint64_t)bc_rd24(bc + i + 3);
+      uint64_t packed = (dst << 32) | src;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_movetx_helper, packed);
+      i += 6;
+      break;
+    }
+    case BC_MOVETX8: {
+      /* opcode + dst(u8) + src(u8) = 3 bytes. */
+      if (i + 3 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_movetx_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t dst = bc[i + 1];
+      uint64_t src = bc[i + 2];
+      uint64_t packed = (dst << 32) | src;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_movetx_helper, packed);
+      i += 3;
+      break;
+    }
+
+    case BC_FXT8: case BC_FXT16: case BC_FXT24:
+    case BC_FXT32: case BC_FXT40: {
+      /* SBC_FXT*: load FIXTEXT-tagged immediate into L[dst].
+       *   FIXTEXT(x) = MKIMM(T_FIXTEXT=2, x) = (x << 16) | (2 << 1)
+       *              = (x << 16) | 4
+       * Inline as 10-byte mov rax, imm64 + slot store. */
+      int width;  /* immediate width in bytes */
+      switch (op) {
+        case BC_FXT8:  width = 1; break;
+        case BC_FXT16: width = 2; break;
+        case BC_FXT24: width = 3; break;
+        case BC_FXT32: width = 4; break;
+        default:       width = 5; break;  /* FXT40 */
+      }
+      if (i + 2 + width > n) { jit_last_fail_opcode = op;
+                               jit_last_fail_offset = i;
+                               fail = 1; goto done; }
+      int dst = bc[i + 1];
+      uint64_t imm = 0;
+      for (int k = 0; k < width; k++)
+        imm |= (uint64_t)bc[i + 2 + k] << (k * 8);
+      uint64_t tagged = (imm << 16) | 4;
+      emit_mov_rax_imm64(b, tagged);
+      emit_mov_slot_from_rax(b, dst);
+      i += 2 + width;
+      break;
+    }
+
     case BC_IADD: case BC_ISUB: case BC_IMUL: case BC_IDIV:
     case BC_IREM: case BC_ILT:  case BC_IGT:  case BC_ILTE: case BC_IGTE: {
       if (i + 7 > n) { fail = 1; goto done; }
@@ -1053,6 +1166,49 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       if (target < 0 || (uint64_t)target > n) { fail = 1; goto done; }
       size_t patch_off = jit_emit_jnz_slot(b, cnd);
       if (patches_n >= JIT_MAX_PATCHES) { fail = 1; goto done; }
+      patches[patches_n].jit_off = patch_off;
+      patches[patches_n].bc_target = (size_t)target;
+      patches_n++;
+      i += 4;
+      break;
+    }
+
+    case BC_IFFXN: {
+      /* SBC_IFFXN: opcode + cnd(u8) + diff(int16) = 4 bytes.
+       * Branches when O_TAG(L[cnd]) == 0 -- i.e. the value is
+       * an int (T_INT=0).  Test by ANDing the low 16 bits with
+       * TAG_MASK (0xFFFE) and checking ZF.
+       *
+       * x86:  mov rax, [rbx + cnd*8]      ; load value
+       *       test eax, 0xfffe            ; check tag bits
+       *       jz <target>                 ; branch if int */
+      if (i + 4 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      int cnd = bc[i + 1];
+      int16_t diff = (int16_t)(uint16_t)bc_rd16(bc + i + 2);
+      int64_t target = (int64_t)i + 4 + diff;
+      if (target < 0 || (uint64_t)target > n) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      emit_mov_rax_from_slot(b, cnd);
+      /* test eax, 0xfffe : a9 fe ff 00 00  (5 bytes; tests low 16
+       * bits while leaving the upper 48 untouched -- they don't
+       * affect the AND result). */
+      jit_emit_u8(b, 0xa9);
+      jit_emit_u32(b, 0x0000FFFE);
+      /* jz rel32 : 0f 84 disp32, 6 bytes total. */
+      jit_emit_u8(b, 0x0f);
+      jit_emit_u8(b, 0x84);
+      size_t patch_off = b->len;
+      jit_emit_u32(b, 0);
+      if (patches_n >= JIT_MAX_PATCHES) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
       patches[patches_n].jit_off = patch_off;
       patches[patches_n].bc_target = (size_t)target;
       patches_n++;

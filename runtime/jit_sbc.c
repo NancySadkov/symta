@@ -68,6 +68,39 @@ static void jit_rt_arglist3_impl(int64_t *L, int a, int b, int c) {
   STARG(1, ((dyn*)L)[b]);
   STARG(2, ((dyn*)L)[c]);
 }
+static void jit_rt_arglist4_impl(int64_t *L, int packed, int u1, int u2) {
+  (void)u1; (void)u2;
+  int a0 = (uint32_t)packed         & 0xFF;
+  int a1 = ((uint32_t)packed >> 8)  & 0xFF;
+  int a2 = ((uint32_t)packed >> 16) & 0xFF;
+  int a3 = ((uint32_t)packed >> 24) & 0xFF;
+  ARGLIST(4);
+  STARG(0, ((dyn*)L)[a0]);
+  STARG(1, ((dyn*)L)[a1]);
+  STARG(2, ((dyn*)L)[a2]);
+  STARG(3, ((dyn*)L)[a3]);
+}
+static void jit_rt_arglist5_impl(int64_t *L, int packed, int a4, int u2) {
+  (void)u2;
+  int a0 = (uint32_t)packed         & 0xFF;
+  int a1 = ((uint32_t)packed >> 8)  & 0xFF;
+  int a2 = ((uint32_t)packed >> 16) & 0xFF;
+  int a3 = ((uint32_t)packed >> 24) & 0xFF;
+  ARGLIST(5);
+  STARG(0, ((dyn*)L)[a0]);
+  STARG(1, ((dyn*)L)[a1]);
+  STARG(2, ((dyn*)L)[a2]);
+  STARG(3, ((dyn*)L)[a3]);
+  STARG(4, ((dyn*)L)[a4]);
+}
+
+/* SBC_MOVETX / MOVETX8: L[dst] = sbc->tx[src] (text constant
+ * table lookup).  Packed arg: dst in upper 32, src in lower 32. */
+static void jit_rt_movetx_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t dst = (uint32_t)(packed >> 32);
+  uint32_t src = (uint32_t)(packed & 0xFFFFFFFF);
+  ((dyn*)L)[dst] = sbc->tx[src];
+}
 static void jit_rt_call_impl(int64_t *L, int dst, int fn, int unused) {
   (void)unused;
   CALL(((dyn*)L)[dst], ((dyn*)L)[fn]);
@@ -203,6 +236,9 @@ static void jit_install_helpers_once(void) {
   jit_rt_calltir_helper  = jit_rt_calltir_impl;
   jit_rt_mcall_helper    = jit_rt_mcall_impl;
   jit_rt_mcallir_helper  = jit_rt_mcallir_impl;
+  jit_rt_arglist4_helper = jit_rt_arglist4_impl;
+  jit_rt_arglist5_helper = jit_rt_arglist5_impl;
+  jit_rt_movetx_helper   = jit_rt_movetx_impl;
 }
 
 /* Read a 24-bit little-endian unsigned int.  Mirrors the
