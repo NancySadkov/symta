@@ -366,6 +366,9 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_MOVENO  0x1C    /* dst=u16; L[dst]=No (a fixed immediate) */
 #define BC_FATAL   0x5C    /* msg=u16; longjmp via fatal((char*)L[msg]) */
 #define BC_FXNLGET 0x34    /* dst=u16 src=u16 index=u16 mcache=u16 */
+#define BC_MOVEIM  0x21    /* dst=u16 src=u24; L[dst]=sbc->im[src] */
+#define BC_INC     0x9E    /* dst=u16 a=u16; INC(L[dst], L[a]) */
+#define BC_DEC     0x9F    /* dst=u16 a=u16; DEC(L[dst], L[a]) */
 #define BC_LOAD   0x24    /* dst=u16 src=u16 index=u16; L[dst]=O_PTR(L[src])[index] */
 #define BC_LOAD8  0x25    /* dst=u8 src=u8 index=u8; same body */
 #define BC_MOVE4  0x97    /* opr=u8; dst=opr&0xF src=opr>>4; L[dst]=L[src] */
@@ -568,6 +571,10 @@ void (*jit_rt_fxntag_helper)(int64_t *L, int dst, int src, int u) = NULL;
 void (*jit_rt_not_helper)  (int64_t *L, int dst, int src, int u) = NULL;
 void (*jit_rt_got_helper)  (int64_t *L, int dst, int src, int u) = NULL;
 void (*jit_rt_no_helper)   (int64_t *L, int dst, int src, int u) = NULL;
+void (*jit_rt_moveim_helper)(int64_t *L, struct sbc_t *sbc,
+                             uint64_t packed) = NULL;
+void (*jit_rt_inc_helper)(int64_t *L, int dst, int a, int u) = NULL;
+void (*jit_rt_dec_helper)(int64_t *L, int dst, int a, int u) = NULL;
 
 /* Step 8: platform-aware default for the AOT pipeline.  Windows
  * has SEH unwind registered (step 5n) so longjmp through native
@@ -1260,6 +1267,27 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       break;
     }
 
+    case BC_MOVEIM: {
+      /* SBC_MOVEIM: opcode + dst(u16) + src(u24) = 6 bytes.
+       * L[dst] = sbc->im[src] -- per-SBC imported-symbol lookup.
+       * Pack dst (16) + src (24). */
+      if (i + 6 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_moveim_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t dst = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t src = (uint64_t)bc_rd24(bc + i + 3);
+      uint64_t packed = (src << 16) | dst;
+      b->pending_helper_id = JIT_HELPER_MOVEIM;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_moveim_helper, packed);
+      i += 6;
+      break;
+    }
+
     case BC_FXT8: case BC_FXT16: case BC_FXT24:
     case BC_FXT32: case BC_FXT40: case BC_FXT48: case BC_FXT56: {
       /* SBC_FXT*: load FIXTEXT-tagged immediate into L[dst].
@@ -1352,10 +1380,11 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       break;
     }
 
-    case BC_FXNTAG: case BC_NOT: case BC_GOT: case BC_NO: {
-      /* All 4 share: opcode + dst(u16) + src(u16) = 5 bytes.
-       * FXNTAG returns FXN(O_TAG(src)); NOT/GOT/NO return
-       * FXN(0) or FXN(1) based on truthy / No comparison. */
+    case BC_FXNTAG: case BC_NOT: case BC_GOT: case BC_NO:
+    case BC_INC: case BC_DEC: {
+      /* All 6 share: opcode + dst(u16) + src/a(u16) = 5 bytes.
+       * FXNTAG returns FXN(O_TAG(src)); NOT/GOT/NO return FXN(0)
+       * or FXN(1); INC/DEC are typed +/-1 with MCALL fallback. */
       if (i + 5 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
@@ -1367,6 +1396,8 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
         case BC_NOT:    helper = (void*)jit_rt_not_helper;    hid = JIT_HELPER_NOT;    break;
         case BC_GOT:    helper = (void*)jit_rt_got_helper;    hid = JIT_HELPER_GOT;    break;
         case BC_NO:     helper = (void*)jit_rt_no_helper;     hid = JIT_HELPER_NO;     break;
+        case BC_INC:    helper = (void*)jit_rt_inc_helper;    hid = JIT_HELPER_INC;    break;
+        case BC_DEC:    helper = (void*)jit_rt_dec_helper;    hid = JIT_HELPER_DEC;    break;
         default: helper = NULL; hid = JIT_HELPER_NONE;
       }
       if (!helper) { jit_last_fail_opcode = op;

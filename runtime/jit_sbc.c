@@ -446,6 +446,37 @@ static void jit_rt_fxntag_impl(int64_t *L, int dst, int src, int u) {
   ((dyn*)L)[dst] = (dyn)(int64_t)FXN(O_TAG(((dyn*)L)[src]));
 }
 
+/* SBC_MOVEIM: L[dst] = sbc->im[src].  Per-SBC imported-symbol
+ * lookup.  Packed: [15:0]=dst (u16), [39:16]=src (u24). */
+static void jit_rt_moveim_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t dst = (uint32_t)(packed & 0xFFFF);
+  uint32_t src = (uint32_t)((packed >> 16) & 0xFFFFFF);
+  ((dyn*)L)[dst] = sbc->im[src];
+}
+
+/* SBC_INC / SBC_DEC: T_INT fast path = FXNADD/SUB(_, _, FXN(1)),
+ * else MCALL m_inc / m_dec.  Helper3 sig: (L, dst, a, _). */
+static void jit_rt_inc_impl(int64_t *L, int dst, int a, int u) {
+  (void)u;
+  dyn aa = ((dyn*)L)[a];
+  if (TAGIS(T_INT, aa)) {
+    FXNADD(((dyn*)L)[dst], aa, FXN(1));
+  } else {
+    ARGLIST1(((dyn*)L)[a]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_inc);
+  }
+}
+static void jit_rt_dec_impl(int64_t *L, int dst, int a, int u) {
+  (void)u;
+  dyn aa = ((dyn*)L)[a];
+  if (TAGIS(T_INT, aa)) {
+    FXNSUB(((dyn*)L)[dst], aa, FXN(1));
+  } else {
+    ARGLIST1(((dyn*)L)[a]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_dec);
+  }
+}
+
 /* SBC_NOT / SBC_GOT / SBC_NO: truthy/No comparisons.  Matches
  * the interpreter bodies exactly. */
 static void jit_rt_not_impl(int64_t *L, int dst, int src, int u) {
@@ -583,6 +614,9 @@ static void jit_install_helpers_once(void) {
   jit_rt_not_helper      = jit_rt_not_impl;
   jit_rt_got_helper      = jit_rt_got_impl;
   jit_rt_no_helper       = jit_rt_no_impl;
+  jit_rt_moveim_helper   = jit_rt_moveim_impl;
+  jit_rt_inc_helper      = jit_rt_inc_impl;
+  jit_rt_dec_helper      = jit_rt_dec_impl;
 }
 
 void jit_install_helpers_public(void) {
@@ -634,6 +668,9 @@ void *jit_helper_pointer(int helper_id) {
     case JIT_HELPER_NOT:      return (void*)jit_rt_not_helper;
     case JIT_HELPER_GOT:      return (void*)jit_rt_got_helper;
     case JIT_HELPER_NO:       return (void*)jit_rt_no_helper;
+    case JIT_HELPER_MOVEIM:   return (void*)jit_rt_moveim_helper;
+    case JIT_HELPER_INC:      return (void*)jit_rt_inc_helper;
+    case JIT_HELPER_DEC:      return (void*)jit_rt_dec_helper;
     default:                  return NULL;
   }
 }

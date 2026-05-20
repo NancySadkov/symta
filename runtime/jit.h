@@ -89,6 +89,9 @@ typedef enum {
   JIT_HELPER_NOT      = 35,
   JIT_HELPER_GOT      = 36,
   JIT_HELPER_NO       = 37,
+  JIT_HELPER_MOVEIM   = 38,
+  JIT_HELPER_INC      = 39,
+  JIT_HELPER_DEC      = 40,
   JIT_HELPER_MAX
 } jit_helper_id_t;
 
@@ -459,6 +462,17 @@ extern void (*jit_rt_fxntag_helper)(int64_t *L, int dst, int src, int u);
 extern void (*jit_rt_not_helper) (int64_t *L, int dst, int src, int u);
 extern void (*jit_rt_got_helper) (int64_t *L, int dst, int src, int u);
 extern void (*jit_rt_no_helper)  (int64_t *L, int dst, int src, int u);
+
+/* SBC_MOVEIM: L[dst] = sbc->im[src].  Needs the sbc pointer so
+ * goes via the call_with_sbc trampoline.  Packed: [15:0]=dst,
+ * [39:16]=src (24-bit). */
+extern void (*jit_rt_moveim_helper)(int64_t *L, struct sbc_t *sbc,
+                                    uint64_t packed);
+
+/* SBC_INC / SBC_DEC: T_INT fast path = FXNADD/SUB(_,_,FXN(1));
+ * else MCALL m_inc / m_dec.  Helper3 sig: (L, dst, a, _). */
+extern void (*jit_rt_inc_helper)(int64_t *L, int dst, int a, int u);
+extern void (*jit_rt_dec_helper)(int64_t *L, int dst, int a, int u);
 
 /* SBC_CLOSURE.  Builds a closure object via the CLOSURE
  * allocator macro.  The third arg packs (dst<<32|idx<<16|size)
