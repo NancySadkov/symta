@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <float.h>
 
 /* Full FXN* helpers.  Each mirrors the corresponding interpreter
@@ -427,6 +428,26 @@ static dyn jit_adapter(uint8_t *payload_ptr) {
 int sbc_jit_install(struct sbc_t *sbc) {
   if (!sbc || !sbc->fntbl || sbc->fntbl_sz < 3) return 0;
   jit_install_helpers_once();
+
+  /* Bisection helper: SYMTA_JIT_FILTER limits JIT install to
+   * SBCs whose filename contains the given substring.  Useful
+   * for narrowing down which SBC's JIT'd code is causing a
+   * runtime crash.  Examples:
+   *   SYMTA_JIT_FILTER=core_     -- only core_.sbc gets JIT
+   *   SYMTA_JIT_FILTER=compiler  -- only compiler.sbc
+   *   (unset)                    -- all SBCs (default) */
+  {
+    const char *filter = getenv("SYMTA_JIT_FILTER");
+    if (filter && filter[0] && sbc->filename) {
+      if (!strstr(sbc->filename, filter)) {
+        if (getenv("SYMTA_JIT_VERBOSE")) {
+          fprintf(stderr, "jit-install: SKIP %s (filter=%s)\n",
+                  sbc->filename, filter);
+        }
+        return 0;
+      }
+    }
+  }
 
   int nfns = (int)(sbc->fntbl_sz / 3);
   if (nfns <= 0) return 0;
