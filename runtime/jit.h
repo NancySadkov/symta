@@ -244,6 +244,25 @@ extern void (*jit_rt_arglist3_helper)(int64_t *L, int a, int b, int c);
 extern void (*jit_rt_call_helper)   (int64_t *L, int dst, int fn, int unused);
 extern void (*jit_rt_callir_helper) (int64_t *L, int fn,  int u1, int u2);
 
+/* CALL_TAGGED variants: SBC_CALLT (with dst) / SBC_CALLTIR
+ * (ignore result).  These dispatch via the value's tag --
+ * used when the callee might not be a closure (e.g. calling
+ * a text or a list).  Same operand layout as CALL/CALLIR. */
+extern void (*jit_rt_callt_helper)  (int64_t *L, int dst, int fn, int unused);
+extern void (*jit_rt_calltir_helper)(int64_t *L, int fn,  int u1, int u2);
+
+/* MCALL family: method dispatch through the per-callsite mcache.
+ * Each SBC_MCALL instruction carries (dst, obj, met) operands
+ * AND an mcache slot index that the MCACHE_CALL macro reads
+ * after the operands.  The helper takes a single 64-bit packed
+ * arg so the call fits the existing call_with_sbc layout:
+ *   [63:48] = mcache_idx
+ *   [47:32] = met         (method-table index)
+ *   [31:16] = obj         (slot)
+ *   [15: 0] = dst         (slot; ignored for MCALLIR) */
+extern void (*jit_rt_mcall_helper)  (int64_t *L, struct sbc_t *sbc, uint64_t packed);
+extern void (*jit_rt_mcallir_helper)(int64_t *L, struct sbc_t *sbc, uint64_t packed);
+
 /* SBC_CLOSURE.  Builds a closure object via the CLOSURE
  * allocator macro.  The third arg packs (dst<<32|idx<<16|size)
  * so the call fits in three integer-arg registers; the helper

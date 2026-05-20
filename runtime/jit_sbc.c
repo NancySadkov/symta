@@ -77,6 +77,63 @@ static void jit_rt_callir_impl(int64_t *L, int fn, int u1, int u2) {
   dyn dummy;
   CALL(dummy, ((dyn*)L)[fn]);
 }
+static void jit_rt_callt_impl(int64_t *L, int dst, int fn, int unused) {
+  (void)unused;
+  CALL_TAGGED(((dyn*)L)[dst], ((dyn*)L)[fn]);
+}
+static void jit_rt_calltir_impl(int64_t *L, int fn, int u1, int u2) {
+  (void)u1; (void)u2;
+  dyn dummy;
+  CALL_TAGGED(dummy, ((dyn*)L)[fn]);
+}
+
+/* MCALL dispatcher.  Mirrors the MCACHE_CALL macro in sbc.c
+ * but reads the mcache slot index from the packed arg instead
+ * of the bytecode stream's RD16.  Cache layout: see runtime/
+ * sif.h's mcache_t.  Hit fast path: one load of mce->fn.  Miss
+ * path: call get_method_for_tag and fill the triple. */
+static void jit_rt_mcall_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t mcache_idx = (uint32_t)((packed >> 48) & 0xFFFF);
+  int      met        = (int)((packed >> 32) & 0xFFFF);
+  uint32_t obj        = (uint32_t)((packed >> 16) & 0xFFFF);
+  uint32_t dst        = (uint32_t)(packed & 0xFFFF);
+  int m = sbc->mt[met];
+  api.method = m;
+  dyn oo = ((dyn*)L)[obj];
+  mcache_t *mce = &sbc->mcaches[mcache_idx];
+  uint32_t tid = O_TAG(oo);
+  dyn mfn;
+  if (mce->tid != tid || mce->mid != (uint32_t)m) {
+    mfn = get_method_for_tag(m, tid);
+    mce->tid = tid;
+    mce->mid = (uint32_t)m;
+    mce->fn  = mfn;
+  } else {
+    mfn = mce->fn;
+  }
+  CALL(((dyn*)L)[dst], mfn);
+}
+static void jit_rt_mcallir_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t mcache_idx = (uint32_t)((packed >> 48) & 0xFFFF);
+  int      met        = (int)((packed >> 32) & 0xFFFF);
+  uint32_t obj        = (uint32_t)((packed >> 16) & 0xFFFF);
+  int m = sbc->mt[met];
+  api.method = m;
+  dyn oo = ((dyn*)L)[obj];
+  mcache_t *mce = &sbc->mcaches[mcache_idx];
+  uint32_t tid = O_TAG(oo);
+  dyn mfn;
+  if (mce->tid != tid || mce->mid != (uint32_t)m) {
+    mfn = get_method_for_tag(m, tid);
+    mce->tid = tid;
+    mce->mid = (uint32_t)m;
+    mce->fn  = mfn;
+  } else {
+    mfn = mce->fn;
+  }
+  dyn dummy;
+  CALL(dummy, mfn);
+}
 
 /* Trampoline helper for SBC_COPY.  Mirrors sbc.c:1153:
  *   COPY(L[dst], dindex, L[src], sindex)
@@ -142,6 +199,10 @@ static void jit_install_helpers_once(void) {
   jit_rt_arglist3_helper = jit_rt_arglist3_impl;
   jit_rt_call_helper     = jit_rt_call_impl;
   jit_rt_callir_helper   = jit_rt_callir_impl;
+  jit_rt_callt_helper    = jit_rt_callt_impl;
+  jit_rt_calltir_helper  = jit_rt_calltir_impl;
+  jit_rt_mcall_helper    = jit_rt_mcall_impl;
+  jit_rt_mcallir_helper  = jit_rt_mcallir_impl;
 }
 
 /* Read a 24-bit little-endian unsigned int.  Mirrors the

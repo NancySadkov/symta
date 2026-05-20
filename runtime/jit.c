@@ -374,6 +374,11 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_ARGLIST3 0x8D  /* opcode + a + b + c (u8 each) */
 #define BC_CALL     0x09  /* opcode + dst(u16) + fn(u16) */
 #define BC_CALLIR   0x0A  /* opcode + fn(u16); ignore return value */
+#define BC_CALLT    0x0B  /* opcode + dst(u16) + fn(u16); CALL_TAGGED */
+#define BC_CALLTIR  0x0C  /* opcode + fn(u16); CALL_TAGGED ignore return */
+#define BC_MCALL    0x0D  /* opcode + dst(u16) + obj(u16) + met(u16) + mcache_idx(u16) */
+#define BC_MCALLIR  0x0E  /* opcode + obj(u16) + met(u16) + mcache_idx(u16) */
+#define BC_MCALL8   0x0F  /* opcode + dst(u8) + obj(u8) + met(u8) + mcache_idx(u16) */
 #define BC_JMP    0x04
 #define BC_JMP16  0x05    /* opcode + int16 PC-relative diff */
 #define BC_B      0x06
@@ -511,6 +516,10 @@ void (*jit_rt_arglist2_helper)(int64_t *L, int a, int b, int c) = NULL;
 void (*jit_rt_arglist3_helper)(int64_t *L, int a, int b, int c) = NULL;
 void (*jit_rt_call_helper)   (int64_t *L, int dst, int fn, int u) = NULL;
 void (*jit_rt_callir_helper) (int64_t *L, int fn,  int u1, int u2) = NULL;
+void (*jit_rt_callt_helper)  (int64_t *L, int dst, int fn, int u) = NULL;
+void (*jit_rt_calltir_helper)(int64_t *L, int fn,  int u1, int u2) = NULL;
+void (*jit_rt_mcall_helper)  (int64_t *L, struct sbc_t *sbc, uint64_t packed) = NULL;
+void (*jit_rt_mcallir_helper)(int64_t *L, struct sbc_t *sbc, uint64_t packed) = NULL;
 void (*jit_rt_closure_helper)(int64_t *L, struct sbc_t *sbc,
                               uint64_t packed) = NULL;
 
@@ -769,6 +778,92 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint32_t fn  = (uint32_t)bc_rd16(bc + i + 1);
       jit_emit_call_helper3(b, (void*)jit_rt_callir_helper, fn, 0, 0);
       i += 3;
+      break;
+    }
+
+    case BC_CALLT: {
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_callt_helper) { jit_last_fail_opcode = op;
+                                  jit_last_fail_offset = i;
+                                  fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t fn  = (uint32_t)bc_rd16(bc + i + 3);
+      jit_emit_call_helper3(b, (void*)jit_rt_callt_helper, dst, fn, 0);
+      i += 5;
+      break;
+    }
+    case BC_CALLTIR: {
+      if (i + 3 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_calltir_helper) { jit_last_fail_opcode = op;
+                                    jit_last_fail_offset = i;
+                                    fail = 1; goto done; }
+      uint32_t fn  = (uint32_t)bc_rd16(bc + i + 1);
+      jit_emit_call_helper3(b, (void*)jit_rt_calltir_helper, fn, 0, 0);
+      i += 3;
+      break;
+    }
+
+    case BC_MCALL: {
+      /* SBC_MCALL: opcode + dst(u16) + obj(u16) + met(u16) +
+       * mcache_idx(u16, read inside MCACHE_CALL).
+       * Total: 9 bytes.  Needs the sbc pointer (mt[met], mcaches[idx]). */
+      if (i + 9 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_mcall_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t dst    = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t obj    = (uint64_t)bc_rd16(bc + i + 3);
+      uint64_t met    = (uint64_t)bc_rd16(bc + i + 5);
+      uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 7);
+      uint64_t packed = (mcidx << 48) | (met << 32) | (obj << 16) | dst;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_mcall_helper, packed);
+      i += 9;
+      break;
+    }
+    case BC_MCALLIR: {
+      /* opcode + obj(u16) + met(u16) + mcache_idx(u16) = 7 bytes */
+      if (i + 7 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_mcallir_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t obj    = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t met    = (uint64_t)bc_rd16(bc + i + 3);
+      uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 5);
+      uint64_t packed = (mcidx << 48) | (met << 32) | (obj << 16) | 0;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_mcallir_helper, packed);
+      i += 7;
+      break;
+    }
+    case BC_MCALL8: {
+      /* opcode + dst(u8) + obj(u8) + met(u8) + mcache_idx(u16) = 6 bytes
+       * (note: mcache_idx stays u16 even though the others are u8). */
+      if (i + 6 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_mcall_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t dst    = (uint64_t)bc[i + 1];
+      uint64_t obj    = (uint64_t)bc[i + 2];
+      uint64_t met    = (uint64_t)bc[i + 3];
+      uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 4);
+      uint64_t packed = (mcidx << 48) | (met << 32) | (obj << 16) | dst;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_mcall_helper, packed);
+      i += 6;
       break;
     }
 
