@@ -384,6 +384,54 @@ static void jit_rt_fxnsize_impl(int64_t *L, int dst, int src, int unused) {
   ((dyn*)L)[dst] = (dyn)(int64_t)FXN(LIST_SIZE(((dyn*)L)[src]));
 }
 
+/* SBC_MOVEEMT: L[dst] = Empty.  Simple deref of the global
+ * api.empty_ field; called once per emission site. */
+static void jit_rt_moveemt_impl(int64_t *L, int dst, int u1, int u2) {
+  (void)u1; (void)u2;
+  ((dyn*)L)[dst] = Empty;
+}
+
+/* SBC_FATAL: longjmps via fatal((char*)L[msg]).  Matches the
+ * interpreter's `FATAL(L[msg])` exactly; the cast to char* is
+ * the same trick the interpreter uses (a Symta text dyn's
+ * heap layout starts with the c-string). */
+static void jit_rt_fatal_impl(int64_t *L, int msg, int u1, int u2) {
+  (void)u1; (void)u2;
+  FATAL((char*)(((dyn*)L)[msg]));
+}
+
+/* SBC_FXNLGET: list-element-get with mcache fallback.  Mirrors
+ * sbc.c:SBC_FXNLGET exactly -- T_LIST + T_INT + in-bounds fast
+ * path; otherwise MCACHE_CALL(m_get).  Packed: [63:48]=mcache_idx
+ * [47:32]=index_slot [31:16]=src_slot [15:0]=dst_slot. */
+static void jit_rt_fxnlget_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t mcache_idx = (uint32_t)((packed >> 48) & 0xFFFF);
+  uint32_t index_slot = (uint32_t)((packed >> 32) & 0xFFFF);
+  uint32_t src        = (uint32_t)((packed >> 16) & 0xFFFF);
+  uint32_t dst        = (uint32_t)(packed & 0xFFFF);
+  dyn ss = ((dyn*)L)[src];
+  dyn ii = ((dyn*)L)[index_slot];
+  if (TAGIS(T_LIST, ss) && TAGIS(T_INT, ii)
+      && (uint64_t)ii < (uint64_t)FXN(LIST_SIZE(ss))) {
+    FXNLGET(((dyn*)L)[dst], ss, ii);
+  } else {
+    ARGLIST2(((dyn*)L)[src], ((dyn*)L)[index_slot]);
+    api.method = m_get;
+    mcache_t *mce = &sbc->mcaches[mcache_idx];
+    uint32_t tid = O_TAG(((dyn*)L)[src]);
+    dyn mfn;
+    if (mce->tid != tid || mce->mid != (uint32_t)m_get) {
+      mfn = get_method_for_tag(m_get, tid);
+      mce->tid = tid;
+      mce->mid = (uint32_t)m_get;
+      mce->fn  = mfn;
+    } else {
+      mfn = mce->fn;
+    }
+    CALL(((dyn*)L)[dst], mfn);
+  }
+}
+
 /* Trampoline helper for SBC_ST4_0..SBC_ST4_F.  Mirrors the
  * interpreter body in sbc.c:1089:
  *   STOR(L[dst], index, L[src])  (== LSET / lsetm)
@@ -463,6 +511,9 @@ static void jit_install_helpers_once(void) {
   jit_rt_list1_helper    = jit_rt_list1_impl;
   jit_rt_list2_helper    = jit_rt_list2_impl;
   jit_rt_fxnsize_helper  = jit_rt_fxnsize_impl;
+  jit_rt_moveemt_helper  = jit_rt_moveemt_impl;
+  jit_rt_fatal_helper    = jit_rt_fatal_impl;
+  jit_rt_fxnlget_helper  = jit_rt_fxnlget_impl;
 }
 
 void jit_install_helpers_public(void) {
@@ -503,6 +554,9 @@ void *jit_helper_pointer(int helper_id) {
     case JIT_HELPER_LIST1:    return (void*)jit_rt_list1_helper;
     case JIT_HELPER_LIST2:    return (void*)jit_rt_list2_helper;
     case JIT_HELPER_FXNSIZE:  return (void*)jit_rt_fxnsize_helper;
+    case JIT_HELPER_MOVEEMT:  return (void*)jit_rt_moveemt_helper;
+    case JIT_HELPER_FATAL:    return (void*)jit_rt_fatal_helper;
+    case JIT_HELPER_FXNLGET:  return (void*)jit_rt_fxnlget_helper;
     default:                  return NULL;
   }
 }

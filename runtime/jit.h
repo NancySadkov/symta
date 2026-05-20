@@ -75,6 +75,12 @@ typedef enum {
   /* Step 7c: SBC_FXNSIZE = `L[dst] = FXN(LIST_SIZE(L[src]))`.
    * Pure heap-header read; no MCACHE fallback (unlike FXNLGET). */
   JIT_HELPER_FXNSIZE  = 26,
+  /* Step 10: 4-arg trivial helpers (MOVEEMT / FATAL) and the
+   * FXNLGET with-sbc trampoline.  FATAL longjmps; the others
+   * return normally. */
+  JIT_HELPER_MOVEEMT  = 27,
+  JIT_HELPER_FATAL    = 28,
+  JIT_HELPER_FXNLGET  = 29,
   JIT_HELPER_MAX
 } jit_helper_id_t;
 
@@ -393,6 +399,38 @@ extern void (*jit_rt_arglist5_helper)(int64_t *L, int packed, int u1, int u2);
 /* SBC_MOVETX / MOVETX8: L[dst] = sbc->tx[src] (text constant
  * table lookup).  Needs sbc context. */
 extern void (*jit_rt_movetx_helper) (int64_t *L, struct sbc_t *sbc, uint64_t packed);
+
+/* SBC_MOVEEMT: L[dst] = Empty (the heap-allocated empty-list
+ * singleton).  Cheaper than a 3-instruction inline because Empty's
+ * address depends on init_builtins layout -- a helper that
+ * dereferences `api.empty_` keeps the JIT free of that
+ * cross-translation-unit binding.  Signature reuses helper3:
+ *   (L, dst_slot, unused, unused). */
+extern void (*jit_rt_moveemt_helper)(int64_t *L, int dst, int u1, int u2);
+
+/* SBC_FATAL: raise a fatal error with the text in L[msg].
+ * Longjmps via the runtime's `fatal(char*)`.  Windows SEH
+ * unwind info registered by jit_register_unwind_2arg in step 5n
+ * lets the unwind walk JIT'd frames.  Signature reuses helper3:
+ *   (L, msg_slot, unused, unused). */
+extern void (*jit_rt_fatal_helper)(int64_t *L, int msg, int u1, int u2);
+
+/* SBC_FXNLGET / SBC_FXNLSET: list-element get / set with the
+ * per-call-site mcache slot.  The interpreter does a fast-path
+ * type check (T_LIST + T_INT + in-bounds) and falls back to
+ * MCACHE_CALL of `m_get` / `m_set`.  Helper mirrors that exactly.
+ * Wire packs the four operands into 64 bits:
+ *   [15:0]   dst
+ *   [31:16]  src
+ *   [47:32]  index   (for FXNLGET) / val (for FXNLSET)
+ *   [63:48]  mcache_idx                (for FXNLGET)
+ *
+ * FXNLSET also carries an `index` field (u16) that doesn't fit
+ * in 64 bits with all the other operands, so its helper takes a
+ * second packed argument -- not added here yet; FXNLGET is the
+ * higher-impact blocker. */
+extern void (*jit_rt_fxnlget_helper)(int64_t *L, struct sbc_t *sbc,
+                                     uint64_t packed);
 
 /* SBC_CLOSURE.  Builds a closure object via the CLOSURE
  * allocator macro.  The third arg packs (dst<<32|idx<<16|size)
