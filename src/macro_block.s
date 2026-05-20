@@ -485,7 +485,17 @@ type Name @Fields =
 expand_block_item_method Type Name Args Body =
 | less Name >< __:
   | push \Me Args
-  | when got GTypes.Type: Body =  form: _type Type $\Me Body
+  // TS-4.5 Phase 1: also wrap for the whitelisted primitive
+  // receivers (int/float/text/list/...).  Used to be gated on
+  // `got GTypes.Type` -- user-defined types only -- which left
+  // every primitive-method body with `Me` as dyn even when the
+  // body did obvious primitive arithmetic.  Auto-typing
+  // unblocks IADD/IMUL/IDIV/IREM on `Me ...` patterns across
+  // the entire stdlib.  Skip-list is encoded in
+  // `is_auto_typed_receiver` (macro.s) -- `_`/`no`/`meta`/
+  // `iter`/`tbl`/`tok` excluded.
+  | when got GTypes.Type or Type^is_auto_typed_receiver:
+    | Body = form: _type Type $\Me Body
 | when Name >< __:
   | case Args
     [Method As] | Args =  [['@' As]]

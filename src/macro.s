@@ -107,6 +107,32 @@ is_gensym_name X =
 | less P+1 < X.n: ret 0
 | X.(P+1) >< \_
 
+// TS-4.5 Phase 1: whitelist of primitive receiver types that
+// `expand_block_item_method` auto-wraps in `_type Type Me Body`.
+// Excludes the universal `_` receiver, the `no`/`meta`/`iter`
+// dynamic-dispatch wrappers, the `tbl.__` forwarder type, and
+// `tok` (low impact, untested).  Each included type is a
+// stable runtime tag whose Me-receiver methods overwhelmingly
+// do arithmetic / index access on Me's primitive shape; auto-
+// typing Me unblocks IADD/IMUL/etc. across the entire stdlib.
+is_auto_typed_receiver T =
+| case T
+    \int   | 1
+    \float | 1
+    \text  | 1
+    \fixtext | 1
+    \list  | 1
+    \hard_list | 1
+    \_list_  | 1
+    \_text_  | 1
+    \_fixtext_ | 1
+    \cons  | 1
+    \bytes | 1
+    \_bytes_ | 1
+    \view  | 1
+    \fn    | 1
+    Else   | 0
+
 is_list_case V =
   V(:[_ _ @_]+[]+[['@'+'/' @_]+['+'+'*' _]+['<' _ ['+'+'*'+'/' _]]])
 
