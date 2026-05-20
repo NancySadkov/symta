@@ -386,6 +386,26 @@ static void jit_rt_closure_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) 
   CLOSURE(((dyn*)L)[dst], fn, size);
 }
 
+/* Public wrapper for sif2sbc.  Ensures helpers are installed
+ * before the writer JIT-translates anything in AOT mode.  Same
+ * once-only semantics as the static version below. */
+void jit_install_helpers_public(void);
+
+/* Helper-id -> live function pointer.  Indexed by JIT_HELPER_*
+ * enum; entry 0 (JIT_HELPER_NONE) is left NULL so accidental
+ * lookups against an un-tagged reloc surface immediately.
+ *
+ * Used by:
+ *   - sbc_prepare's loader install path (step 6c) to patch
+ *     each imm64 in a freshly-copied JIT blob.
+ *   - the writer-side sanity check that every reloc collected
+ *     during AOT translation refers to a known helper.
+ *
+ * The table is populated lazily after jit_install_helpers_once
+ * runs, since the helper pointers themselves can be swapped
+ * from int-only fallbacks to full impls. */
+void *jit_helper_pointer(int helper_id);
+
 /* Install the helpers on first audit so the standalone JIT
  * self-test (which doesn't link jit_sbc.c) keeps the pointers
  * NULL and bails out cleanly on the corresponding opcodes. */
@@ -416,6 +436,45 @@ static void jit_install_helpers_once(void) {
   jit_rt_arglist4_helper = jit_rt_arglist4_impl;
   jit_rt_arglist5_helper = jit_rt_arglist5_impl;
   jit_rt_movetx_helper   = jit_rt_movetx_impl;
+}
+
+void jit_install_helpers_public(void) {
+  jit_install_helpers_once();
+}
+
+void *jit_helper_pointer(int helper_id) {
+  /* Caller must have called jit_install_helpers_public() first
+   * so the full-dispatch impls are in place.  The table below is
+   * evaluated each call rather than cached because the function-
+   * pointer globals can legally be reassigned (e.g. swapping the
+   * int-only fallbacks for the full versions, as
+   * jit_install_helpers_once does). */
+  switch (helper_id) {
+    case JIT_HELPER_FXNADD:   return (void*)jit_rt_fxnadd_helper;
+    case JIT_HELPER_FXNSUB:   return (void*)jit_rt_fxnsub_helper;
+    case JIT_HELPER_FXNMUL:   return (void*)jit_rt_fxnmul_helper;
+    case JIT_HELPER_FXNDIV:   return (void*)jit_rt_fxndiv_helper;
+    case JIT_HELPER_FXNREM:   return (void*)jit_rt_fxnrem_helper;
+    case JIT_HELPER_LD4:      return (void*)jit_rt_ld4_helper;
+    case JIT_HELPER_ST4:      return (void*)jit_rt_st4_helper;
+    case JIT_HELPER_LIST:     return (void*)jit_rt_list_helper;
+    case JIT_HELPER_COPY:     return (void*)jit_rt_copy_helper;
+    case JIT_HELPER_CLOSURE:  return (void*)jit_rt_closure_helper;
+    case JIT_HELPER_ARGLIST0: return (void*)jit_rt_arglist0_helper;
+    case JIT_HELPER_ARGLIST1: return (void*)jit_rt_arglist1_helper;
+    case JIT_HELPER_ARGLIST2: return (void*)jit_rt_arglist2_helper;
+    case JIT_HELPER_ARGLIST3: return (void*)jit_rt_arglist3_helper;
+    case JIT_HELPER_ARGLIST4: return (void*)jit_rt_arglist4_helper;
+    case JIT_HELPER_ARGLIST5: return (void*)jit_rt_arglist5_helper;
+    case JIT_HELPER_CALL:     return (void*)jit_rt_call_helper;
+    case JIT_HELPER_CALLIR:   return (void*)jit_rt_callir_helper;
+    case JIT_HELPER_CALLT:    return (void*)jit_rt_callt_helper;
+    case JIT_HELPER_CALLTIR:  return (void*)jit_rt_calltir_helper;
+    case JIT_HELPER_MCALL:    return (void*)jit_rt_mcall_helper;
+    case JIT_HELPER_MCALLIR:  return (void*)jit_rt_mcallir_helper;
+    case JIT_HELPER_MOVETX:   return (void*)jit_rt_movetx_helper;
+    default:                  return NULL;
+  }
 }
 
 /* Read a 24-bit little-endian unsigned int.  Mirrors the

@@ -104,6 +104,7 @@ void jit_buf_free(jit_buf *b) {
     munmap(b->code, b->cap);
 #endif
   }
+  if (b->relocs) free(b->relocs);
   free(b);
 }
 
@@ -535,21 +536,39 @@ void (*jit_rt_movetx_helper) (int64_t *L, struct sbc_t *sbc, uint64_t packed) = 
 void (*jit_rt_closure_helper)(int64_t *L, struct sbc_t *sbc,
                               uint64_t packed) = NULL;
 
-static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc);
+static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
+                                   int have_sbc, int record_relocs);
 
 jit_buf *jit_translate(const uint8_t *bc, size_t n) {
-  return jit_translate_core(bc, n, 0);
+  return jit_translate_core(bc, n, 0, 0);
 }
 jit_buf *jit_translate_with_sbc(const uint8_t *bc, size_t n) {
-  return jit_translate_core(bc, n, 1);
+  return jit_translate_core(bc, n, 1, 0);
+}
+jit_buf *jit_translate_with_sbc_record(const uint8_t *bc, size_t n) {
+  /* Step 6b: AOT path.  Same code shape as the runtime translator
+   * but turns on the reloc recorder so the writer can persist the
+   * helper-pointer call sites.  The returned buffer is owned by
+   * the caller; sif2sbc reads code+relocs out and then jit_buf_free's. */
+  return jit_translate_core(bc, n, 1, 1);
 }
 
-static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
+static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
+                                   int have_sbc, int record_relocs) {
   /* x86 expansion factor.  Worst case so far is the comparison
    * sequence at ~16 bytes per opcode; B is ~12 bytes; prologue
    * 6, epilogue 7.  Round up to 20/opcode to leave headroom. */
   jit_buf *b = jit_buf_new(n * 20 + 64);
   if (!b) return NULL;
+  /* Step 6b: turn on reloc recording for the AOT writer path.
+   * Each helper-pointer call site appends (offset, helper_id)
+   * to b->relocs; the runtime translator path (record_relocs=0)
+   * skips the bookkeeping. */
+  b->record_relocs = record_relocs;
+  b->pending_helper_id = JIT_HELPER_NONE;
+  b->relocs = NULL;
+  b->relocs_count = 0;
+  b->relocs_cap = 0;
 
   /* bc_to_x86[i] = x86 offset of the instruction starting at
    * bc[i], or (size_t)-1 if bc[i] isn't an instruction start.
@@ -632,6 +651,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint8_t opr = bc[i + 1];
       uint32_t dst = (uint32_t)(opr & 0xF);
       uint32_t src = (uint32_t)(opr >> 4);
+      b->pending_helper_id = JIT_HELPER_ST4;
       jit_emit_call_helper3(b, (void*)jit_rt_st4_helper,
                             dst, src, (uint32_t)index);
       i += 2;
@@ -661,6 +681,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint8_t opr = bc[i + 1];
       uint32_t dst = (uint32_t)(opr & 0xF);
       uint32_t src = (uint32_t)(opr >> 4);
+      b->pending_helper_id = JIT_HELPER_LD4;
       jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper,
                             dst, src, (uint32_t)index);
       i += 2;
@@ -679,6 +700,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint32_t dst   = (uint32_t)bc_rd16(bc + i + 1);
       uint32_t src   = (uint32_t)bc_rd16(bc + i + 3);
       uint32_t index = (uint32_t)bc_rd16(bc + i + 5);
+      b->pending_helper_id = JIT_HELPER_LD4;
       jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper, dst, src, index);
       i += 7;
       break;
@@ -693,6 +715,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint32_t dst   = bc[i + 1];
       uint32_t src   = bc[i + 2];
       uint32_t index = bc[i + 3];
+      b->pending_helper_id = JIT_HELPER_LD4;
       jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper, dst, src, index);
       i += 4;
       break;
@@ -710,6 +733,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
                                  fail = 1; goto done; }
       uint32_t dst  = (uint32_t)bc_rd16(bc + i + 1);
       uint32_t size = (uint32_t)bc_rd16(bc + i + 3);
+      b->pending_helper_id = JIT_HELPER_LIST;
       jit_emit_call_helper3(b, (void*)jit_rt_list_helper, dst, size, 0);
       i += 5;
       break;
@@ -719,6 +743,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       if (!jit_rt_arglist0_helper) { jit_last_fail_opcode = op;
                                      jit_last_fail_offset = i;
                                      fail = 1; goto done; }
+      b->pending_helper_id = JIT_HELPER_ARGLIST0;
       jit_emit_call_helper3(b, (void*)jit_rt_arglist0_helper, 0, 0, 0);
       i += 1;
       break;
@@ -731,6 +756,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
                                      jit_last_fail_offset = i;
                                      fail = 1; goto done; }
       uint32_t a = bc[i + 1];
+      b->pending_helper_id = JIT_HELPER_ARGLIST1;
       jit_emit_call_helper3(b, (void*)jit_rt_arglist1_helper, a, 0, 0);
       i += 2;
       break;
@@ -744,6 +770,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
                                      fail = 1; goto done; }
       uint32_t a = bc[i + 1];
       uint32_t bb = bc[i + 2];
+      b->pending_helper_id = JIT_HELPER_ARGLIST2;
       jit_emit_call_helper3(b, (void*)jit_rt_arglist2_helper, a, bb, 0);
       i += 3;
       break;
@@ -758,6 +785,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint32_t a = bc[i + 1];
       uint32_t bb = bc[i + 2];
       uint32_t c = bc[i + 3];
+      b->pending_helper_id = JIT_HELPER_ARGLIST3;
       jit_emit_call_helper3(b, (void*)jit_rt_arglist3_helper, a, bb, c);
       i += 4;
       break;
@@ -775,6 +803,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
                       | ((uint32_t)bc[i + 2] << 8)
                       | ((uint32_t)bc[i + 3] << 16)
                       | ((uint32_t)bc[i + 4] << 24);
+      b->pending_helper_id = JIT_HELPER_ARGLIST4;
       jit_emit_call_helper3(b, (void*)jit_rt_arglist4_helper, packed, 0, 0);
       i += 5;
       break;
@@ -793,6 +822,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
                        | ((uint32_t)bc[i + 3] << 16)
                        | ((uint32_t)bc[i + 4] << 24);
       uint32_t a4 = bc[i + 5];
+      b->pending_helper_id = JIT_HELPER_ARGLIST5;
       jit_emit_call_helper3(b, (void*)jit_rt_arglist5_helper, packed4, a4, 0);
       i += 6;
       break;
@@ -811,6 +841,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
                                  fail = 1; goto done; }
       uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
       uint32_t fn  = (uint32_t)bc_rd16(bc + i + 3);
+      b->pending_helper_id = JIT_HELPER_CALL;
       jit_emit_call_helper3(b, (void*)jit_rt_call_helper, dst, fn, 0);
       i += 5;
       break;
@@ -823,6 +854,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
                                    jit_last_fail_offset = i;
                                    fail = 1; goto done; }
       uint32_t fn  = (uint32_t)bc_rd16(bc + i + 1);
+      b->pending_helper_id = JIT_HELPER_CALLIR;
       jit_emit_call_helper3(b, (void*)jit_rt_callir_helper, fn, 0, 0);
       i += 3;
       break;
@@ -837,6 +869,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
                                   fail = 1; goto done; }
       uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
       uint32_t fn  = (uint32_t)bc_rd16(bc + i + 3);
+      b->pending_helper_id = JIT_HELPER_CALLT;
       jit_emit_call_helper3(b, (void*)jit_rt_callt_helper, dst, fn, 0);
       i += 5;
       break;
@@ -849,6 +882,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
                                     jit_last_fail_offset = i;
                                     fail = 1; goto done; }
       uint32_t fn  = (uint32_t)bc_rd16(bc + i + 1);
+      b->pending_helper_id = JIT_HELPER_CALLTIR;
       jit_emit_call_helper3(b, (void*)jit_rt_calltir_helper, fn, 0, 0);
       i += 3;
       break;
@@ -871,6 +905,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint64_t met    = (uint64_t)bc_rd16(bc + i + 5);
       uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 7);
       uint64_t packed = (mcidx << 48) | (met << 32) | (obj << 16) | dst;
+      b->pending_helper_id = JIT_HELPER_MCALL;
       jit_emit_call_with_sbc(b, (void*)jit_rt_mcall_helper, packed);
       i += 9;
       break;
@@ -889,6 +924,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint64_t met    = (uint64_t)bc_rd16(bc + i + 3);
       uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 5);
       uint64_t packed = (mcidx << 48) | (met << 32) | (obj << 16) | 0;
+      b->pending_helper_id = JIT_HELPER_MCALLIR;
       jit_emit_call_with_sbc(b, (void*)jit_rt_mcallir_helper, packed);
       i += 7;
       break;
@@ -909,6 +945,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint64_t met    = (uint64_t)bc[i + 3];
       uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 4);
       uint64_t packed = (mcidx << 48) | (met << 32) | (obj << 16) | dst;
+      b->pending_helper_id = JIT_HELPER_MCALL;
       jit_emit_call_with_sbc(b, (void*)jit_rt_mcall_helper, packed);
       i += 6;
       break;
@@ -934,6 +971,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint32_t dindex = (uint32_t)bc_rd16(bc + i + 5);
       uint32_t sindex = (uint32_t)bc_rd16(bc + i + 7);
       uint32_t packed = (dindex << 16) | sindex;
+      b->pending_helper_id = JIT_HELPER_COPY;
       jit_emit_call_helper3(b, (void*)jit_rt_copy_helper, dst, src, packed);
       i += 9;
       break;
@@ -963,6 +1001,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
        *   [15: 0] = size
        */
       uint64_t packed = (dst << 32) | (idx << 16) | (size & 0xFF);
+      b->pending_helper_id = JIT_HELPER_CLOSURE;
       jit_emit_call_with_sbc(b, (void*)jit_rt_closure_helper, packed);
       i += 6;
       break;
@@ -1014,6 +1053,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint64_t dst = (uint64_t)bc_rd16(bc + i + 1);
       uint64_t src = (uint64_t)bc_rd24(bc + i + 3);
       uint64_t packed = (dst << 32) | src;
+      b->pending_helper_id = JIT_HELPER_MOVETX;
       jit_emit_call_with_sbc(b, (void*)jit_rt_movetx_helper, packed);
       i += 6;
       break;
@@ -1031,6 +1071,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint64_t dst = bc[i + 1];
       uint64_t src = bc[i + 2];
       uint64_t packed = (dst << 32) | src;
+      b->pending_helper_id = JIT_HELPER_MOVETX;
       jit_emit_call_with_sbc(b, (void*)jit_rt_movetx_helper, packed);
       i += 3;
       break;
@@ -1096,15 +1137,16 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
       uint32_t a   = (uint32_t)bc_rd16(bc + i + 3);
       uint32_t x   = (uint32_t)bc_rd16(bc + i + 5);
-      void *helper;
+      void *helper; jit_helper_id_t hid;
       switch (op) {
-        case BC_FXNADD: helper = (void*)jit_rt_fxnadd_helper; break;
-        case BC_FXNSUB: helper = (void*)jit_rt_fxnsub_helper; break;
-        case BC_FXNMUL: helper = (void*)jit_rt_fxnmul_helper; break;
-        case BC_FXNDIV: helper = (void*)jit_rt_fxndiv_helper; break;
-        case BC_FXNREM: helper = (void*)jit_rt_fxnrem_helper; break;
-        default: helper = NULL;  /* unreachable */
+        case BC_FXNADD: helper = (void*)jit_rt_fxnadd_helper; hid = JIT_HELPER_FXNADD; break;
+        case BC_FXNSUB: helper = (void*)jit_rt_fxnsub_helper; hid = JIT_HELPER_FXNSUB; break;
+        case BC_FXNMUL: helper = (void*)jit_rt_fxnmul_helper; hid = JIT_HELPER_FXNMUL; break;
+        case BC_FXNDIV: helper = (void*)jit_rt_fxndiv_helper; hid = JIT_HELPER_FXNDIV; break;
+        case BC_FXNREM: helper = (void*)jit_rt_fxnrem_helper; hid = JIT_HELPER_FXNREM; break;
+        default: helper = NULL; hid = JIT_HELPER_NONE;  /* unreachable */
       }
+      b->pending_helper_id = hid;
       jit_emit_call_helper3(b, helper, dst, a, x);
       i += 7;
       break;
@@ -1354,19 +1396,58 @@ done:
   return b;
 }
 
+/* Append a (offset, helper_id) record to b->relocs.  Grows the
+ * array on demand (doubling).  Caller has already validated
+ * b->record_relocs is set. */
+static void jit_record_reloc(jit_buf *b, uint32_t imm_offset,
+                             jit_helper_id_t hid) {
+  if (b->relocs_count >= b->relocs_cap) {
+    int newcap = b->relocs_cap ? b->relocs_cap * 2 : 16;
+    jit_reloc_t *neu = (jit_reloc_t*)realloc(b->relocs,
+                          (size_t)newcap * sizeof(jit_reloc_t));
+    if (!neu) {
+      fprintf(stderr, "jit_record_reloc: realloc failed (cap=%d)\n", newcap);
+      abort();
+    }
+    b->relocs = neu;
+    b->relocs_cap = newcap;
+  }
+  b->relocs[b->relocs_count].offset    = imm_offset;
+  b->relocs[b->relocs_count].helper_id = (uint8_t)hid;
+  b->relocs[b->relocs_count].pad[0] = 0;
+  b->relocs[b->relocs_count].pad[1] = 0;
+  b->relocs[b->relocs_count].pad[2] = 0;
+  b->relocs_count++;
+}
+
 void jit_emit_call_abs(jit_buf *b, void *target) {
   /* Two-instruction call: load the absolute address into RAX
    * via `mov rax, imm64` (10 bytes) then `call rax` (2 bytes).
    * Total 12 bytes -- longer than a relative call but works
    * for any target regardless of its distance from the JIT'd
-   * code. */
+   * code.
+   *
+   * Reloc recording: when b->record_relocs is on, we log the
+   * imm64's byte offset together with b->pending_helper_id so
+   * the loader can patch this site without re-translating the
+   * bytecode.  The pending_helper_id is set by the wrapper
+   * function (jit_emit_call_helper3 / jit_emit_call_with_sbc
+   * or the arith family) right before this call.  If a caller
+   * forgets to set it, we still log the offset but with
+   * JIT_HELPER_NONE so the writer can flag the missing
+   * mapping at build time. */
   uint64_t v = (uint64_t)target;
+  uint32_t imm_off = (uint32_t)(b->len + 2);  /* 2 bytes of REX+opcode prefix */
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0xb8);  /* mov rax, imm64 (opcode b8+reg, rax=0) */
   for (int i = 0; i < 8; i++) jit_emit_u8(b, (uint8_t)(v >> (i*8)));
   /* call rax :  ff d0 (ModR/M 11 010 000, /2=call, r/m=rax) */
   jit_emit_u8(b, 0xff);
   jit_emit_u8(b, 0xd0);
+  if (b->record_relocs) {
+    jit_record_reloc(b, imm_off, b->pending_helper_id);
+    b->pending_helper_id = JIT_HELPER_NONE;
+  }
 }
 
 /* Step 5c helpers: per-platform mov r32, imm32 emitters.

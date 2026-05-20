@@ -26,10 +26,79 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Step 6b: stable helper IDs for AOT relocation.
+ *
+ * Each opcode the JIT delegates to a runtime helper -- the FXN*
+ * arith helpers, ARGLIST/CALL/MCALL dispatchers, LD4/ST4/COPY/
+ * LIST/CLOSURE/MOVETX -- has one of these IDs.  When the JIT
+ * runs in record-relocs mode the imm64 of each `mov rax, helper`
+ * + `call rax` site is logged as (byte_offset, helper_id) into
+ * `jit_buf.relocs`.  The writer side (sif2sbc) emits these into
+ * the SBC's IA64 section; the loader (sbc_prepare) walks them
+ * after copying the code into executable memory and patches each
+ * imm64 to point at the LIVE address of the corresponding
+ * helper in THIS process.
+ *
+ * IDs are stable across writer/loader versions -- new helpers
+ * append to the end of this enum, never reorder.  JIT_HELPER_MAX
+ * is the sentinel; helpers expand by adding entries before it. */
+typedef enum {
+  JIT_HELPER_NONE     = 0,
+  JIT_HELPER_FXNADD   = 1,
+  JIT_HELPER_FXNSUB   = 2,
+  JIT_HELPER_FXNMUL   = 3,
+  JIT_HELPER_FXNDIV   = 4,
+  JIT_HELPER_FXNREM   = 5,
+  JIT_HELPER_LD4      = 6,
+  JIT_HELPER_ST4      = 7,
+  JIT_HELPER_LIST     = 8,
+  JIT_HELPER_COPY     = 9,
+  JIT_HELPER_CLOSURE  = 10,
+  JIT_HELPER_ARGLIST0 = 11,
+  JIT_HELPER_ARGLIST1 = 12,
+  JIT_HELPER_ARGLIST2 = 13,
+  JIT_HELPER_ARGLIST3 = 14,
+  JIT_HELPER_ARGLIST4 = 15,
+  JIT_HELPER_ARGLIST5 = 16,
+  JIT_HELPER_CALL     = 17,
+  JIT_HELPER_CALLIR   = 18,
+  JIT_HELPER_CALLT    = 19,
+  JIT_HELPER_CALLTIR  = 20,
+  JIT_HELPER_MCALL    = 21,
+  JIT_HELPER_MCALLIR  = 22,
+  JIT_HELPER_MOVETX   = 23,
+  JIT_HELPER_MAX
+} jit_helper_id_t;
+
+/* One reloc entry: where the helper-pointer imm64 lives in the
+ * code buffer + which helper it should resolve to.  Eight bytes
+ * total on disk (matches the directory-entry struct format). */
+typedef struct {
+  uint32_t offset;       /* byte offset of the imm64 in jit_buf.code */
+  uint8_t  helper_id;    /* jit_helper_id_t value */
+  uint8_t  pad[3];
+} jit_reloc_t;
+
 typedef struct jit_buf {
-  uint8_t *code;     /* base of the executable mapping */
-  size_t cap;        /* total bytes mapped */
-  size_t len;        /* bytes written so far */
+  uint8_t *code;          /* base of the executable mapping */
+  size_t cap;             /* total bytes mapped */
+  size_t len;             /* bytes written so far */
+  /* Reloc-recording state.  When `record_relocs` is non-zero,
+   * jit_emit_call_abs appends a (offset, helper_id) entry to
+   * `relocs` each time it emits a helper-pointer call.  The
+   * helper_id is taken from `pending_helper_id` -- the wrapper
+   * functions (jit_emit_call_helper3 / jit_emit_call_with_sbc /
+   * the arith family) set this right before calling abs.  This
+   * keeps the call_abs signature unchanged.
+   *
+   * relocs is a heap-malloc'd array, not stb_ds, so the writer
+   * can hand the pointer back to sif2sbc without dragging in
+   * ng.h.  Caller owns the buffer until jit_buf_free. */
+  int record_relocs;
+  jit_helper_id_t pending_helper_id;
+  jit_reloc_t *relocs;
+  int relocs_count;
+  int relocs_cap;
 } jit_buf;
 
 /* Allocate an executable buffer of `cap` bytes.  Returns NULL on
@@ -360,5 +429,31 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n);
  *
  * Caller invokes the JIT'd code as `fn(L, sbc)`. */
 jit_buf *jit_translate_with_sbc(const uint8_t *bc, size_t n);
+
+/* AOT-recording variant of jit_translate_with_sbc.  Same code is
+ * emitted, but each helper-pointer call site adds an entry to
+ * `b->relocs`.  The writer hands these off to sif2sbc which
+ * stores them in the SBC's IA64 section; the loader patches the
+ * imm64s on load.
+ *
+ * Caller owns the returned jit_buf (and its relocs[]).  Note the
+ * code is NOT finalized to PROT_EXEC -- the writer never executes
+ * it, just reads b->code[0..b->len] for storage. */
+jit_buf *jit_translate_with_sbc_record(const uint8_t *bc, size_t n);
+
+/* Look up the live function pointer for a given helper_id in
+ * THIS process.  Returns NULL for JIT_HELPER_NONE or unknown
+ * ids.  Used by the loader to patch each relocated imm64 in
+ * a JIT'd code blob.  Implemented in jit_sbc.c (the runtime
+ * glue layer); jit.c's standalone self-test stubs it. */
+void *jit_helper_pointer(int helper_id);
+
+/* Ensure the helper-pointer globals point at their full-dispatch
+ * impls (not the int-only fallbacks).  Idempotent.  Implemented
+ * in jit_sbc.c.  Writer must call this before
+ * jit_translate_with_sbc_record so the relocs collected refer to
+ * the real impls; the loader must call it too before applying
+ * relocs since the helper-id-to-pointer mapping depends on it. */
+void jit_install_helpers_public(void);
 
 #endif
