@@ -150,11 +150,26 @@ declared_compare_result_type A B =
 //      wins land without waiting for Phase 4 to refactor every
 //      core_.s method body.
 method_return_type RT M =
-  | when M.is_text and M^is_known_type: ret M
-  | when no RT: ret No
   | when no M.is_text: ret No
+  // Stage 1 (TS-3.4): method name IS a type -- conversion methods
+  // (.int, .float, .text, .fixtext, .bytes).  Was previously
+  // applied regardless of receiver, on the premise that these
+  // methods universally coerce to the named type.  False for
+  // list-shaped receivers: `[1.5 2.5].int -> [1 2]`, a LIST.
+  // The premise also fails for fully-dynamic receivers (RT=No):
+  // we can't tell whether the runtime value is a primitive
+  // (.int parses/converts to int) or a list (.int maps).
+  // Bin_op then routes to _idiv on what's actually a list and
+  // crashes inside `list.-` downstream.  Only fire when we KNOW
+  // the receiver is a primitive that does whole-value coercion.
+  | when M^is_known_type and got RT and not RT^is_list_shaped_receiver:
+    | ret M
+  | when no RT: ret No
+  // Stage 2: receiver+method registry, populated by
+  // expand_block_item_method.
   | KnownRet GMethodReturns.("[RT].[M]")
   | when got KnownRet: ret KnownRet
+  // Stage 3: hardcoded universal shortcuts.
   | when M >< "n" and RT^is_sequence_type: ret "int"
   | when M >< "hash": ret "int"
   | when M >< "code" and (RT >< "text" or RT >< "fixtext"): ret "int"

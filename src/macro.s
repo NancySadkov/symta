@@ -138,6 +138,24 @@ is_auto_typed_receiver T =
     \fn    | 1
     Else   | 0
 
+// TS-4.5 Phase 2: types where conversion methods (.int, .float,
+// .text, .fixtext, .bytes) MAP element-wise rather than coerce
+// the value as a whole.  Used to suppress TS-3.4's "method-name
+// IS a type" shortcut on these receivers -- `[1.5 2.5].int`
+// returns `[1 2]` (a list), not an int.  TS-3.4 was wrong to
+// claim int regardless of receiver; for list-shaped receivers,
+// the result has the SAME shape as the receiver (elements
+// converted).  text/fixtext/bytes are NOT in this list -- their
+// `.int` parses the whole text as a number, returning int.
+is_list_shaped_receiver T =
+| case T
+    \list      | 1
+    \hard_list | 1
+    \_list_    | 1
+    \cons      | 1
+    \view      | 1
+    Else       | 0
+
 // TS-4.5 Phase 2: types whose `.n` method returns int.  Covers
 // the sequence-like and table-like receivers that `Xs.n` is
 // the natural size accessor on.  Used as a KISS shortcut in
