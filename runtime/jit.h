@@ -81,6 +81,14 @@ typedef enum {
   JIT_HELPER_MOVEEMT  = 27,
   JIT_HELPER_FATAL    = 28,
   JIT_HELPER_FXNLGET  = 29,
+  JIT_HELPER_FXNLT    = 30,
+  JIT_HELPER_FXNGT    = 31,
+  JIT_HELPER_FXNLTE   = 32,
+  JIT_HELPER_FXNGTE   = 33,
+  JIT_HELPER_FXNTAG   = 34,
+  JIT_HELPER_NOT      = 35,
+  JIT_HELPER_GOT      = 36,
+  JIT_HELPER_NO       = 37,
   JIT_HELPER_MAX
 } jit_helper_id_t;
 
@@ -431,6 +439,26 @@ extern void (*jit_rt_fatal_helper)(int64_t *L, int msg, int u1, int u2);
  * higher-impact blocker. */
 extern void (*jit_rt_fxnlget_helper)(int64_t *L, struct sbc_t *sbc,
                                      uint64_t packed);
+
+/* SBC_FXNLT / FXNGT / FXNLTE / FXNGTE: untyped ordering ops.
+ * Fast path = both T_INT, inline FXNLT macro; else MCALL into
+ * m_lt / m_gt / m_lte / m_gte (NO mcache slot, plain MCALL).
+ * Helper3 sig: (L, dst, a, b). */
+extern void (*jit_rt_fxnlt_helper) (int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fxngt_helper) (int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fxnlte_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fxngte_helper)(int64_t *L, int dst, int a, int b);
+
+/* SBC_FXNTAG: L[dst] = FXN(O_TAG(L[src])).  Trivial heap-header
+ * read; no fast/slow split.  Helper3: (L, dst, src, _). */
+extern void (*jit_rt_fxntag_helper)(int64_t *L, int dst, int src, int u);
+
+/* SBC_NOT / SBC_GOT / SBC_NO: dst=u16 src=u16; each writes FXN(0)
+ * or FXN(1) based on a truthy/No comparison.  Trivial inline-able
+ * but cheaper to ship as helper3 trampolines for now. */
+extern void (*jit_rt_not_helper) (int64_t *L, int dst, int src, int u);
+extern void (*jit_rt_got_helper) (int64_t *L, int dst, int src, int u);
+extern void (*jit_rt_no_helper)  (int64_t *L, int dst, int src, int u);
 
 /* SBC_CLOSURE.  Builds a closure object via the CLOSURE
  * allocator macro.  The third arg packs (dst<<32|idx<<16|size)

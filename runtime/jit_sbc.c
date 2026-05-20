@@ -400,6 +400,67 @@ static void jit_rt_fatal_impl(int64_t *L, int msg, int u1, int u2) {
   FATAL((char*)(((dyn*)L)[msg]));
 }
 
+/* SBC_FXNLT / FXNGT / FXNLTE / FXNGTE: untyped ordering ops.
+ * T_INT-T_INT fast path inline; else MCALL into the appropriate
+ * method id.  Helper3 sig: (L, dst, a, b). */
+static void jit_rt_fxnlt_impl(int64_t *L, int dst, int a, int b) {
+  dyn aa = ((dyn*)L)[a], bb = ((dyn*)L)[b];
+  if (TAGIS(T_INT, aa) && TAGIS(T_INT, bb)) {
+    FXNLT(((dyn*)L)[dst], aa, bb);
+  } else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_lt);
+  }
+}
+static void jit_rt_fxngt_impl(int64_t *L, int dst, int a, int b) {
+  dyn aa = ((dyn*)L)[a], bb = ((dyn*)L)[b];
+  if (TAGIS(T_INT, aa) && TAGIS(T_INT, bb)) {
+    FXNGT(((dyn*)L)[dst], aa, bb);
+  } else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_gt);
+  }
+}
+static void jit_rt_fxnlte_impl(int64_t *L, int dst, int a, int b) {
+  dyn aa = ((dyn*)L)[a], bb = ((dyn*)L)[b];
+  if (TAGIS(T_INT, aa) && TAGIS(T_INT, bb)) {
+    FXNLTE(((dyn*)L)[dst], aa, bb);
+  } else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_lte);
+  }
+}
+static void jit_rt_fxngte_impl(int64_t *L, int dst, int a, int b) {
+  dyn aa = ((dyn*)L)[a], bb = ((dyn*)L)[b];
+  if (TAGIS(T_INT, aa) && TAGIS(T_INT, bb)) {
+    FXNGTE(((dyn*)L)[dst], aa, bb);
+  } else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_gte);
+  }
+}
+
+/* SBC_FXNTAG: L[dst] = FXN(O_TAG(L[src])).  Trivial. */
+static void jit_rt_fxntag_impl(int64_t *L, int dst, int src, int u) {
+  (void)u;
+  ((dyn*)L)[dst] = (dyn)(int64_t)FXN(O_TAG(((dyn*)L)[src]));
+}
+
+/* SBC_NOT / SBC_GOT / SBC_NO: truthy/No comparisons.  Matches
+ * the interpreter bodies exactly. */
+static void jit_rt_not_impl(int64_t *L, int dst, int src, int u) {
+  (void)u;
+  ((dyn*)L)[dst] = ((dyn*)L)[src] ? (dyn)(int64_t)FXN(0) : (dyn)(int64_t)FXN(1);
+}
+static void jit_rt_got_impl(int64_t *L, int dst, int src, int u) {
+  (void)u;
+  ((dyn*)L)[dst] = (((dyn*)L)[src] != No) ? (dyn)(int64_t)FXN(1) : (dyn)(int64_t)FXN(0);
+}
+static void jit_rt_no_impl(int64_t *L, int dst, int src, int u) {
+  (void)u;
+  ((dyn*)L)[dst] = (((dyn*)L)[src] == No) ? (dyn)(int64_t)FXN(1) : (dyn)(int64_t)FXN(0);
+}
+
 /* SBC_FXNLGET: list-element-get with mcache fallback.  Mirrors
  * sbc.c:SBC_FXNLGET exactly -- T_LIST + T_INT + in-bounds fast
  * path; otherwise MCACHE_CALL(m_get).  Packed: [63:48]=mcache_idx
@@ -514,6 +575,14 @@ static void jit_install_helpers_once(void) {
   jit_rt_moveemt_helper  = jit_rt_moveemt_impl;
   jit_rt_fatal_helper    = jit_rt_fatal_impl;
   jit_rt_fxnlget_helper  = jit_rt_fxnlget_impl;
+  jit_rt_fxnlt_helper    = jit_rt_fxnlt_impl;
+  jit_rt_fxngt_helper    = jit_rt_fxngt_impl;
+  jit_rt_fxnlte_helper   = jit_rt_fxnlte_impl;
+  jit_rt_fxngte_helper   = jit_rt_fxngte_impl;
+  jit_rt_fxntag_helper   = jit_rt_fxntag_impl;
+  jit_rt_not_helper      = jit_rt_not_impl;
+  jit_rt_got_helper      = jit_rt_got_impl;
+  jit_rt_no_helper       = jit_rt_no_impl;
 }
 
 void jit_install_helpers_public(void) {
@@ -557,6 +626,14 @@ void *jit_helper_pointer(int helper_id) {
     case JIT_HELPER_MOVEEMT:  return (void*)jit_rt_moveemt_helper;
     case JIT_HELPER_FATAL:    return (void*)jit_rt_fatal_helper;
     case JIT_HELPER_FXNLGET:  return (void*)jit_rt_fxnlget_helper;
+    case JIT_HELPER_FXNLT:    return (void*)jit_rt_fxnlt_helper;
+    case JIT_HELPER_FXNGT:    return (void*)jit_rt_fxngt_helper;
+    case JIT_HELPER_FXNLTE:   return (void*)jit_rt_fxnlte_helper;
+    case JIT_HELPER_FXNGTE:   return (void*)jit_rt_fxngte_helper;
+    case JIT_HELPER_FXNTAG:   return (void*)jit_rt_fxntag_helper;
+    case JIT_HELPER_NOT:      return (void*)jit_rt_not_helper;
+    case JIT_HELPER_GOT:      return (void*)jit_rt_got_helper;
+    case JIT_HELPER_NO:       return (void*)jit_rt_no_helper;
     default:                  return NULL;
   }
 }

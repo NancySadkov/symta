@@ -418,6 +418,14 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_FXNMUL 0x3B
 #define BC_FXNDIV 0x3C
 #define BC_FXNREM 0x3D
+#define BC_FXNLT  0x40
+#define BC_FXNGT  0x41
+#define BC_FXNLTE 0x42
+#define BC_FXNGTE 0x43
+#define BC_FXNTAG 0x31
+#define BC_NOT    0x9B
+#define BC_GOT    0x9C
+#define BC_NO     0x9D
 #define BC_IADD   0xA3
 #define BC_ISUB   0xA4
 #define BC_IMUL   0xA5
@@ -552,6 +560,14 @@ void (*jit_rt_moveemt_helper)(int64_t *L, int dst, int u1, int u2) = NULL;
 void (*jit_rt_fatal_helper)  (int64_t *L, int msg, int u1, int u2) = NULL;
 void (*jit_rt_fxnlget_helper)(int64_t *L, struct sbc_t *sbc,
                               uint64_t packed) = NULL;
+void (*jit_rt_fxnlt_helper) (int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fxngt_helper) (int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fxnlte_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fxngte_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fxntag_helper)(int64_t *L, int dst, int src, int u) = NULL;
+void (*jit_rt_not_helper)  (int64_t *L, int dst, int src, int u) = NULL;
+void (*jit_rt_got_helper)  (int64_t *L, int dst, int src, int u) = NULL;
+void (*jit_rt_no_helper)   (int64_t *L, int dst, int src, int u) = NULL;
 
 /* Step 8: platform-aware default for the AOT pipeline.  Windows
  * has SEH unwind registered (step 5n) so longjmp through native
@@ -1303,7 +1319,8 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_FXNADD: case BC_FXNSUB: case BC_FXNMUL:
-    case BC_FXNDIV: case BC_FXNREM: {
+    case BC_FXNDIV: case BC_FXNREM:
+    case BC_FXNLT:  case BC_FXNGT:  case BC_FXNLTE: case BC_FXNGTE: {
       /* Same operand format as the I* family.  These differ
        * only at the dispatch level: the JIT trampolines them
        * to runtime helpers instead of inlining the encoding.
@@ -1320,11 +1337,44 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
         case BC_FXNMUL: helper = (void*)jit_rt_fxnmul_helper; hid = JIT_HELPER_FXNMUL; break;
         case BC_FXNDIV: helper = (void*)jit_rt_fxndiv_helper; hid = JIT_HELPER_FXNDIV; break;
         case BC_FXNREM: helper = (void*)jit_rt_fxnrem_helper; hid = JIT_HELPER_FXNREM; break;
+        case BC_FXNLT:  helper = (void*)jit_rt_fxnlt_helper;  hid = JIT_HELPER_FXNLT;  break;
+        case BC_FXNGT:  helper = (void*)jit_rt_fxngt_helper;  hid = JIT_HELPER_FXNGT;  break;
+        case BC_FXNLTE: helper = (void*)jit_rt_fxnlte_helper; hid = JIT_HELPER_FXNLTE; break;
+        case BC_FXNGTE: helper = (void*)jit_rt_fxngte_helper; hid = JIT_HELPER_FXNGTE; break;
         default: helper = NULL; hid = JIT_HELPER_NONE;  /* unreachable */
       }
+      if (!helper) { jit_last_fail_opcode = op;
+                     jit_last_fail_offset = i;
+                     fail = 1; goto done; }
       b->pending_helper_id = hid;
       jit_emit_call_helper3(b, helper, dst, a, x);
       i += 7;
+      break;
+    }
+
+    case BC_FXNTAG: case BC_NOT: case BC_GOT: case BC_NO: {
+      /* All 4 share: opcode + dst(u16) + src(u16) = 5 bytes.
+       * FXNTAG returns FXN(O_TAG(src)); NOT/GOT/NO return
+       * FXN(0) or FXN(1) based on truthy / No comparison. */
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t src = (uint32_t)bc_rd16(bc + i + 3);
+      void *helper; jit_helper_id_t hid;
+      switch (op) {
+        case BC_FXNTAG: helper = (void*)jit_rt_fxntag_helper; hid = JIT_HELPER_FXNTAG; break;
+        case BC_NOT:    helper = (void*)jit_rt_not_helper;    hid = JIT_HELPER_NOT;    break;
+        case BC_GOT:    helper = (void*)jit_rt_got_helper;    hid = JIT_HELPER_GOT;    break;
+        case BC_NO:     helper = (void*)jit_rt_no_helper;     hid = JIT_HELPER_NO;     break;
+        default: helper = NULL; hid = JIT_HELPER_NONE;
+      }
+      if (!helper) { jit_last_fail_opcode = op;
+                     jit_last_fail_offset = i;
+                     fail = 1; goto done; }
+      b->pending_helper_id = hid;
+      jit_emit_call_helper3(b, helper, dst, src, 0);
+      i += 5;
       break;
     }
 
