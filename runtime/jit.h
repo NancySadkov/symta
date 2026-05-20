@@ -226,6 +226,24 @@ extern void (*jit_rt_st4_helper)(int64_t *L, int dst, int src, int index);
  * gc_alloc which uses thread-local heap state. */
 extern void (*jit_rt_list_helper)(int64_t *L, int dst, int size, int unused);
 
+/* SBC_COPY: LSET(L[dst], dindex, LGET(L[src], sindex)).  Packs
+ * the two 16-bit field indices into the third helper3 arg
+ * (low 16 = sindex, high 16 = dindex).  The helper unpacks. */
+extern void (*jit_rt_copy_helper)(int64_t *L, int dst, int src, int packed_indices);
+
+/* ARGLIST family + CALL: per-call-site argument setup and
+ * dispatch.  ARGLIST{0,1,2,3} all use the helper3 calling
+ * convention; trailing slot args are ignored when not needed.
+ * CALL/CALLIR likewise -- dst+fn for CALL, fn-only for the
+ * ignore-result variant.  Stack-trace `pin` recording is
+ * skipped in the JIT'd path (interpreter only). */
+extern void (*jit_rt_arglist0_helper)(int64_t *L, int a, int b, int c);
+extern void (*jit_rt_arglist1_helper)(int64_t *L, int a, int b, int c);
+extern void (*jit_rt_arglist2_helper)(int64_t *L, int a, int b, int c);
+extern void (*jit_rt_arglist3_helper)(int64_t *L, int a, int b, int c);
+extern void (*jit_rt_call_helper)   (int64_t *L, int dst, int fn, int unused);
+extern void (*jit_rt_callir_helper) (int64_t *L, int fn,  int u1, int u2);
+
 /* SBC_CLOSURE.  Builds a closure object via the CLOSURE
  * allocator macro.  The third arg packs (dst<<32|idx<<16|size)
  * so the call fits in three integer-arg registers; the helper

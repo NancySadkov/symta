@@ -32,6 +32,64 @@ static void jit_rt_ld4_impl(int64_t *L, int dst, int src, int index) {
   L[dst] = (int64_t)base[index];
 }
 
+/* Trampoline helpers for SBC_ARGLIST0..3 + SBC_CALL/CALLIR.
+ *
+ * ARGLIST opcodes set up `api.args` for the upcoming CALL:
+ * ARGLIST(n) allocates an n-slot list and stores it in
+ * api.args; STARG(i, v) sets api.args[i] = v.  The CALL macro
+ * then dispatches to the closure's installed handler.
+ *
+ * The interpreter version of SBC_CALL also writes
+ *   api.frame->pin = pin
+ * before the CALL so a later stack trace can recover the
+ * caller's source line via the lineno side-table.  We skip
+ * that here -- the JIT'd code doesn't carry a `pin`, so
+ * stack frames from JIT'd callsites won't have row/col info.
+ * Trade-off acceptable for the coverage win; can revisit if
+ * traces from JIT'd code prove unusable. */
+static void jit_rt_arglist0_impl(int64_t *L, int a, int b, int c) {
+  (void)L; (void)a; (void)b; (void)c;
+  ARGLIST(0);
+}
+static void jit_rt_arglist1_impl(int64_t *L, int a, int b, int c) {
+  (void)b; (void)c;
+  ARGLIST(1);
+  STARG(0, ((dyn*)L)[a]);
+}
+static void jit_rt_arglist2_impl(int64_t *L, int a, int b, int c) {
+  (void)c;
+  ARGLIST(2);
+  STARG(0, ((dyn*)L)[a]);
+  STARG(1, ((dyn*)L)[b]);
+}
+static void jit_rt_arglist3_impl(int64_t *L, int a, int b, int c) {
+  ARGLIST(3);
+  STARG(0, ((dyn*)L)[a]);
+  STARG(1, ((dyn*)L)[b]);
+  STARG(2, ((dyn*)L)[c]);
+}
+static void jit_rt_call_impl(int64_t *L, int dst, int fn, int unused) {
+  (void)unused;
+  CALL(((dyn*)L)[dst], ((dyn*)L)[fn]);
+}
+static void jit_rt_callir_impl(int64_t *L, int fn, int u1, int u2) {
+  (void)u1; (void)u2;
+  dyn dummy;
+  CALL(dummy, ((dyn*)L)[fn]);
+}
+
+/* Trampoline helper for SBC_COPY.  Mirrors sbc.c:1153:
+ *   COPY(L[dst], dindex, L[src], sindex)
+ *   == LSET(L[dst], dindex, LGET(L[src], sindex))
+ * The two 16-bit field indices are packed in the 4th arg:
+ *   [31:16] = dindex (target field)
+ *   [15: 0] = sindex (source field) */
+static void jit_rt_copy_impl(int64_t *L, int dst, int src, int packed) {
+  int dindex = (packed >> 16) & 0xFFFF;
+  int sindex =  packed        & 0xFFFF;
+  COPY(((dyn*)L)[dst], dindex, ((dyn*)L)[src], sindex);
+}
+
 /* Trampoline helper for SBC_LIST.  Mirrors sbc.c:973:
  *   LIST(L[dst], size)  (== OBJECT(dst, T_LIST, size) == gc_alloc).
  * `size` is the number of slots in the new list, not a slot
@@ -76,7 +134,14 @@ static void jit_install_helpers_once(void) {
   jit_rt_ld4_helper     = jit_rt_ld4_impl;
   jit_rt_st4_helper     = jit_rt_st4_impl;
   jit_rt_list_helper    = jit_rt_list_impl;
+  jit_rt_copy_helper    = jit_rt_copy_impl;
   jit_rt_closure_helper = jit_rt_closure_impl;
+  jit_rt_arglist0_helper = jit_rt_arglist0_impl;
+  jit_rt_arglist1_helper = jit_rt_arglist1_impl;
+  jit_rt_arglist2_helper = jit_rt_arglist2_impl;
+  jit_rt_arglist3_helper = jit_rt_arglist3_impl;
+  jit_rt_call_helper     = jit_rt_call_impl;
+  jit_rt_callir_helper   = jit_rt_callir_impl;
 }
 
 /* Read a 24-bit little-endian unsigned int.  Mirrors the

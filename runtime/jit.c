@@ -367,6 +367,13 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_MOVE4  0x97    /* opr=u8; dst=opr&0xF src=opr>>4; L[dst]=L[src] */
 #define BC_CLOSURE 0x10   /* dst=u16 idx=u16 size=u8; L[dst]=CLOSURE(sbc->hooks[idx],size) */
 #define BC_LIST    0x12   /* dst=u16 size=u16; L[dst]=LIST(size) */
+#define BC_COPY    0x26   /* dst=u16 src=u16 dindex=u16 sindex=u16; COPY */
+#define BC_ARGLIST0 0x8A  /* opcode only; ARGLIST(0) */
+#define BC_ARGLIST1 0x8B  /* opcode + a(u8); ARGLIST(1) + STARG(0,L[a]) */
+#define BC_ARGLIST2 0x8C  /* opcode + a(u8) + b(u8) */
+#define BC_ARGLIST3 0x8D  /* opcode + a + b + c (u8 each) */
+#define BC_CALL     0x09  /* opcode + dst(u16) + fn(u16) */
+#define BC_CALLIR   0x0A  /* opcode + fn(u16); ignore return value */
 #define BC_JMP    0x04
 #define BC_JMP16  0x05    /* opcode + int16 PC-relative diff */
 #define BC_B      0x06
@@ -497,6 +504,13 @@ size_t  jit_last_fail_offset = 0;
 void (*jit_rt_ld4_helper)(int64_t *L, int dst, int src, int index) = NULL;
 void (*jit_rt_st4_helper)(int64_t *L, int dst, int src, int index) = NULL;
 void (*jit_rt_list_helper)(int64_t *L, int dst, int size, int unused) = NULL;
+void (*jit_rt_copy_helper)(int64_t *L, int dst, int src, int packed_indices) = NULL;
+void (*jit_rt_arglist0_helper)(int64_t *L, int a, int b, int c) = NULL;
+void (*jit_rt_arglist1_helper)(int64_t *L, int a, int b, int c) = NULL;
+void (*jit_rt_arglist2_helper)(int64_t *L, int a, int b, int c) = NULL;
+void (*jit_rt_arglist3_helper)(int64_t *L, int a, int b, int c) = NULL;
+void (*jit_rt_call_helper)   (int64_t *L, int dst, int fn, int u) = NULL;
+void (*jit_rt_callir_helper) (int64_t *L, int fn,  int u1, int u2) = NULL;
 void (*jit_rt_closure_helper)(int64_t *L, struct sbc_t *sbc,
                               uint64_t packed) = NULL;
 
@@ -677,6 +691,109 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint32_t size = (uint32_t)bc_rd16(bc + i + 3);
       jit_emit_call_helper3(b, (void*)jit_rt_list_helper, dst, size, 0);
       i += 5;
+      break;
+    }
+
+    case BC_ARGLIST0: {
+      if (!jit_rt_arglist0_helper) { jit_last_fail_opcode = op;
+                                     jit_last_fail_offset = i;
+                                     fail = 1; goto done; }
+      jit_emit_call_helper3(b, (void*)jit_rt_arglist0_helper, 0, 0, 0);
+      i += 1;
+      break;
+    }
+    case BC_ARGLIST1: {
+      if (i + 2 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_arglist1_helper) { jit_last_fail_opcode = op;
+                                     jit_last_fail_offset = i;
+                                     fail = 1; goto done; }
+      uint32_t a = bc[i + 1];
+      jit_emit_call_helper3(b, (void*)jit_rt_arglist1_helper, a, 0, 0);
+      i += 2;
+      break;
+    }
+    case BC_ARGLIST2: {
+      if (i + 3 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_arglist2_helper) { jit_last_fail_opcode = op;
+                                     jit_last_fail_offset = i;
+                                     fail = 1; goto done; }
+      uint32_t a = bc[i + 1];
+      uint32_t bb = bc[i + 2];
+      jit_emit_call_helper3(b, (void*)jit_rt_arglist2_helper, a, bb, 0);
+      i += 3;
+      break;
+    }
+    case BC_ARGLIST3: {
+      if (i + 4 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_arglist3_helper) { jit_last_fail_opcode = op;
+                                     jit_last_fail_offset = i;
+                                     fail = 1; goto done; }
+      uint32_t a = bc[i + 1];
+      uint32_t bb = bc[i + 2];
+      uint32_t c = bc[i + 3];
+      jit_emit_call_helper3(b, (void*)jit_rt_arglist3_helper, a, bb, c);
+      i += 4;
+      break;
+    }
+    case BC_CALL: {
+      /* SBC_CALL: opcode + dst(u16) + fn(u16).  The interpreter
+       * also writes `api.frame->pin = pin` for stack traces --
+       * we skip that here.  JIT'd code doesn't have a `pin`;
+       * trace frames will be missing row/col info but the
+       * function-frame chain itself is still walked correctly. */
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_call_helper) { jit_last_fail_opcode = op;
+                                 jit_last_fail_offset = i;
+                                 fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t fn  = (uint32_t)bc_rd16(bc + i + 3);
+      jit_emit_call_helper3(b, (void*)jit_rt_call_helper, dst, fn, 0);
+      i += 5;
+      break;
+    }
+    case BC_CALLIR: {
+      if (i + 3 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_callir_helper) { jit_last_fail_opcode = op;
+                                   jit_last_fail_offset = i;
+                                   fail = 1; goto done; }
+      uint32_t fn  = (uint32_t)bc_rd16(bc + i + 1);
+      jit_emit_call_helper3(b, (void*)jit_rt_callir_helper, fn, 0, 0);
+      i += 3;
+      break;
+    }
+
+    case BC_COPY: {
+      /* SBC_COPY: opcode + dst(u16) + src(u16) + dindex(u16) +
+       * sindex(u16).  Copies one slot from L[src]'s sindex-th
+       * field to L[dst]'s dindex-th field via LSET+LGET (lsetm
+       * write barrier).  Pack the two 16-bit field indices into
+       * one 32-bit arg so the call fits helper3.  Layout:
+       *   [31:16] = dindex
+       *   [15: 0] = sindex
+       */
+      if (i + 9 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_copy_helper) { jit_last_fail_opcode = op;
+                                 jit_last_fail_offset = i;
+                                 fail = 1; goto done; }
+      uint32_t dst    = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t src    = (uint32_t)bc_rd16(bc + i + 3);
+      uint32_t dindex = (uint32_t)bc_rd16(bc + i + 5);
+      uint32_t sindex = (uint32_t)bc_rd16(bc + i + 7);
+      uint32_t packed = (dindex << 16) | sindex;
+      jit_emit_call_helper3(b, (void*)jit_rt_copy_helper, dst, src, packed);
+      i += 9;
       break;
     }
 
