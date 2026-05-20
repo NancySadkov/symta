@@ -158,6 +158,32 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b);
 void jit_emit_call_abs(jit_buf *b, void *target);
 
 /* ============================================================
+ * Step 5c: 4-arg call trampoline.
+ *
+ * Emits the calling-convention-specific argument setup for a
+ * helper with C signature `void helper(int64_t *L, int dst,
+ * int a, int b)` and the indirect call to `target`.  Used by
+ * the JIT to defer opcodes it doesn't natively emit -- e.g.
+ * the untyped FXN* arith ops, MCALL dispatch, allocators --
+ * to runtime helpers that mirror the interpreter's behaviour.
+ *
+ * Slot indices are passed as 32-bit unsigned (mov r32, imm32
+ * zero-extends to 64).  The locals pointer is sourced from
+ * RBX (where the prologue stashed it) and copied into the
+ * platform's arg0 register.
+ *
+ * After the call returns:
+ *   RBX still holds L (callee-saved)
+ *   RAX holds the helper's return value (ignored for void)
+ *   Other caller-saved regs are clobbered
+ *
+ * Win64 ABI: RCX=L, RDX=dst, R8=a, R9=b.
+ * SysV  ABI: RDI=L, RSI=dst, RDX=a, RCX=b.
+ * ============================================================ */
+void jit_emit_call_helper3(jit_buf *b, void *target,
+                           uint32_t slot_dst, uint32_t slot_a, uint32_t slot_b);
+
+/* ============================================================
  * Step 4: SBC bytecode -> x86 translator.
  *
  * Walks `n` bytes of SBC bytecode starting at `bc` and emits an

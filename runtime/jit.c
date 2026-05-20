@@ -370,6 +370,17 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_FXN8   0x2C    /* dst=RD16; L[dst]=FXN(int8) */
 #define BC_FXN16  0x2D    /* dst=RD16; L[dst]=FXN(int16) */
 #define BC_FXN32  0x2E    /* dst=RD16; L[dst]=FXN(int32) */
+/* Untyped (dyn) tagged-arith family -- bit-for-bit math on
+ * tagged values.  These were the pre-TS-4 default; the JIT
+ * dispatches them via the C-runtime trampoline because the
+ * inline encoding without static type info is non-trivial
+ * (FXNMUL needs a runtime untag depending on operand shape;
+ * cleanest to defer to the existing macros). */
+#define BC_FXNADD 0x39
+#define BC_FXNSUB 0x3A
+#define BC_FXNMUL 0x3B
+#define BC_FXNDIV 0x3C
+#define BC_FXNREM 0x3D
 #define BC_IADD   0xA3
 #define BC_ISUB   0xA4
 #define BC_IMUL   0xA5
@@ -404,6 +415,43 @@ static void emit_mov_rax_imm64(jit_buf *b, uint64_t imm) {
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0xb8);
   for (int k = 0; k < 8; k++) jit_emit_u8(b, (uint8_t)(imm >> (k * 8)));
+}
+
+/* ============================================================
+ * Step 5c runtime helpers (called from JIT'd code).
+ *
+ * Each helper mirrors one of the FXN* macros in runtime/symta.h
+ * but in function form so the JIT can defer the opcode via a
+ * trampolined call instead of inlining the encoding.  All five
+ * take (L, dst, a, b) and write L[dst]; the return value is
+ * ignored (Win64 RAX, SysV RAX -- both writable, no caller-side
+ * cost).
+ *
+ * Kept here (rather than in symta.h's macro form) because the
+ * JIT needs function-pointer targets and the macros aren't
+ * addressable.  Semantics must stay bit-identical with the
+ * macros -- divergence would silently desync interpreter and
+ * JIT for any function the JIT defers. */
+void jit_rt_fxnadd(int64_t *L, int dst, int a, int b) {
+  L[dst] = L[a] + L[b];
+}
+void jit_rt_fxnsub(int64_t *L, int dst, int a, int b) {
+  L[dst] = L[a] - L[b];
+}
+void jit_rt_fxnmul(int64_t *L, int dst, int a, int b) {
+  /* FXNMUL: dst = UNFXN(a) * b -- the >> 16 detags one side so
+   * the product has exactly one tag's worth of low-zero bits.
+   * GID_SHFT = TAG_BITS = 16 (runtime/symta.h). */
+  L[dst] = (L[a] >> 16) * L[b];
+}
+void jit_rt_fxndiv(int64_t *L, int dst, int a, int b) {
+  /* FXNDIV: dst = FXN(a / b) -- integer-div the tagged values
+   * (tags cancel), then re-tag.  No zero check; relies on the
+   * existing SEH/SIGFPE handler. */
+  L[dst] = (L[a] / L[b]) << 16;
+}
+void jit_rt_fxnrem(int64_t *L, int dst, int a, int b) {
+  L[dst] = L[a] % L[b];
 }
 
 /* L[dst] = FXN(imm).  Tagged-int store via mov rax, imm64; mov [rbx+dst*8], rax.
@@ -476,6 +524,31 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
         case BC_ILTE: jit_emit_ilte(b, dst, a, x); break;
         case BC_IGTE: jit_emit_igte(b, dst, a, x); break;
       }
+      i += 7;
+      break;
+    }
+
+    case BC_FXNADD: case BC_FXNSUB: case BC_FXNMUL:
+    case BC_FXNDIV: case BC_FXNREM: {
+      /* Same operand format as the I* family.  These differ
+       * only at the dispatch level: the JIT trampolines them
+       * to runtime helpers instead of inlining the encoding.
+       * Used when static type info isn't available at SBC
+       * emission time. */
+      if (i + 7 > n) { fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t a   = (uint32_t)bc_rd16(bc + i + 3);
+      uint32_t x   = (uint32_t)bc_rd16(bc + i + 5);
+      void *helper;
+      switch (op) {
+        case BC_FXNADD: helper = (void*)jit_rt_fxnadd; break;
+        case BC_FXNSUB: helper = (void*)jit_rt_fxnsub; break;
+        case BC_FXNMUL: helper = (void*)jit_rt_fxnmul; break;
+        case BC_FXNDIV: helper = (void*)jit_rt_fxndiv; break;
+        case BC_FXNREM: helper = (void*)jit_rt_fxnrem; break;
+        default: helper = NULL;  /* unreachable */
+      }
+      jit_emit_call_helper3(b, helper, dst, a, x);
       i += 7;
       break;
     }
@@ -688,6 +761,67 @@ void jit_emit_call_abs(jit_buf *b, void *target) {
   /* call rax :  ff d0 (ModR/M 11 010 000, /2=call, r/m=rax) */
   jit_emit_u8(b, 0xff);
   jit_emit_u8(b, 0xd0);
+}
+
+/* Step 5c helpers: per-platform mov r32, imm32 emitters.
+ *
+ * The opcode is b8+reg for the basic 8 GPRs (eax..edi).  The
+ * R8..R15 variants need a REX.B prefix (0x41).  Writing to a
+ * 32-bit subregister zero-extends to the full 64-bit reg, so
+ * slot indices stay positive in the high half. */
+#ifdef _WIN32
+/* mov ecx, imm32  (arg1 register: actually arg0 on Win64).
+ * Used by emit_mov_arg0_from_locals; not used here for arg
+ * setup -- helpers below set RCX/RDX/R8/R9. */
+static void emit_mov_arg1_imm32(jit_buf *b, uint32_t imm) {
+  /* mov edx, imm32 : ba ll ll ll ll */
+  jit_emit_u8(b, 0xba);
+  jit_emit_u32(b, imm);
+}
+static void emit_mov_arg2_imm32(jit_buf *b, uint32_t imm) {
+  /* mov r8d, imm32 : 41 b8 ll ll ll ll  (REX.B for R8) */
+  jit_emit_u8(b, 0x41);
+  jit_emit_u8(b, 0xb8);
+  jit_emit_u32(b, imm);
+}
+static void emit_mov_arg3_imm32(jit_buf *b, uint32_t imm) {
+  /* mov r9d, imm32 : 41 b9 ll ll ll ll  (REX.B for R9) */
+  jit_emit_u8(b, 0x41);
+  jit_emit_u8(b, 0xb9);
+  jit_emit_u32(b, imm);
+}
+#else
+/* SysV: arg1=RSI, arg2=RDX, arg3=RCX. */
+static void emit_mov_arg1_imm32(jit_buf *b, uint32_t imm) {
+  /* mov esi, imm32 : be ll ll ll ll */
+  jit_emit_u8(b, 0xbe);
+  jit_emit_u32(b, imm);
+}
+static void emit_mov_arg2_imm32(jit_buf *b, uint32_t imm) {
+  /* mov edx, imm32 : ba ll ll ll ll */
+  jit_emit_u8(b, 0xba);
+  jit_emit_u32(b, imm);
+}
+static void emit_mov_arg3_imm32(jit_buf *b, uint32_t imm) {
+  /* mov ecx, imm32 : b9 ll ll ll ll */
+  jit_emit_u8(b, 0xb9);
+  jit_emit_u32(b, imm);
+}
+#endif
+
+void jit_emit_call_helper3(jit_buf *b, void *target,
+                           uint32_t slot_dst, uint32_t slot_a, uint32_t slot_b) {
+  /* Arg setup order matters only if the target functions touched
+   * the registers we're setting up.  Since we're loading
+   * IMMEDIATES (not register-to-register copies), the order is
+   * irrelevant -- pick the layout that minimises register
+   * dependency reads.  We load arg0 last because it depends on
+   * RBX and the imm32 movs don't touch RBX. */
+  emit_mov_arg1_imm32(b, slot_dst);   /* dst */
+  emit_mov_arg2_imm32(b, slot_a);     /* a   */
+  emit_mov_arg3_imm32(b, slot_b);     /* b   */
+  jit_emit_mov_arg0_from_locals(b);   /* L   */
+  jit_emit_call_abs(b, target);
 }
 
 /* ============================================================
@@ -1461,6 +1595,92 @@ static int step5b_immediates(void) {
   return fail;
 }
 
+/* Step 5c proof: untyped FXN* opcodes dispatch through C
+ * runtime helpers via the step-3 trampoline.  Verifies (a)
+ * the 4-arg call sequence sets up registers correctly,
+ * (b) the helpers mutate L through the L pointer, (c) RBX
+ * survives across multiple back-to-back helper calls, and
+ * (d) the helper-routed semantics match the inline-emitted
+ * I* family bit-for-bit. */
+static int step5c_fxn_trampoline(void) {
+  int fail = 0;
+
+  /* All-FXN* program: do every untyped arith op once.
+   *   bc[ 0..3 ]: FXN8 dst=0, imm=20
+   *   bc[ 4..7 ]: FXN8 dst=1, imm=7
+   *   bc[ 8..14]: FXNADD L[2] = L[0] + L[1]
+   *   bc[15..21]: FXNSUB L[3] = L[0] - L[1]
+   *   bc[22..28]: FXNMUL L[4] = L[0] * L[1]
+   *   bc[29..35]: FXNDIV L[5] = L[0] / L[1]
+   *   bc[36..42]: FXNREM L[6] = L[0] % L[1]
+   *   bc[43..45]: LEAVE L[2]
+   */
+  static const uint8_t bc_all_fxn[] = {
+    BC_FXN8, 0,0, 20,
+    BC_FXN8, 1,0, 7,
+    BC_FXNADD, 2,0, 0,0, 1,0,
+    BC_FXNSUB, 3,0, 0,0, 1,0,
+    BC_FXNMUL, 4,0, 0,0, 1,0,
+    BC_FXNDIV, 5,0, 0,0, 1,0,
+    BC_FXNREM, 6,0, 0,0, 1,0,
+    BC_LEAVE, 2,0,
+  };
+  jit_buf *b = jit_translate(bc_all_fxn, sizeof(bc_all_fxn));
+  if (!b) { printf("FAIL  step5c all-FXN returned NULL\n"); return 1; }
+  int64_t (*fn)(int64_t*) = (int64_t(*)(int64_t*))jit_buf_finalize(b);
+
+  int64_t L[10] = {0};
+  int64_t ret = fn(L);
+  fail += check("FXNADD 20+7",  L[2], TEST_FXN(27));
+  fail += check("FXNSUB 20-7",  L[3], TEST_FXN(13));
+  fail += check("FXNMUL 20*7",  L[4], TEST_FXN(140));
+  fail += check("FXNDIV 20/7",  L[5], TEST_FXN(2));
+  fail += check("FXNREM 20%7",  L[6], TEST_FXN(6));
+  fail += check("LEAVE -> L[2]", ret,  TEST_FXN(27));
+  jit_buf_free(b);
+
+  /* Mixed I* + FXN* program: prove typed and trampolined paths
+   * compose cleanly within the same function -- L stays
+   * accessible across helper calls via RBX. */
+  static const uint8_t bc_mixed[] = {
+    BC_FXN8, 0,0, 10,
+    BC_FXN8, 1,0, 3,
+    BC_IADD,   2,0, 0,0, 1,0,    /* typed   L[2] = L[0] + L[1] = 13 */
+    BC_FXNMUL, 3,0, 0,0, 1,0,    /* untyped L[3] = L[0] * L[1] = 30 */
+    BC_IADD,   4,0, 2,0, 3,0,    /* typed   L[4] = L[2] + L[3] = 43 */
+    BC_LEAVE, 4,0,
+  };
+  jit_buf *b2 = jit_translate(bc_mixed, sizeof(bc_mixed));
+  if (!b2) { printf("FAIL  step5c mixed returned NULL\n"); return 1; }
+  int64_t (*fn2)(int64_t*) = (int64_t(*)(int64_t*))jit_buf_finalize(b2);
+
+  int64_t L2[10] = {0};
+  int64_t ret2 = fn2(L2);
+  fail += check("mixed I+F: L[2] = 10+3 (I)",   L2[2], TEST_FXN(13));
+  fail += check("mixed I+F: L[3] = 10*3 (F)",   L2[3], TEST_FXN(30));
+  fail += check("mixed I+F: L[4] = 13+30 (I)",  L2[4], TEST_FXN(43));
+  fail += check("mixed I+F: ret = L[4]",        ret2,  TEST_FXN(43));
+  jit_buf_free(b2);
+
+  /* Negative-operand FXNMUL via trampoline -- exercises the
+   * sign-handling >> 16 inside jit_rt_fxnmul. */
+  static const uint8_t bc_neg[] = {
+    BC_FXN8, 0,0, (uint8_t)(int8_t)-6,
+    BC_FXN8, 1,0, 4,
+    BC_FXNMUL, 2,0, 0,0, 1,0,
+    BC_LEAVE, 2,0,
+  };
+  jit_buf *b3 = jit_translate(bc_neg, sizeof(bc_neg));
+  if (!b3) { printf("FAIL  step5c neg returned NULL\n"); return 1; }
+  int64_t (*fn3)(int64_t*) = (int64_t(*)(int64_t*))jit_buf_finalize(b3);
+  int64_t L3[10] = {0};
+  int64_t ret3 = fn3(L3);
+  fail += check("FXNMUL -6*4", ret3, TEST_FXN(-24));
+  jit_buf_free(b3);
+
+  return fail;
+}
+
 int main(void) {
   int fail = 0;
   printf("=== step 0: hand-coded add ===\n");
@@ -1481,6 +1701,8 @@ int main(void) {
   fail += step5_branches();
   printf("\n=== step 5b: immediate-loads + relative branches ===\n");
   fail += step5b_immediates();
+  printf("\n=== step 5c: FXN* trampolines (untyped arith) ===\n");
+  fail += step5c_fxn_trampoline();
   if (fail) {
     fprintf(stderr, "\n%d check(s) failed\n", fail);
     return 1;
