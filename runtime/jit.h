@@ -55,4 +55,29 @@ void *jit_buf_finalize(jit_buf *b);
 /* Release the mapping.  Pass NULL safely. */
 void jit_buf_free(jit_buf *b);
 
+/* ============================================================
+ * Step 1: typed-int arithmetic emitters.
+ *
+ * Each emitter generates the x86_64 sequence equivalent to one
+ * SBC_I{ADD,SUB,MUL,DIV,REM} opcode, operating on a `dyn *L`
+ * locals array passed as the function's first integer argument.
+ * `a` and `b` are slot indices (0..65535, matching SBC RD16).
+ *
+ * On Win64 the locals pointer arrives in RCX; on SysV in RDI.
+ * The emitters pick the right addressing mode via #ifdef _WIN32.
+ *
+ * Semantics mirror the FXN* macros in runtime/symta.h:
+ *   IADD/ISUB/IREM   bit-for-bit on the tagged values
+ *   IMUL             UNFXN(a) * b  (one side detagged first)
+ *   IDIV             FXN(a / b)    (re-tag the integer quotient)
+ *
+ * Use `jit_emit_ret` to close the emitted function.
+ * ============================================================ */
+void jit_emit_iadd(jit_buf *b, int dst, int a, int x);
+void jit_emit_isub(jit_buf *b, int dst, int a, int x);
+void jit_emit_imul(jit_buf *b, int dst, int a, int x);
+void jit_emit_idiv(jit_buf *b, int dst, int a, int x);
+void jit_emit_irem(jit_buf *b, int dst, int a, int x);
+void jit_emit_ret(jit_buf *b);
+
 #endif
