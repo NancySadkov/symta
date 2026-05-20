@@ -176,6 +176,45 @@ static void emit_add_rax_from_slot(jit_buf *b, int slot) {
   emit_mem_op(b, 0, slot);
 }
 
+/* or rax, [locals_reg + slot*8] -- combines tag bits across two
+ * operands so a single tag check covers both.  Used for the
+ * inline fast path of FXN-arith / FXN-cmp: if (aa|bb) has any
+ * tag bits set, fall through to the helper. */
+static void emit_or_rax_from_slot(jit_buf *b, int slot) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x0b);  /* opcode: or r64, r/m64 */
+  emit_mem_op(b, 0, slot);
+}
+
+/* test ax, ax -- 3 bytes (66 85 C0).  Sets ZF iff low 16 bits
+ * of RAX are zero, i.e. the value is FXN-tagged int (T_INT=0).
+ * For any other tag, at least one of the low 15 tag bits is set
+ * (FLG_BITS=1, TAG_BITS=16, so the tag lives in bits 1..15). */
+static void emit_test_ax_ax(jit_buf *b) {
+  jit_emit_u8(b, 0x66);  /* operand-size override -> 16-bit */
+  jit_emit_u8(b, 0x85);  /* opcode: test r16, r16 */
+  jit_emit_u8(b, 0xc0);  /* ModR/M: AX, AX */
+}
+
+/* add rax, imm32 -- sign-extended.  6 bytes (48 05 imm32).
+ * Uses the RAX-specific short form. */
+static void emit_add_rax_imm32(jit_buf *b, int32_t imm) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x05);
+  jit_emit_u32(b, (uint32_t)imm);
+}
+
+/* jnz rel32 -- 6 bytes (0F 85 + 4-byte rel).  Returns the
+ * offset of the 4-byte displacement field for later patching
+ * via jit_patch_jmp_here.  Mirrors jit_emit_jmp's contract. */
+static size_t emit_jnz_rel32(jit_buf *b) {
+  jit_emit_u8(b, 0x0f);
+  jit_emit_u8(b, 0x85);
+  size_t patch = b->len;
+  jit_emit_u32(b, 0);
+  return patch;
+}
+
 /* sub rax, [locals_reg + slot*8] */
 static void emit_sub_rax_from_slot(jit_buf *b, int slot) {
   jit_emit_u8(b, 0x48);
@@ -1349,11 +1388,20 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     case BC_FXNADD: case BC_FXNSUB: case BC_FXNMUL:
     case BC_FXNDIV: case BC_FXNREM:
     case BC_FXNLT:  case BC_FXNGT:  case BC_FXNLTE: case BC_FXNGTE: {
-      /* Same operand format as the I* family.  These differ
-       * only at the dispatch level: the JIT trampolines them
-       * to runtime helpers instead of inlining the encoding.
-       * Used when static type info isn't available at SBC
-       * emission time. */
+      /* Same wire shape as the I* family: opcode + dst(u16) +
+       * a(u16) + b(u16) = 7 bytes.  The interpreter's body for
+       * each of these is:
+       *   if (TAGIS(T_INT, L[a]) && TAGIS(T_INT, L[b]))
+       *     <typed-arith>(L[dst], L[a], L[b]);
+       *   else
+       *     ARGLIST2(L[a],L[b]); MCALL(L[dst], L[a], m_*);
+       *
+       * The JIT inlines the fast path (typed arith using the
+       * existing jit_emit_iadd/isub/imul/idiv/irem/ilt/...
+       * primitives, same code IADD/ILT emit) and only falls
+       * through to a helper call on the non-int slow path.
+       * For a tight counted loop the per-iter savings are
+       * roughly one helper call (~3-5 ns) per arith op. */
       if (i + 7 > n) { fail = 1; goto done; }
       uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
       uint32_t a   = (uint32_t)bc_rd16(bc + i + 3);
@@ -1374,17 +1422,46 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       if (!helper) { jit_last_fail_opcode = op;
                      jit_last_fail_offset = i;
                      fail = 1; goto done; }
+
+      /* Tag-check: if (L[a] | L[b]) has any tag bits set, take
+       * the slow path.  Combining via OR means one test covers
+       * both operands -- low-16 bits stay zero iff both are
+       * T_INT (FXN(x) = x<<16). */
+      emit_mov_rax_from_slot(b, a);
+      emit_or_rax_from_slot(b, x);
+      emit_test_ax_ax(b);
+      size_t to_slow = emit_jnz_rel32(b);
+
+      /* Fast path: emit the typed arith / cmp.  jit_emit_iadd
+       * etc. reload from slots so the OR-clobbered rax isn't a
+       * problem. */
+      switch (op) {
+        case BC_FXNADD: jit_emit_iadd(b, dst, a, x); break;
+        case BC_FXNSUB: jit_emit_isub(b, dst, a, x); break;
+        case BC_FXNMUL: jit_emit_imul(b, dst, a, x); break;
+        case BC_FXNDIV: jit_emit_idiv(b, dst, a, x); break;
+        case BC_FXNREM: jit_emit_irem(b, dst, a, x); break;
+        case BC_FXNLT:  jit_emit_ilt (b, dst, a, x); break;
+        case BC_FXNGT:  jit_emit_igt (b, dst, a, x); break;
+        case BC_FXNLTE: jit_emit_ilte(b, dst, a, x); break;
+        case BC_FXNGTE: jit_emit_igte(b, dst, a, x); break;
+      }
+      size_t to_done = jit_emit_jmp(b);
+
+      /* Slow path. */
+      jit_patch_jmp_here(b, to_slow);
       b->pending_helper_id = hid;
       jit_emit_call_helper3(b, helper, dst, a, x);
+      jit_patch_jmp_here(b, to_done);
       i += 7;
       break;
     }
 
-    case BC_FXNTAG: case BC_NOT: case BC_GOT: case BC_NO:
-    case BC_INC: case BC_DEC: {
-      /* All 6 share: opcode + dst(u16) + src/a(u16) = 5 bytes.
+    case BC_FXNTAG: case BC_NOT: case BC_GOT: case BC_NO: {
+      /* All 4 share: opcode + dst(u16) + src(u16) = 5 bytes.
        * FXNTAG returns FXN(O_TAG(src)); NOT/GOT/NO return FXN(0)
-       * or FXN(1); INC/DEC are typed +/-1 with MCALL fallback. */
+       * or FXN(1) based on truthy / No comparison.  Pure
+       * helper-call trampolines -- no fast-path inline. */
       if (i + 5 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
@@ -1396,8 +1473,6 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
         case BC_NOT:    helper = (void*)jit_rt_not_helper;    hid = JIT_HELPER_NOT;    break;
         case BC_GOT:    helper = (void*)jit_rt_got_helper;    hid = JIT_HELPER_GOT;    break;
         case BC_NO:     helper = (void*)jit_rt_no_helper;     hid = JIT_HELPER_NO;     break;
-        case BC_INC:    helper = (void*)jit_rt_inc_helper;    hid = JIT_HELPER_INC;    break;
-        case BC_DEC:    helper = (void*)jit_rt_dec_helper;    hid = JIT_HELPER_DEC;    break;
         default: helper = NULL; hid = JIT_HELPER_NONE;
       }
       if (!helper) { jit_last_fail_opcode = op;
@@ -1405,6 +1480,65 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
                      fail = 1; goto done; }
       b->pending_helper_id = hid;
       jit_emit_call_helper3(b, helper, dst, src, 0);
+      i += 5;
+      break;
+    }
+
+    case BC_INC: case BC_DEC: {
+      /* SBC_INC / SBC_DEC: typed +/-1 with MCALL fallback.
+       * Inline the T_INT fast path so per-iteration overhead in
+       * counted loops is a single ADD instruction instead of a
+       * call into jit_rt_inc_helper.  Bytecode wire shape:
+       * opcode + dst(u16) + a(u16) = 5 bytes.
+       *
+       * Inline x86 (8 instructions, ~32 bytes):
+       *   mov  rax, [rbx + a*8]      ; load aa
+       *   test ax, ax                 ; tag check (T_INT == 0)
+       *   jnz  slow                   ; non-int -> helper
+       *   add  rax, +/- 0x10000       ; FXN(1) for INC, -FXN(1) for DEC
+       *   mov  [rbx + dst*8], rax
+       *   jmp  done
+       * slow:
+       *   ... helper call ...         ; ~30 bytes
+       * done:
+       *
+       * The fast path is roughly 6 cycles vs ~5-10 ns for the
+       * helper call.  In a tight counted loop (10^9 iters) the
+       * difference is ~5 s of wall time. */
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      void *helper; jit_helper_id_t hid;
+      int32_t delta;
+      switch (op) {
+        case BC_INC: helper = (void*)jit_rt_inc_helper;
+                     hid = JIT_HELPER_INC;
+                     delta = 0x10000;    /* FXN(1) */
+                     break;
+        case BC_DEC: helper = (void*)jit_rt_dec_helper;
+                     hid = JIT_HELPER_DEC;
+                     delta = -0x10000;   /* -FXN(1) */
+                     break;
+        default: helper = NULL; hid = JIT_HELPER_NONE; delta = 0;
+      }
+      if (!helper) { jit_last_fail_opcode = op;
+                     jit_last_fail_offset = i;
+                     fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t a   = (uint32_t)bc_rd16(bc + i + 3);
+
+      emit_mov_rax_from_slot(b, a);
+      emit_test_ax_ax(b);
+      size_t to_slow = emit_jnz_rel32(b);
+      /* Fast path: aa is FXN-tagged int. */
+      emit_add_rax_imm32(b, delta);
+      emit_mov_slot_from_rax(b, dst);
+      size_t to_done = jit_emit_jmp(b);
+      /* Slow path. */
+      jit_patch_jmp_here(b, to_slow);
+      b->pending_helper_id = hid;
+      jit_emit_call_helper3(b, helper, dst, a, 0);
+      jit_patch_jmp_here(b, to_done);
       i += 5;
       break;
     }
