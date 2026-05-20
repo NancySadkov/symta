@@ -592,17 +592,17 @@ text.get = get_file_ Me
 text.getText = get_text_file_ Me
 text.lines = $getText.rows
 text.set Value =
-| if Value.is_text then set_text_file_ Me Value else set_file_ Me Value.bytes
-| 0
+  if Value.is_text then set_text_file_ Me Value else set_file_ Me Value.bytes
+  0
 text.exists = file_exists_ Me
 text.time = file_time_ Me
 text.mkpath = mkpath_ Me
 
 
 text.paths @As =
-| Path if '/' >< $~ then Me else "[Me]/"
-| Xs if As.n then $items(all) else $items
-| map X Xs "[Path][X]"
+  Path if '/' >< $~ then Me else "[Me]/"
+  Xs if As.n then $items(all) else $items
+  map X Xs "[Path][X]"
 
 text.urls = Me.paths{url}
 
@@ -626,19 +626,19 @@ text.url =
 | [Folder Name Ext]
 
 list.unurl =
-| [Folder Name Ext] Me
-| when Ext <> '': Ext =  ".[Ext]"
-| "[Folder][Name][Ext]"
+  [Folder Name Ext] Me
+  when Ext <> '': Ext =  ".[Ext]"
+  "[Folder][Name][Ext]"
 
 list.take N =
-| @"First N elements of a list.  Returns the whole list if N >= length."
-| dup N: Me^pop
+  @"First N elements of a list.  Returns the whole list if N >= length."
+  dup N: Me^pop
 hard_list.take N = dup I N $I
 
 list.drop N =
-| @"All elements after the first N.  Returns empty if N >= length."
-| times I N Me^pop
-| Me
+  @"All elements after the first N.  Returns empty if N >= length."
+  times I N Me^pop
+  Me
 
 hard_list.drop S = dup $n-S: Me.|S+
 
@@ -729,22 +729,22 @@ _.rmap F = F(Me)
 list.rmap F = map X Me X.rmap(F)
 
 list.infix Item =
-| @"Insert a value between every two adjacent elements.
+  @"Insert a value between every two adjacent elements.
 Example:  \[\\a \\b \\c\].infix(\\sep)   // (a sep b sep c)"
-| N $n*2-1
-| if N < 0 then [] else dup I N: if I%2 then Item else Me^pop
+  N $n*2-1
+  if N < 0 then [] else dup I N: if I%2 then Item else Me^pop
 
 list.locate F =
-| @"Return the INDEX of the first matching element, or No."
-| less F.is_fn: F = (X => F >< X)
-| for (I 0; not $end; I+): when F(Me^pop): ret   I
+  @"Return the INDEX of the first matching element, or No."
+  less F.is_fn: F = (X => F >< X)
+  for (I 0; not $end; I+): when F(Me^pop): ret   I
 
 hard_list.locate F =
-| if F.is_fn then times I $n: when F($I): ret   I
+  if F.is_fn then times I $n: when F($I): ret   I
   else times I $n: when F >< $I: ret   I
 
 text.locate F =
-| if F.is_fn then times I $n: when F($I): ret   I
+  if F.is_fn then times I $n: when F($I): ret   I
   else times I $n: when F >< $I: ret   I
 
 list.find F =
