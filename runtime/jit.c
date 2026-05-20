@@ -406,6 +406,8 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_FATAL   0x5C    /* msg=u16; longjmp via fatal((char*)L[msg]) */
 #define BC_FXNLGET 0x34    /* dst=u16 src=u16 index=u16 mcache=u16 */
 #define BC_MOVEIM  0x21    /* dst=u16 src=u24; L[dst]=sbc->im[src] */
+#define BC_MOVEMT  0x1F    /* dst=u16 src=u24; L[dst]=FXN(sbc->mt[src]) */
+#define BC_MOVEMT8 0x20    /* dst=u8  src=u8;  L[dst]=FXN(sbc->mt[src]) */
 #define BC_INC     0x9E    /* dst=u16 a=u16; INC(L[dst], L[a]) */
 #define BC_DEC     0x9F    /* dst=u16 a=u16; DEC(L[dst], L[a]) */
 #define BC_LOAD   0x24    /* dst=u16 src=u16 index=u16; L[dst]=O_PTR(L[src])[index] */
@@ -614,6 +616,8 @@ void (*jit_rt_moveim_helper)(int64_t *L, struct sbc_t *sbc,
                              uint64_t packed) = NULL;
 void (*jit_rt_inc_helper)(int64_t *L, int dst, int a, int u) = NULL;
 void (*jit_rt_dec_helper)(int64_t *L, int dst, int a, int u) = NULL;
+void (*jit_rt_movemt_helper)(int64_t *L, struct sbc_t *sbc,
+                             uint64_t packed) = NULL;
 
 /* Step 8: platform-aware default for the AOT pipeline.  Windows
  * has SEH unwind registered (step 5n) so longjmp through native
@@ -1324,6 +1328,37 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       b->pending_helper_id = JIT_HELPER_MOVEIM;
       jit_emit_call_with_sbc(b, (void*)jit_rt_moveim_helper, packed);
       i += 6;
+      break;
+    }
+
+    case BC_MOVEMT: case BC_MOVEMT8: {
+      /* SBC_MOVEMT (0x1F): opcode + dst(u16) + src(u24) = 6 bytes.
+       * SBC_MOVEMT8 (0x20): opcode + dst(u8) + src(u8)  = 3 bytes.
+       * Both: L[dst] = FXN(sbc->mt[src]).  Same packed layout as
+       * MOVEIM ([15:0]=dst, [39:16]=src); a single shared helper
+       * handles either wire width. */
+      int wide = (op == BC_MOVEMT);
+      int op_len = wide ? 6 : 3;
+      if (i + op_len > n) { jit_last_fail_opcode = op;
+                            jit_last_fail_offset = i;
+                            fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_movemt_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t dst, src;
+      if (wide) {
+        dst = (uint64_t)bc_rd16(bc + i + 1);
+        src = (uint64_t)bc_rd24(bc + i + 3);
+      } else {
+        dst = bc[i + 1];
+        src = bc[i + 2];
+      }
+      uint64_t packed = (src << 16) | dst;
+      b->pending_helper_id = JIT_HELPER_MOVEMT;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_movemt_helper, packed);
+      i += op_len;
       break;
     }
 

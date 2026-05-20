@@ -454,6 +454,14 @@ static void jit_rt_moveim_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
   ((dyn*)L)[dst] = sbc->im[src];
 }
 
+/* SBC_MOVEMT / SBC_MOVEMT8: L[dst] = FXN(sbc->mt[src]).  Method-
+ * id table lookup; same packed layout as MOVEIM. */
+static void jit_rt_movemt_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t dst = (uint32_t)(packed & 0xFFFF);
+  uint32_t src = (uint32_t)((packed >> 16) & 0xFFFFFF);
+  ((dyn*)L)[dst] = (dyn)(int64_t)FXN(sbc->mt[src]);
+}
+
 /* SBC_INC / SBC_DEC: T_INT fast path = FXNADD/SUB(_, _, FXN(1)),
  * else MCALL m_inc / m_dec.  Helper3 sig: (L, dst, a, _). */
 static void jit_rt_inc_impl(int64_t *L, int dst, int a, int u) {
@@ -617,6 +625,7 @@ static void jit_install_helpers_once(void) {
   jit_rt_moveim_helper   = jit_rt_moveim_impl;
   jit_rt_inc_helper      = jit_rt_inc_impl;
   jit_rt_dec_helper      = jit_rt_dec_impl;
+  jit_rt_movemt_helper   = jit_rt_movemt_impl;
 }
 
 void jit_install_helpers_public(void) {
@@ -671,6 +680,7 @@ void *jit_helper_pointer(int helper_id) {
     case JIT_HELPER_MOVEIM:   return (void*)jit_rt_moveim_helper;
     case JIT_HELPER_INC:      return (void*)jit_rt_inc_helper;
     case JIT_HELPER_DEC:      return (void*)jit_rt_dec_helper;
+    case JIT_HELPER_MOVEMT:   return (void*)jit_rt_movemt_helper;
     default:                  return NULL;
   }
 }

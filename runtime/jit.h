@@ -92,6 +92,7 @@ typedef enum {
   JIT_HELPER_MOVEIM   = 38,
   JIT_HELPER_INC      = 39,
   JIT_HELPER_DEC      = 40,
+  JIT_HELPER_MOVEMT   = 41,
   JIT_HELPER_MAX
 } jit_helper_id_t;
 
@@ -467,6 +468,12 @@ extern void (*jit_rt_no_helper)  (int64_t *L, int dst, int src, int u);
  * goes via the call_with_sbc trampoline.  Packed: [15:0]=dst,
  * [39:16]=src (24-bit). */
 extern void (*jit_rt_moveim_helper)(int64_t *L, struct sbc_t *sbc,
+                                    uint64_t packed);
+
+/* SBC_MOVEMT / SBC_MOVEMT8: L[dst] = FXN(sbc->mt[src]).  Pulls
+ * a method-id from the per-SBC method table.  Packed format
+ * identical to MOVEIM. */
+extern void (*jit_rt_movemt_helper)(int64_t *L, struct sbc_t *sbc,
                                     uint64_t packed);
 
 /* SBC_INC / SBC_DEC: T_INT fast path = FXNADD/SUB(_,_,FXN(1));
