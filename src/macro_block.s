@@ -737,11 +737,27 @@ expand_block Xs =
       Else = push X Ys
   less Ms.end: push Ms.f^make_multimethod Ys
   Xs = Ys.f
+  // TS-4.3c: sideband typed-decl channel.  expand_block_item
+  // EAGERLY mexes each item; without this, a later item that
+  // uses an earlier item's typed-decl var sees it untyped and
+  // bin_op falls to FXNADD.  After each item's mex, scan its
+  // result for `[VarName <typed-expr>]` declarations and push
+  // the type into GVarsTypes so subsequent items see it at
+  // mex time.  Restore all pushes at end-of-block (stack-style
+  // -- Pushed holds [Var OldType] pairs, most-recent first).
+  Pushed []
   Xs = map X Xs:
     Src when X.is_meta: X.meta_
     Rs let GSrc (if got Src then Src else GSrc):
           expand_block_item X
     when X.is_meta: Rs =  map R Rs: meta R X.meta_
+    for Item Rs:
+      case Item [A B]:
+        when A.is_text and not A.is_keyword:
+          | InferredType infer_declared_type B
+          | when got InferredType:
+            | push [A GVarsTypes.A] Pushed
+            | GVarsTypes.A =  InferredType
     Rs
   Xs = Xs.j
   R:
@@ -752,6 +768,9 @@ expand_block Xs =
   R = [_progn @R]
   Bs Xs.keep(X => X.0.is_keyword)
   when Bs.n: R =  [let_ (map B Bs [B.0 No]) R]
+  // TS-4.3c: restore.  Pushed is most-recent first, so iterating
+  // it pops the most-recent shadow correctly.
+  for [V OldT] Pushed: GVarsTypes.V =  OldT
   R
 
 `|` @Xs = expand_block Xs
