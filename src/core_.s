@@ -1268,14 +1268,14 @@ list.div F =
   R{[?0 ?1.f]}.t
 
 list.rip F = //rip list in two parts
-| As $keep(F)
-| Bs $skip(F)
-| Bs,As
+  As $keep(F)
+  Bs $skip(F)
+  Bs,As
 
 list.hash =
-| H 0
-| for X Me: H =  (H -<- 1) -^- X.hash
-| if H<0 then -H else H
+  H 0
+  for X Me: H =  (H -<- 1) -^- X.hash
+  if H<0 then -H else H
 
 list.clear Value = times I $n: Me.I =  Value
 
@@ -1294,21 +1294,21 @@ SetterCache!
 GetterCache!
 
 setters_ O =
-| T typename O
-| Ss SetterCache.T
-| when no Ss:
+  T typename O
+  Ss SetterCache.T
+  when no Ss:
   | Ss =  O^methods_.keep(?0.0 >< '='){[?0.tail ?1]}.t
   | SetterCache.T =  Ss
-| Ss
+  Ss
 
 getters_ O =
-| T typename O
-| Gs GetterCache.T
-| when no Gs:
+  T typename O
+  Gs GetterCache.T
+  when no Gs:
   | Setters setters_ O
   | Gs =  O^methods_.keep(K,V => got Setters.K).t
   | GetterCache.T =  Gs
-| Gs
+  Gs
 
 _.getter = getters_ Me
 
@@ -1318,8 +1318,8 @@ _.setter = setters_ Me
 //backtracking landing place
 //very fragile, and will crash and call any function other than F
 btland F =
-| K _setjmp
-| if _lget K 0: F(| _lget K 1) else _lget K 1
+  K _setjmp
+  if _lget K 0: F(| _lget K 1) else _lget K 1
 
 //jumps to previously created backtrack landing
 btjump Land Value = _longjmp Land Value
@@ -1327,13 +1327,13 @@ btjump Land Value = _longjmp Land Value
 type bterror type text
 
 btrap F = btland: K =>
-| PrevDEH get_deh
-| set_deh: Type Msg =>
+  PrevDEH get_deh
+  set_deh: Type Msg =>
   | set_deh PrevDEH
   | btjump K: bterror reader_error Msg
-| R F()
-| set_deh PrevDEH
-| R
+  R F()
+  set_deh PrevDEH
+  R
 
 // Token type accessors.  The `tok` type itself comes from C
 // (runtime/bltin.c's `tok_` varargs constructor); we just expose
@@ -1353,25 +1353,25 @@ tok.is_token = 1
 
 tok.src =: $row $col $orig
 tok.=src S =
-| $row = S.0
-| $col = S.1
-| $orig = S.2
+  $row = S.0
+  $col = S.1
+  $orig = S.2
 
 tok.as_text = "#[$value]"
 
 
 normalize_folder F =
-| when F >< '': ret   './'
-| if F.~ >< '/' then F else "[F]/"
+  when F >< '': ret   './'
+  if F.~ >< '/' then F else "[F]/"
 
 //FIXME: eval.s/produce_sbc could use this function too
 resolve_src_path Name Folders =
-| for Folder Folders
+  for Folder Folders
   | SrcFile "[Folder][Name].s"
   | when SrcFile.exists: ret SrcFile
   | Donor "[Folder][Name].sbc"
   | when Donor.exists: ret Donor
-| No
+  No
 
 lexical_macro_expand SrcFile Text LexP =
 | [Name Paths] LexP
