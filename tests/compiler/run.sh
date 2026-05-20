@@ -50,7 +50,12 @@ for f in "$EXAMPLES"/*.s; do
   mkdir -p "$case_dir/src"
   cp "$f" "$case_dir/src/go.s"
 
-  ( cd "$case_dir" && "$SYMTA" . ) >"$case_dir/build.log" 2>&1
+  # Force --no-jit so the AOT-default state on Windows doesn't
+  # add a native section to the produced go.sbc -- compiler-output
+  # goldens are bytecode-only by design (the AOT section's bytes
+  # are deterministic but huge; doubling every golden file is not
+  # what this test exists to measure).
+  ( cd "$case_dir" && "$SYMTA" . --no-jit ) >"$case_dir/build.log" 2>&1
   rc=$?
   actual="$case_dir/sbc/go.sbc"
 

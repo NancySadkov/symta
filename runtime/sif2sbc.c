@@ -1055,7 +1055,11 @@ uint8_t *sif2sbc(sif_t *sif) {
    * directory so drift / sweep stay 1-round byte-stable. */
   int ia64_ofs = 0;
   int ia64_count = 0;
-  if (getenv("SYMTA_AOT_IA64")) {
+  /* Step 8: AOT writer activates when jit_aot_enabled is on
+   * (set by --jit / --no-jit / platform default in main.c) OR
+   * the fine-grained SYMTA_AOT_IA64 override is set.  Either
+   * path produces a populated section. */
+  if (jit_aot_enabled || getenv("SYMTA_AOT_IA64")) {
     int nfns = shlen(label2fn);
     ia64_ofs = arrlen(wb);
     ia64_count = nfns;

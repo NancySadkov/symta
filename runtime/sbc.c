@@ -431,12 +431,18 @@ void sbc_prepare(sbc_t *sbc) {
     sbc_jit_install(sbc);
   }
 
-  /* Step 6c: install pre-baked native code from the IA64 section
-   * if both the SBC carries one AND the user opted in.  Runs
-   * AFTER sbc_jit_install so SYMTA_AOT_RUN wins when both are
-   * set (rare; mostly useful as a "I trust the AOT writer's
-   * output more than runtime translation" override). */
-  if (sbc->ia64_table && sbc->ia64_sz && getenv("SYMTA_AOT_RUN")) {
+  /* Step 6c / 8: install pre-baked native code from the IA64
+   * section if both the SBC carries one AND the runtime AOT
+   * gate is open.  The gate is the unified `jit_aot_enabled`
+   * (default-on on Windows, off elsewhere, overridable via
+   * --no-jit / --jit / SYMTA_NO_JIT / SYMTA_JIT) OR the
+   * fine-grained SYMTA_AOT_RUN env-var.
+   * Runs AFTER sbc_jit_install so the AOT pre-baked path wins
+   * when both are set (rare; mostly useful as a "I trust the
+   * AOT writer's output more than runtime translation"
+   * override). */
+  if (sbc->ia64_table && sbc->ia64_sz &&
+      (jit_aot_enabled || getenv("SYMTA_AOT_RUN"))) {
     sbc_install_ia64(sbc);
   }
 

@@ -15,6 +15,7 @@
 #include "ng.h"
 #include "sif.h"
 #include "fs.h"
+#include "jit.h"
 
 
 
@@ -851,10 +852,51 @@ void make_executable(void *ptr, int size) {
 
 
 
+/* Step 8: parse runtime-level CLI flags before they reach
+ * init_args.  Currently recognised:
+ *
+ *   --no-jit   force AOT off (overrides _WIN32 default and any
+ *              prior env-var SET; useful when a JIT bug is
+ *              suspected and the interpreter path needs to be
+ *              re-isolated).
+ *   --jit      force AOT on  (useful on Linux to test the
+ *              pipeline despite the POSIX-unwind gap; expect
+ *              crashes on longjmp-bearing programs).
+ *
+ * Recognised flags are removed from argv in-place so user code
+ * (visible via `args` in Symta) doesn't see them.  Flags appear
+ * anywhere in argv -- before or after the project path -- to
+ * keep the calling convention forgiving. */
+static void parse_jit_flags(int *argc_io, char **argv) {
+  int rd = 1, wr = 1;
+  int n = *argc_io;
+  while (rd < n) {
+    if (!strcmp(argv[rd], "--no-jit")) {
+      jit_aot_enabled = 0;
+      rd++;
+    } else if (!strcmp(argv[rd], "--jit")) {
+      jit_aot_enabled = 1;
+      rd++;
+    } else {
+      if (wr != rd) argv[wr] = argv[rd];
+      wr++; rd++;
+    }
+  }
+  *argc_io = wr;
+
+  /* Env-var overrides for scripting / build systems.  Both
+   * SYMTA_NO_JIT and SYMTA_JIT take precedence over CLI flags
+   * (the more explicit a knob, the higher it wins). */
+  if (getenv("SYMTA_NO_JIT")) jit_aot_enabled = 0;
+  if (getenv("SYMTA_JIT"))    jit_aot_enabled = 1;
+}
+
 int main(int argc, char **argv) {
   int i;
   void *R;
   char *tmp;
+
+  parse_jit_flags(&argc, argv);
 
 #ifdef __linux__
   /* Match Windows' merged-output interleaving exactly so the test

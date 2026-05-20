@@ -282,6 +282,25 @@ void jit_emit_call_with_sbc(jit_buf *b, void *target, uint64_t packed);
 /* Forward decl so callers don't need to include runtime/sif.h. */
 struct sbc_t;
 
+/* Step 8: AOT default-on flag.  Read by the writer (sif2sbc) and
+ * loader (sbc_prepare) to decide whether to embed/adopt native
+ * code without each consulting env vars separately.
+ *
+ * Default: 1 on _WIN32 (SEH unwind works), 0 elsewhere (POSIX
+ * DWARF .eh_frame is still TODO so native frames can't be
+ * longjmp'd through safely).
+ *
+ * Overridden by CLI flags in main.c:
+ *   --no-jit    -> 0  (skip both AOT writer and AOT loader)
+ *   --jit       -> 1  (force on, useful for Linux testing)
+ *
+ * Env-var overrides apply over the CLI defaults (in order of
+ * precedence: SYMTA_NO_JIT > SYMTA_JIT > CLI flag > platform
+ * default).  SYMTA_AOT_IA64 / SYMTA_AOT_RUN still work as
+ * fine-grained controls -- if set, they take precedence over
+ * the unified flag in their respective sides. */
+extern int jit_aot_enabled;
+
 /* Diagnostics set on the most recent `jit_translate` failure.
  * Useful for figuring out which opcode is blocking translation
  * of real code so we know what to implement next. */

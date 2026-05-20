@@ -24,7 +24,14 @@ check() {
   want_pat="$2"
   label="$3"
   printf '%s\n' "$src" > "$tmp"
-  out=$("$SYMTA" -f "$tmp" 2>&1)
+  # Step 8: pass --no-jit so the AOT default doesn't elide the
+  # per-instruction pin writes the interpreter uses to recover
+  # accurate per-statement source-line info.  JIT'd frames carry
+  # pin=0 (the "zero-cost pin tracking" trade in step 5n) and
+  # would report the function-header line instead of the body
+  # position this test pins down.  Drop the flag once basic-block
+  # pin granularity lands in the JIT.
+  out=$("$SYMTA" --no-jit -f "$tmp" 2>&1)
   if echo "$out" | grep -q "$want_pat"; then
     pass=$((pass+1))
   else

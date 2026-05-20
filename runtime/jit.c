@@ -544,6 +544,16 @@ void (*jit_rt_list1_helper)(int64_t *L, int dst, int x, int unused) = NULL;
 void (*jit_rt_list2_helper)(int64_t *L, int dst, int a, int b) = NULL;
 void (*jit_rt_fxnsize_helper)(int64_t *L, int dst, int src, int unused) = NULL;
 
+/* Step 8: platform-aware default for the AOT pipeline.  Windows
+ * has SEH unwind registered (step 5n) so longjmp through native
+ * frames works.  POSIX still needs DWARF .eh_frame -- defaulting
+ * to OFF there until that lands. */
+#ifdef _WIN32
+int jit_aot_enabled = 1;
+#else
+int jit_aot_enabled = 0;
+#endif
+
 static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
                                    int have_sbc, int record_relocs);
 
