@@ -316,10 +316,10 @@ Example:  \"  hi  \".trim         // \"hi\"
 | Xs.text
 
 text.begin T =
-| @"Test whether this text starts with the given prefix (or any of a list).
+  @"Test whether this text starts with the given prefix (or any of a list).
 Example:  \"hello world\".begin(\"hello\")   // 1"
-| if T.is_text: ret $upto(T.n) >< T
-| T.any: X => $upto(X.n) >< X
+  if T.is_text: ret $upto(T.n) >< T
+  T.any: X => $upto(X.n) >< X
 
 int.map F = dup I Me: F(I)
 
@@ -327,25 +327,25 @@ int.keep F = $l.keep(F)
 int.skip F = $l.skip(F)
 
 list.i =
-| @"Pair each element with its index, producing a list of \[I value\] pairs.
+  @"Pair each element with its index, producing a list of \[I value\] pairs.
 Useful for indexed iteration via destructured map bodies."
-| dup I $n: [I Me^pop]
+  dup I $n: [I Me^pop]
 
 text.i = $l.i
 
 list.`.` K =
-| times I K: Me =  $tail
-| $head
+  times I K: Me =  $tail
+  $head
 
 list.del K =
-| @"Remove the element at index K.  Returns a new list."
-| [@$take(K) @$drop(K+1)]
+  @"Remove the element at index K.  Returns a new list."
+  [@$take(K) @$drop(K+1)]
 list.insert K V =
-| @"Insert value V at index K, shifting later elements right."
-| [@$take(K) V @$drop(K)]
+  @"Insert value V at index K, shifting later elements right."
+  [@$take(K) V @$drop(K)]
 list.change K V =
-| @"Replace the element at index K with value V."
-| [@$take(K) V @$drop(K+1)]
+  @"Replace the element at index K with value V."
+  [@$take(K) V @$drop(K+1)]
 
 text.del K = [@$take(K) @$drop(K+1)].text
 text.insert K V = [@$take(K) V @$drop(K)].text
@@ -354,17 +354,17 @@ text.change K V = [@$take(K) V @$drop(K+1)].text
 `..` X N = dup N X
 
 list.n =
-| @"Length of a list -- O(1) on regular lists."
-| S 0
-| till $end
+  @"Length of a list -- O(1) on regular lists."
+  S 0
+  till $end
   | Me =  $tail
   | S+
-| S
+  S
 
 list.end =
-| @"Test whether a list is empty.  Returns 1 if empty, else 0.
+  @"Test whether a list is empty.  Returns 1 if empty, else 0.
 Use this instead of .n equal-test -- O(1) on every list representation."
-| _eq $n 0
+  _eq $n 0
 
 text.end = _eq $n 0
 
@@ -372,21 +372,21 @@ text.end = _eq $n 0
 bytes.bytes = Me
 
 list.bytes =
-| N $n
-| as Ys N.bytes: times I N: Ys.I =  pop Me
+  N $n
+  as Ys N.bytes: times I N: Ys.I =  pop Me
 
 list.utf8 = $bytes.utf8
 
 list.head =
-| @"First element of a list.  Returns No on an empty list.
+  @"First element of a list.  Returns No on an empty list.
 See also: .tail, .end (test for empty)."
-| $0
+  $0
 
 list.tail =
-| @"All elements after the first.  Returns the empty list when
+  @"All elements after the first.  Returns the empty list when
 the input has zero or one elements.
 See also: .head, .lead (all but last)."
-| $l.tail
+  $l.tail
 
 no.'*head' = No
 list.'*head' = if $end: No else $head
@@ -496,9 +496,9 @@ Empty list returns 0."
   S
 
 hard_list.z =
-| S 0
-| times I $n: S += $I
-| S
+  S 0
+  times I $n: S += $I
+  S
 
 list.cnt F =
   C 0
