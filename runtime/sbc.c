@@ -409,6 +409,14 @@ void sbc_prepare(sbc_t *sbc) {
     sbc_jit_audit(sbc);
   }
 
+  /* Step 5k: install JIT'd hooks if SYMTA_JIT_RUN is set.
+   * Separate flag from SYMTA_JIT_AUDIT so the audit can be run
+   * (measurement only) without exposing dispatch to JIT'd code.
+   * Setting both runs audit first, then install. */
+  if (getenv("SYMTA_JIT_RUN")) {
+    sbc_jit_install(sbc);
+  }
+
   sbc->ready = 1;
 }
 

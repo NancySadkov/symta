@@ -256,6 +256,150 @@ static int u32_cmp(const void *a, const void *b) {
   return (ua > ub) - (ua < ub);
 }
 
+/* ============================================================
+ * Step 5k: dispatch wiring.
+ *
+ * Each JIT'd function gets a small heap-allocated payload
+ * struct, and the corresponding hook in hooks_heap is rewritten
+ * so that the handler is `jit_adapter` (instead of
+ * `sbc_exec_fn`) and the payload is our struct instead of pin.
+ *
+ * `jit_adapter` matches the `dyn(uint8_t*)` signature the hook
+ * system requires.  It allocates the function's frame on the
+ * C stack (same VLA pattern as the SUBR macro), populates
+ * L[0]=current closure / L[1]=current args, zeroes the rest,
+ * then calls the JIT'd body with `(L, sbc)`.
+ *
+ * The CALL macro saves and restores `api.frame` around the
+ * handler call, so the adapter doesn't need to restore it.
+ *
+ * Gated on SYMTA_JIT_RUN at sbc_prepare time -- so a normal
+ * build / sweep / drift run is unaffected.  Setting both
+ * SYMTA_JIT_AUDIT and SYMTA_JIT_RUN runs the audit first
+ * (reporting coverage), then installs the JIT'd hooks. */
+
+typedef struct {
+  void *jit_body;        /* (dyn(*)(int64_t*, struct sbc_t*)) */
+  struct sbc_t *sbc;
+  int nvars;
+} jit_adapter_payload_t;
+
+static dyn jit_adapter(uint8_t *payload_ptr) {
+  jit_adapter_payload_t *p = (jit_adapter_payload_t*)payload_ptr;
+  int nvars = p->nvars;
+
+  /* Inline SUBR / PROLOGUE: allocate frame on the C stack via
+   * VLA, link into the api.frame chain, zero non-special
+   * slots, then populate L[0]=closure / L[1]=args. */
+  void *L_blk_[FRAME_PREFIX_SLOTS + nvars];
+  frame_t *frm_ = (frame_t*)L_blk_;
+  void **L = L_blk_ + FRAME_PREFIX_SLOTS;
+  frm_->prev = api.frame;
+  frm_->clsr = api.clsr_pending;
+  frm_->pin = 0;
+  frm_->nvars = nvars;
+  api.frame = frm_;
+  {
+    void **q_ = L + 2;
+    void **e_ = L + nvars;
+    while (q_ < e_) *q_++ = 0;
+  }
+  L[0] = frm_->clsr;
+  L[1] = api.args;
+
+  /* Call the JIT'd body. */
+  typedef dyn (*jit_fn_t)(int64_t*, struct sbc_t*);
+  return ((jit_fn_t)p->jit_body)((int64_t*)L, p->sbc);
+}
+
+/* Rewrites hook entries for JIT'd functions so CALL/MCALL
+ * dispatches through jit_adapter -> JIT'd body instead of
+ * through sbc_exec_fn -> interpreter.
+ *
+ * Returns the number of functions successfully installed.
+ *
+ * Strategy: walk fntbl, translate each function via
+ * jit_translate_with_sbc.  On success, allocate a payload
+ * struct, finalize the jit_buf as executable, and overwrite
+ * the corresponding hooks_heap entry's handler+payload.  On
+ * failure, leave the hook untouched (interpreter handles it). */
+int sbc_jit_install(struct sbc_t *sbc) {
+  if (!sbc || !sbc->fntbl || sbc->fntbl_sz < 3) return 0;
+  jit_install_helpers_once();
+
+  int nfns = (int)(sbc->fntbl_sz / 3);
+  if (nfns <= 0) return 0;
+
+  uint32_t *offs = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(nfns + 1));
+  if (!offs) return 0;
+  /* Build [(orig_idx, ofs)] table -- we need the original index
+   * back since hooks[i] indexes by ORIGINAL ordering, not sort. */
+  for (int i = 0; i < nfns; i++) {
+    offs[i] = fntbl_read24(sbc->fntbl + i * 3);
+  }
+  offs[nfns] = sbc->code_sz;
+
+  /* For body length we still need the sorted positions to know
+   * where each function ends.  Make a sorted copy. */
+  uint32_t *sorted = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(nfns + 1));
+  if (!sorted) { free(offs); return 0; }
+  for (int i = 0; i <= nfns; i++) sorted[i] = offs[i];
+  qsort(sorted, (size_t)nfns + 1, sizeof(uint32_t), u32_cmp);
+
+  int installed = 0;
+  const size_t HEADER = 5;
+
+  for (int i = 0; i < nfns; i++) {
+    uint32_t start = offs[i];
+    /* Find this start's slot in sorted -> next-sorted is the
+     * upper bound on the body's bytecode range. */
+    int s;
+    for (s = 0; s < nfns; s++) if (sorted[s] == start) break;
+    uint32_t end = sorted[s + 1];
+    if (end <= start + HEADER) continue;
+    if (sbc->code[start] != SBC_SUBR) continue;
+
+    const uint8_t *body = sbc->code + start + HEADER;
+    size_t body_len = (size_t)end - start - HEADER;
+    int nvars = (int)((uint32_t)sbc->code[start + 3]
+                    | ((uint32_t)sbc->code[start + 4] << 8));
+
+    jit_buf *jb = jit_translate_with_sbc(body, body_len);
+    if (!jb) continue;
+
+    void *jit_code = jit_buf_finalize(jb);
+    /* NOTE: we deliberately DON'T jit_buf_free(jb) -- the
+     * executable memory must outlive sbc_prepare.  The
+     * jit_buf struct itself leaks, but that's a few dozen
+     * bytes per installed function (the code is what matters,
+     * and we keep that). */
+
+    jit_adapter_payload_t *payload =
+      (jit_adapter_payload_t*)malloc(sizeof(*payload));
+    if (!payload) continue;
+    payload->jit_body = jit_code;
+    payload->sbc      = sbc;
+    payload->nvars    = nvars;
+
+    /* Overwrite the hook entry. */
+    uint32_t hook_idx = (uint32_t)sbc->hooks[i];
+    hooks_heap[hook_idx].handler = (psf_t)&jit_adapter;
+    hooks_heap[hook_idx].payload = (uint8_t*)payload;
+    installed++;
+  }
+
+  free(sorted);
+  free(offs);
+  /* Verbose install summary, gated to keep `SYMTA_JIT_RUN=1`
+   * usable in test runs whose goldens include stderr.  Set
+   * SYMTA_JIT_VERBOSE=1 alongside to see per-sbc counts. */
+  if (getenv("SYMTA_JIT_VERBOSE")) {
+    fprintf(stderr, "jit-install: %d/%d functions installed for %s\n",
+            installed, nfns, sbc->filename);
+  }
+  return installed;
+}
+
 int sbc_jit_audit(struct sbc_t *sbc) {
   if (!sbc || !sbc->fntbl || sbc->fntbl_sz < 3) return 0;
   jit_install_helpers_once();

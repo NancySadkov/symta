@@ -296,6 +296,29 @@ extern void (*jit_rt_closure_helper)(int64_t *L, struct sbc_t *sbc,
 int sbc_jit_audit(struct sbc_t *sbc);
 
 /* ============================================================
+ * Step 5k: actually install JIT'd code into the dispatch table.
+ *
+ * For each function `jit_translate_with_sbc` accepts, this:
+ *   1. Allocates a heap payload struct {jit_body, sbc, nvars}.
+ *   2. Finalizes the jit_buf (sealing it executable).
+ *   3. Rewrites the hooks_heap entry for that function to
+ *      point at `jit_adapter` (instead of sbc_exec_fn) with
+ *      our payload (instead of pin).
+ *
+ * jit_adapter has the same `dyn(uint8_t*)` signature the hook
+ * system needs.  Internally it allocates the function's frame
+ * via a VLA matching the SUBR macro, then calls the JIT'd body
+ * with `(L, sbc)`.  CALL's outer api.frame save/restore takes
+ * care of unwinding on return.
+ *
+ * Returns the number of functions successfully installed.
+ * Functions that can't translate are left interpreter-bound;
+ * mixed-mode dispatch is fully supported (a JIT'd caller can
+ * invoke an interpreted callee or vice versa, the hook layer
+ * is uniform). */
+int sbc_jit_install(struct sbc_t *sbc);
+
+/* ============================================================
  * Step 4: SBC bytecode -> x86 translator.
  *
  * Walks `n` bytes of SBC bytecode starting at `bc` and emits an
