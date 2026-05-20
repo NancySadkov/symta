@@ -23,6 +23,81 @@
 #include <string.h>
 #include <float.h>
 
+#ifdef _WIN32
+#include <windows.h>
+
+/* Register Windows x64 SEH unwind info for a JIT'd function.
+ *
+ * Without this, RtlUnwindEx (called by longjmp / `bad`) sees
+ * JIT'd frames as having no `.pdata` RUNTIME_FUNCTION entry
+ * and either skips them silently or aborts the process.  The
+ * step-5 static-check tests hit the abort path when two
+ * JIT'd frames stack up (caller + JIT'd callee).
+ *
+ * Layout:  the jit_buf is page-aligned and oversized for the
+ * code; we tuck the UNWIND_INFO and RUNTIME_FUNCTION right
+ * after the code, in the same allocation.  BaseAddress passed
+ * to RtlAddFunctionTable is the code start; the RVAs in
+ * RUNTIME_FUNCTION are offsets from there.
+ *
+ * Only the 2-arg prologue is registered (the one used by
+ * jit_translate_with_sbc / sbc_jit_install).  The 1-arg
+ * variant is self-test only and never longjmps, so it doesn't
+ * need unwind info. */
+static void jit_register_unwind_2arg(void *jit_code, size_t code_size) {
+  size_t uw_off = (code_size + 3) & ~(size_t)3;
+  size_t rt_off = uw_off + 16;  /* 16 bytes max for UNWIND_INFO */
+  uint8_t *uw   = (uint8_t*)jit_code + uw_off;
+
+  /* 2-arg prologue layout (matches jit_emit_prologue2):
+   *   0x00 (1 byte):  push rbx
+   *   0x01 (2 bytes): push r12
+   *   0x03 (3 bytes): mov rbx, <arg0>
+   *   0x06 (3 bytes): mov r12, <arg1>
+   *   0x09 (4 bytes): sub rsp, 40
+   *   0x0d:           body starts
+   *
+   * UNWIND_INFO header (4 bytes) + UNWIND_CODEs (in REVERSE
+   * prologue order, 2 bytes each). */
+  uw[0] = 0x01;             /* Version=1, Flags=0      */
+  uw[1] = 0x0d;             /* SizeOfProlog            */
+  uw[2] = 0x03;             /* CountOfCodes            */
+  uw[3] = 0x00;             /* FrameReg=0, FrameOff=0  */
+
+  /* UNWIND_CODE 0: UWOP_ALLOC_SMALL 40 at offset 0x0d.
+   *   CodeOffset = 0x0d
+   *   UnwindOp   = 2 (UWOP_ALLOC_SMALL)
+   *   OpInfo     = (40/8) - 1 = 4 */
+  uw[4] = 0x0d;  uw[5] = (4 << 4) | 2;
+
+  /* UNWIND_CODE 1: UWOP_PUSH_NONVOL R12 at offset 0x03.
+   *   UnwindOp = 0, OpInfo = 12 (R12). */
+  uw[6] = 0x03;  uw[7] = (12 << 4) | 0;
+
+  /* UNWIND_CODE 2: UWOP_PUSH_NONVOL RBX at offset 0x01.
+   *   UnwindOp = 0, OpInfo = 3 (RBX). */
+  uw[8] = 0x01;  uw[9] = (3 << 4) | 0;
+
+  /* RUNTIME_FUNCTION sits 4-aligned right after UNWIND_INFO. */
+  PRUNTIME_FUNCTION rt = (PRUNTIME_FUNCTION)((uint8_t*)jit_code + rt_off);
+  rt->BeginAddress = 0;
+  rt->EndAddress   = (DWORD)code_size;
+  rt->UnwindData   = (DWORD)uw_off;
+
+  if (!RtlAddFunctionTable(rt, 1, (DWORD64)jit_code)) {
+    fprintf(stderr, "jit-install: RtlAddFunctionTable failed at %p\n", jit_code);
+  }
+}
+#else
+/* POSIX: no-op for now.  Linux uses DWARF .eh_frame; we'd
+ * need to emit __register_frame data.  Leaving as a TODO --
+ * non-Windows builds still work for any JIT'd function that
+ * doesn't have an inner longjmp through its frame. */
+static void jit_register_unwind_2arg(void *jit_code, size_t code_size) {
+  (void)jit_code; (void)code_size;
+}
+#endif
+
 /* Full FXN* helpers.  Each mirrors the corresponding interpreter
  * opcode's 3-way dispatch from sbc.c -- int-int via the FXN*
  * macro, int-float via float promotion, non-int via MCALL to
@@ -515,6 +590,11 @@ int sbc_jit_install(struct sbc_t *sbc) {
      * jit_buf struct itself leaks, but that's a few dozen
      * bytes per installed function (the code is what matters,
      * and we keep that). */
+
+    /* Register Windows SEH unwind info so longjmp through this
+     * frame works.  Zero-cost on the happy path -- the table
+     * entry just sits in memory until RtlUnwindEx looks it up. */
+    jit_register_unwind_2arg(jit_code, jb->len);
 
     jit_adapter_payload_t *payload =
       (jit_adapter_payload_t*)malloc(sizeof(*payload));
