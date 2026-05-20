@@ -748,13 +748,13 @@ text.locate F =
   else times I $n: when F >< $I: ret   I
 
 list.find F =
-| @"Return the first element for which the predicate is truthy, or No."
-| if F.is_fn
+  @"Return the first element for which the predicate is truthy, or No."
+  if F.is_fn
   then for (I 0; not $end; I+):
-  | It Me^pop; when F(It): ret   It
+       | It Me^pop; when F(It): ret   It
   else for (I 0; not $end; I+):
-  | It Me^pop
-  | when F><It: ret   It
+       | It Me^pop
+       | when F><It: ret   It
 
 hard_list.find F =
   if F.is_fn
