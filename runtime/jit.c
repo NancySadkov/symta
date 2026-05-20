@@ -362,6 +362,9 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_MOVE   0x19    /* dst=u16 src=u16; L[dst]=L[src] */
 #define BC_MOVE8  0x1A    /* dst=u8  src=u8;  L[dst]=L[src] */
 #define BC_MOVENO 0x1C    /* dst=u16; L[dst]=No (a fixed immediate) */
+#define BC_LOAD   0x24    /* dst=u16 src=u16 index=u16; L[dst]=O_PTR(L[src])[index] */
+#define BC_LOAD8  0x25    /* dst=u8 src=u8 index=u8; same body */
+#define BC_MOVE4  0x97    /* opr=u8; dst=opr&0xF src=opr>>4; L[dst]=L[src] */
 #define BC_JMP    0x04
 #define BC_JMP16  0x05    /* opcode + int16 PC-relative diff */
 #define BC_B      0x06
@@ -584,6 +587,53 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
       uint32_t src = (uint32_t)(opr >> 4);
       jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper,
                             dst, src, (uint32_t)index);
+      i += 2;
+      break;
+    }
+
+    case BC_LOAD: {
+      /* SBC_LOAD: same body as LD4 but with u16 operands.  Reuses
+       * the LD4 helper directly. */
+      if (i + 7 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_ld4_helper) { jit_last_fail_opcode = op;
+                                jit_last_fail_offset = i;
+                                fail = 1; goto done; }
+      uint32_t dst   = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t src   = (uint32_t)bc_rd16(bc + i + 3);
+      uint32_t index = (uint32_t)bc_rd16(bc + i + 5);
+      jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper, dst, src, index);
+      i += 7;
+      break;
+    }
+    case BC_LOAD8: {
+      if (i + 4 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_ld4_helper) { jit_last_fail_opcode = op;
+                                jit_last_fail_offset = i;
+                                fail = 1; goto done; }
+      uint32_t dst   = bc[i + 1];
+      uint32_t src   = bc[i + 2];
+      uint32_t index = bc[i + 3];
+      jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper, dst, src, index);
+      i += 4;
+      break;
+    }
+    case BC_MOVE4: {
+      /* SBC_MOVE4: 1 operand byte holds dst (low 4 bits) and
+       * src (high 4 bits) -- both 4-bit slot indices into
+       * L[0..15], the hot range that gets register-allocated
+       * to register slots in tight loops. */
+      if (i + 2 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      uint8_t opr = bc[i + 1];
+      int dst = opr & 0xF;
+      int src = opr >> 4;
+      emit_mov_rax_from_slot(b, src);
+      emit_mov_slot_from_rax(b, dst);
       i += 2;
       break;
     }
