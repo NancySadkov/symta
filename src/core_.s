@@ -394,16 +394,16 @@ text.'*head' = if $end: No else $head
 list.`++` = if $end: No else $tail
 
 list.`><` B =
-| less B.is_list: ret   0
-| till $end or B.end: less Me^pop >< B^pop: ret   0
-| $end and B.end
+  less B.is_list: ret   0
+  till $end or B.end: less Me^pop >< B^pop: ret   0
+  $end and B.end
 
 hard_list.`><` B =
-| less B.is_list: ret   0 //FIXME: cons_list B will be O(n^2) slow
-| N $n
-| when _ne N B.n: ret   0
-| times I N: less $I >< B.I: ret   0
-| 1
+  less B.is_list: ret   0 //FIXME: cons_list B will be O(n^2) slow
+  N $n
+  when _ne N B.n: ret   0
+  times I N: less $I >< B.I: ret   0
+  1
 
 _list_.`><` B =
   less B.is_list: ret   0 //FIXME: cons_list B will be O(n^2) slow
@@ -414,49 +414,49 @@ _list_.`><` B =
   1
 
 list.`<` Xs =
-| A B 0
-| times I $n:
+  A B 0
+  times I $n:
   | A =  $I
   | B =  Xs.I
   | when A <> B: ret   A < B
-| ret   A < B
+  ret   A < B
 
 list.`>` Xs =
-| A B 0
-| times I $n:
+  A B 0
+  times I $n:
   | A =  $I
   | B =  Xs.I
   | when A <> B: ret   A > B
-| ret   A > B
+  ret   A > B
 
 list.`<<` Xs =
-| A B 0
-| times I $n:
+  A B 0
+  times I $n:
   | A =  $I
   | B =  Xs.I
   | when A <> B: ret   A << B
-| ret   A << B
+  ret   A << B
 
 list.`>>` Xs =
-| A B 0
-| times I $n:
+  A B 0
+  times I $n:
   | A =  $I
   | B =  Xs.I
   | when A <> B: ret   A >> B
-| ret   A >> B
+  ret   A >> B
 
 list.f =
-| @"Reverse a list (flip).  Returns a new list; the original is untouched."
-| N $n
-| Ys dup N
-| while N
+  @"Reverse a list (flip).  Returns a new list; the original is untouched."
+  N $n
+  Ys dup N
+  while N
   | N-
   | Ys.N =  pop Me
-| Ys
+  Ys
 
 hard_list.f =
-| N $n
-| dup N
+  N $n
+  dup N
   | N-
   | $N
 
@@ -467,11 +467,11 @@ text.cnt C = $l.cnt^C
 
 
 list.map F =
-| @"Apply a function to every element, collecting results.
+  @"Apply a function to every element, collecting results.
 Example: Xs.map(X => X * X) squares each element.
 Use `&fn` to pass a named function: Xs.map(&sq).
 The `Xs{Body}` operator is the same thing with a richer body grammar."
-| dup $n: F(Me^pop)
+  dup $n: F(Me^pop)
 hard_list.map F = dup I $n: F($I)
 _list_.map F = dup I $n: F(|_lget Me I)
 text.map F = $l.map(F)
@@ -479,21 +479,21 @@ text.map F = $l.map(F)
 list.`^^` X = map Y Me Y^^X
 
 list.fold Run F =
-| @"Left fold with an explicit initial value.
+  @"Left fold with an explicit initial value.
 Example: Xs.fold 100 (Acc X => Acc + X) -- 100 plus sum of Xs.
 Same shape as foldl in Haskell or reduce in JS.  For sum use .z."
-| for X Me: Run = F(Run X)
-| Run
+  for X Me: Run = F(Run X)
+  Run
 
 list.e F = till $end: F(Me^pop)
 hard_list.e F = times I $n: F($I)
 
 list.z =
-| @"Sum a list of numbers.  Mixed int/float promotes to float.
+  @"Sum a list of numbers.  Mixed int/float promotes to float.
 Empty list returns 0."
-| S 0
-| till $end: S += pop Me
-| S
+  S 0
+  till $end: S += pop Me
+  S
 
 hard_list.z =
 | S 0
