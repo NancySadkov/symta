@@ -501,87 +501,87 @@ hard_list.z =
 | S
 
 list.cnt F =
-| C 0
-| if F.is_fn
+  C 0
+  if F.is_fn
   then till $end: when F(Me^pop): C+
   else till $end: when F><Me^pop: C+
-| C
+  C
 
 hard_list.cnt F =
-| C I 0
-| if F.is_fn
+  C I 0
+  if F.is_fn
   then times I $n: when F($I): C+
   else times I $n: when F><$I: C+
-| C
+  C
 
 list.keep F =
-| @"Keep elements for which the predicate returns truthy.
+  @"Keep elements for which the predicate returns truthy.
 Example: Xs.keep(X => X > 0) keeps positives.
 Use `&fn` to pass a named predicate: Xs.keep(&is_odd).
 See also: .skip (inverse), the `:Cond` form for in-line filters."
-| Ys:
-| if F.is_fn
+  Ys:
+  if F.is_fn
   then for X Me: when F(X): Ys =  [X@Ys]
   else for X Me: when F >< X: Ys =  [X@Ys]
-| Ys.f
+  Ys.f
 
 list.skip F =
-| @"Drop elements for which the predicate returns truthy.  Inverse of .keep."
-| Ys:
-| if F.is_fn
+  @"Drop elements for which the predicate returns truthy.  Inverse of .keep."
+  Ys:
+  if F.is_fn
   then for X Me: less F(X): Ys =  [X@Ys]
   else for X Me: less F >< X: Ys =  [X@Ys]
-| Ys.f
+  Ys.f
 
 list.j =
-| @"Concatenate a list of lists into a single flat list.
+  @"Concatenate a list of lists into a single flat list.
 Sometimes spelled \"join\" or \"flatten\" elsewhere."
-| Rs dup $map(?n).z
-| I 0
-| for Ys Me: for Y Ys: Rs.(I+) =  Y
-| Rs
+  Rs dup $map(?n).z
+  I 0
+  for Ys Me: for Y Ys: Rs.(I+) =  Y
+  Rs
 
 
 _list_.l = Me
 _bytes_.l = dup I $n $I
 text.l = dup I $n $I
 list.l =
-| N $n
-| Ys dup N
-| times I N: Ys.I =  pop Me
-| Ys
+  N $n
+  Ys dup N
+  times I N: Ys.I =  pop Me
+  Ys
 int.l = dup I Me: I //iota operator
 
 list.apply F =
-| @"Call a function with this list as its argument list.
+  @"Call a function with this list as its argument list.
 Example:  \[1 2 3\].apply(min)   // min(1, 2, 3) -> 1"
-| $l.apply(F)
+  $l.apply(F)
 list.apply_method F = $l.apply_method(F)
 
 list.text @As =
-| @"Join a list of text values into one text, optionally with a separator.
+  @"Join a list of text values into one text, optionally with a separator.
 Example: Xs.text(\", \") joins with comma-space.  Non-text elements are coerced via interpolation."
-| R $l
-| if As.n then R.text(As.0) else R.text
+  R $l
+  if As.n then R.text(As.0) else R.text
 
 text.text = Me
 
 list.x @As = Me{as_text}.text(@As)
 
 list.split S =
-| F if S.is_fn then S else X => S >< X
-| Ys:
-| P $locate(F)
-| while got P:
+  F if S.is_fn then S else X => S >< X
+  Ys:
+  P $locate(F)
+  while got P:
   | Ys =  [$take(P)@Ys]
   | Me =  $drop(P+1)
   | P =  $locate(F)
-| [Me@Ys].f
+  [Me@Ys].f
 
 text.split F =
-| @"Split a text on a delimiter.  Returns a list of texts.
+  @"Split a text on a delimiter.  Returns a list of texts.
 Empty pieces are kept."
-| $l.split(F).map(X=>X.text)
+  $l.split(F).map(X=>X.text)
 
 text.all F = $l.all(F)
 text.any F = $l.any(F)
