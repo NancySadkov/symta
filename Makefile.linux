@@ -34,7 +34,7 @@ CP = cp -fp
 RM = rm -f
 
 SRCS = main.c gc.c ncm.c bltin.c tokenize.c reader.c meta_table.c ng.c \
-       sif.c fs.c sbc.c sif2sbc.c jit.c \
+       sif.c fs.c sbc.c sif2sbc.c jit.c jit_sbc.c \
        sffi/sffi.c sffi/arch_x64_sysv.c \
        linux/ctx.c linux/compat.c
 

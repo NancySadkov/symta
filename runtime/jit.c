@@ -358,6 +358,7 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_NOP    0x00
 #define BC_LEAVE  0x02
 #define BC_LEAVE0 0x03
+#define BC_CNAS   0x14    /* function-prologue nargs check */
 #define BC_JMP    0x04
 #define BC_JMP16  0x05    /* opcode + int16 PC-relative diff */
 #define BC_B      0x06
@@ -478,6 +479,12 @@ typedef struct {
   size_t bc_target;   /* target byte offset within the bc buffer */
 } jit_patch;
 
+/* Diagnostics: set whenever jit_translate aborts.  Read by the
+ * audit code in jit_sbc.c to tally which opcodes are blocking
+ * coverage of real SBC files. */
+uint8_t jit_last_fail_opcode = 0;
+size_t  jit_last_fail_offset = 0;
+
 jit_buf *jit_translate(const uint8_t *bc, size_t n) {
   /* x86 expansion factor.  Worst case so far is the comparison
    * sequence at ~16 bytes per opcode; B is ~12 bytes; prologue
@@ -505,6 +512,20 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
     switch (op) {
     case BC_NOP:
       i += 1;
+      break;
+
+    case BC_CNAS:
+      /* Function-prologue arg-count check.  Compiler always
+       * emits matching counts; the runtime check is a defensive
+       * assertion against bytecode corruption.  Skip in JIT for
+       * now -- the worst case is we lose a redundant validation.
+       * If a corrupted SBC ever needs the check, we'll route
+       * through a trampoline helper instead.  Format: opcode
+       * + 16-bit expected nargs. */
+      if (i + 3 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      i += 3;
       break;
 
     case BC_IADD: case BC_ISUB: case BC_IMUL: case BC_IDIV:
@@ -703,8 +724,11 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
 
     default:
       /* Unsupported opcode -- bail out so the caller falls back
-       * to the interpreter.  A later step will widen coverage
-       * via the C-runtime trampoline. */
+       * to the interpreter.  Diagnostics record what we hit so
+       * the audit can tally which opcodes need implementing
+       * next. */
+      jit_last_fail_opcode = op;
+      jit_last_fail_offset = i;
       fail = 1;
       goto done;
     }

@@ -5,6 +5,7 @@
 #include "ng.h"
 #include "fs.h"
 #include "sffi/sffi.h"
+#include "jit.h"
 
 /* RT-1: threaded dispatch (computed gotos) is on by default for
  * compilers that support GCC's address-of-label extension --
@@ -397,6 +398,15 @@ void sbc_prepare(sbc_t *sbc) {
     fprintf(stderr, "sbc_prepare: out of memory for %u mcache slots\n"
            ,slots);
     exit(-1);
+  }
+
+  /* Step 5d: optional JIT translatability audit.  Gated on the
+   * env var so a default `make test-drift` run doesn't print
+   * extra noise.  Use `SYMTA_JIT_AUDIT=1 ./symta.exe ...` to see
+   * per-loaded-SBC stats on stderr. */
+  if (getenv("SYMTA_JIT_AUDIT")) {
+    fprintf(stderr, "jit-audit: %s -- ", sbc->filename);
+    sbc_jit_audit(sbc);
   }
 
   sbc->ready = 1;

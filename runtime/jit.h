@@ -183,6 +183,31 @@ void jit_emit_call_abs(jit_buf *b, void *target);
 void jit_emit_call_helper3(jit_buf *b, void *target,
                            uint32_t slot_dst, uint32_t slot_a, uint32_t slot_b);
 
+/* Forward decl so callers don't need to include runtime/sif.h. */
+struct sbc_t;
+
+/* Diagnostics set on the most recent `jit_translate` failure.
+ * Useful for figuring out which opcode is blocking translation
+ * of real code so we know what to implement next. */
+extern uint8_t jit_last_fail_opcode;
+extern size_t  jit_last_fail_offset;
+
+/* ============================================================
+ * Step 5d: SBC-level JIT integration.
+ *
+ * `sbc_jit_audit` walks every function in `sbc`, tries to
+ * translate it via `jit_translate`, and returns the number that
+ * succeeded.  Doesn't actually invoke any JIT'd code -- it's an
+ * instrumentation hook for measuring how much of a loaded SBC
+ * the JIT can handle today.  Failing translations get freed
+ * before counting moves on.
+ *
+ * Called from sbc_prepare when the env var SYMTA_JIT_AUDIT=1.
+ * Prints a `jit-audit: K/N functions translatable` line to
+ * stderr.  Zero overhead when the env var is unset.
+ * ============================================================ */
+int sbc_jit_audit(struct sbc_t *sbc);
+
 /* ============================================================
  * Step 4: SBC bytecode -> x86 translator.
  *
