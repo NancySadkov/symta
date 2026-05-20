@@ -125,13 +125,13 @@ void jit_buf_free(jit_buf *b) {
  * int32_t max).
  * ============================================================ */
 
-#ifdef _WIN32
-  /* Win64: arg0 = RCX, r/m code 001. */
-  #define LOCALS_RM 1
-#else
-  /* SysV:  arg0 = RDI, r/m code 111. */
-  #define LOCALS_RM 7
-#endif
+/* Locals-pointer register.  We use RBX (callee-saved on both
+ * Win64 and SysV) so the pointer survives across inner C calls
+ * without explicit save/restore.  The prologue moves the
+ * platform's arg0 (RCX on Win64, RDI on SysV) into RBX once;
+ * every memory emitter addresses [rbx + slot*8] thereafter.
+ * RBX's r/m field is 011 (3). */
+#define LOCALS_RM 3
 
 /* Emit ModR/M + displacement for `[locals_reg + slot*8]` with
  * the given /reg (or /opcode-ext) field set.  Picks disp8 vs
@@ -269,6 +269,96 @@ void jit_emit_irem(jit_buf *b, int dst, int a, int x) {
 
 void jit_emit_ret(jit_buf *b) {
   jit_emit_u8(b, 0xc3);
+}
+
+/* ============================================================
+ * Step 3: prologue / epilogue / C-call trampoline.
+ *
+ * Stack layout while inside a JIT'd function (the `[]` marks
+ * grow-down direction):
+ *
+ *   [ caller's frame                 ] <- on entry RSP%16==8
+ *   [ return address (8 bytes)       ] <- caller's CALL pushed
+ *   [ saved RBX (8 bytes)            ] <- prologue: push rbx
+ *   [ shadow space (32 bytes)        ] <- prologue: sub rsp, 32
+ *                                          (Win64 requires 32
+ *                                          home bytes for any
+ *                                          inner CALL; SysV
+ *                                          ignores them but
+ *                                          allocating is harmless)
+ *                                       <- RSP%16==0; inner CALL
+ *                                          will push 8, callee
+ *                                          sees %16==8 as
+ *                                          expected.
+ *
+ * RBX holds the locals pointer the entire time.  Inner C calls
+ * preserve RBX by ABI; we never have to save/restore it
+ * mid-function.
+ * ============================================================ */
+
+void jit_emit_prologue(jit_buf *b) {
+  /* push rbx -- one byte (PUSH r64 family: 50+reg, RBX=011) */
+  jit_emit_u8(b, 0x53);
+  /* mov rbx, <arg0>  --  rbx is the new home of the locals ptr */
+#ifdef _WIN32
+  /* mov rbx, rcx :  48 89 cb (ModR/M 11 001 011, r=rcx, r/m=rbx) */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, 0xcb);
+#else
+  /* mov rbx, rdi :  48 89 fb (ModR/M 11 111 011, r=rdi, r/m=rbx) */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, 0xfb);
+#endif
+  /* sub rsp, 32 :  48 83 ec 20 (Win64 shadow space + alignment
+   * marker; harmless on SysV).  Keeps RSP%16==0 before any
+   * inner CALL. */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x83);
+  jit_emit_u8(b, 0xec);
+  jit_emit_u8(b, 0x20);
+}
+
+void jit_emit_epilogue(jit_buf *b) {
+  /* add rsp, 32 :  48 83 c4 20 */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x83);
+  jit_emit_u8(b, 0xc4);
+  jit_emit_u8(b, 0x20);
+  /* pop rbx :  5b */
+  jit_emit_u8(b, 0x5b);
+  /* ret :  c3 */
+  jit_emit_u8(b, 0xc3);
+}
+
+void jit_emit_mov_arg0_from_locals(jit_buf *b) {
+#ifdef _WIN32
+  /* mov rcx, rbx :  48 89 d9 (ModR/M 11 011 001) */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, 0xd9);
+#else
+  /* mov rdi, rbx :  48 89 df (ModR/M 11 011 111) */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, 0xdf);
+#endif
+}
+
+void jit_emit_call_abs(jit_buf *b, void *target) {
+  /* Two-instruction call: load the absolute address into RAX
+   * via `mov rax, imm64` (10 bytes) then `call rax` (2 bytes).
+   * Total 12 bytes -- longer than a relative call but works
+   * for any target regardless of its distance from the JIT'd
+   * code. */
+  uint64_t v = (uint64_t)target;
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0xb8);  /* mov rax, imm64 (opcode b8+reg, rax=0) */
+  for (int i = 0; i < 8; i++) jit_emit_u8(b, (uint8_t)(v >> (i*8)));
+  /* call rax :  ff d0 (ModR/M 11 010 000, /2=call, r/m=rax) */
+  jit_emit_u8(b, 0xff);
+  jit_emit_u8(b, 0xd0);
 }
 
 /* ============================================================
@@ -445,12 +535,13 @@ static int step1_arith(void) {
   jit_buf *b = jit_buf_new(256);
   if (!b) return 1;
 
+  jit_emit_prologue(b);
   jit_emit_iadd(b, 2, 0, 1);
   jit_emit_isub(b, 3, 0, 1);
   jit_emit_imul(b, 4, 0, 1);
   jit_emit_idiv(b, 5, 0, 1);
   jit_emit_irem(b, 6, 0, 1);
-  jit_emit_ret(b);
+  jit_emit_epilogue(b);
 
   void (*fn)(int64_t*) = (void(*)(int64_t*))jit_buf_finalize(b);
 
@@ -479,8 +570,9 @@ static int step1_arith(void) {
 
   /* Slot index large enough to force disp32 encoding (>15). */
   jit_buf *bb = jit_buf_new(256);
+  jit_emit_prologue(bb);
   jit_emit_iadd(bb, 32, 0, 1);   /* L[32] = L[0] + L[1] */
-  jit_emit_ret(bb);
+  jit_emit_epilogue(bb);
   void (*fn2)(int64_t*) = (void(*)(int64_t*))jit_buf_finalize(bb);
 
   int64_t L2[64] = {0};
@@ -501,12 +593,13 @@ static int step2_compares(void) {
   jit_buf *b = jit_buf_new(256);
   if (!b) return 1;
 
+  jit_emit_prologue(b);
   /* L[2]=ILT(0,1) L[3]=IGT(0,1) L[4]=ILTE(0,1) L[5]=IGTE(0,1) */
   jit_emit_ilt (b, 2, 0, 1);
   jit_emit_igt (b, 3, 0, 1);
   jit_emit_ilte(b, 4, 0, 1);
   jit_emit_igte(b, 5, 0, 1);
-  jit_emit_ret(b);
+  jit_emit_epilogue(b);
 
   void (*fn)(int64_t*) = (void(*)(int64_t*))jit_buf_finalize(b);
 
@@ -554,12 +647,13 @@ static int step2_loop(void) {
   jit_buf *b = jit_buf_new(256);
   if (!b) return 1;
 
+  jit_emit_prologue(b);
   size_t loop_start = jit_here(b);
   jit_emit_iadd(b, 0, 0, 1);
   jit_emit_isub(b, 1, 1, 2);
   size_t back = jit_emit_jnz_slot(b, 1);
   jit_patch_jmp_to(b, back, loop_start);
-  jit_emit_ret(b);
+  jit_emit_epilogue(b);
 
   void (*fn)(int64_t*) = (void(*)(int64_t*))jit_buf_finalize(b);
 
@@ -590,6 +684,7 @@ static int step2_forward_jmp(void) {
   jit_buf *b = jit_buf_new(256);
   if (!b) return 1;
 
+  jit_emit_prologue(b);
   /* L[3] = IGT L[0] L[1]      ; 1 if L[0] > L[1] */
   jit_emit_igt(b, 3, 0, 1);
 
@@ -606,7 +701,7 @@ static int step2_forward_jmp(void) {
 
   /* end: */
   jit_patch_jmp_here(b, end_jmp);
-  jit_emit_ret(b);
+  jit_emit_epilogue(b);
 
   void (*fn)(int64_t*) = (void(*)(int64_t*))jit_buf_finalize(b);
 
@@ -630,6 +725,80 @@ static int step2_forward_jmp(void) {
   return fail;
 }
 
+/* Step 3 callbacks: ordinary C functions invoked from JIT'd
+ * code via jit_emit_call_abs.  Their first arg (RCX on Win64,
+ * RDI on SysV) gets loaded by jit_emit_mov_arg0_from_locals. */
+static void step3_cb_store_magic(int64_t *L) { L[3] = TEST_FXN(42); }
+static int  step3_cb_count = 0;
+static void step3_cb_increment_counter(int64_t *L) {
+  (void)L;
+  step3_cb_count++;
+}
+
+/* Step 3 proof: emit a function that does arithmetic, calls
+ * a C function, does more arithmetic, calls another C function.
+ * Verifies (a) the trampoline works, (b) RBX survives across
+ * the call so post-call emitters can still access L, and
+ * (c) multiple calls compose. */
+static int step3_call(void) {
+  jit_buf *b = jit_buf_new(512);
+  if (!b) return 1;
+
+  jit_emit_prologue(b);
+
+  /* L[2] = L[0] + L[1]   (pre-call arith) */
+  jit_emit_iadd(b, 2, 0, 1);
+
+  /* Call step3_cb_store_magic(L) -- writes FXN(42) into L[3]. */
+  jit_emit_mov_arg0_from_locals(b);
+  jit_emit_call_abs(b, (void*)step3_cb_store_magic);
+
+  /* Post-call arith: L[4] = L[2] + L[3] = 15 + 42 = 57.  This
+   * tests that L is still accessible via RBX after the call. */
+  jit_emit_iadd(b, 4, 2, 3);
+
+  /* Call step3_cb_increment_counter(L) -- bumps a global. */
+  jit_emit_mov_arg0_from_locals(b);
+  jit_emit_call_abs(b, (void*)step3_cb_increment_counter);
+
+  /* L[5] = L[4] * L[1] = 57 * 5 = 285 */
+  jit_emit_imul(b, 5, 4, 1);
+
+  jit_emit_epilogue(b);
+
+  void (*fn)(int64_t*) = (void(*)(int64_t*))jit_buf_finalize(b);
+
+  int fail = 0;
+  int64_t L[10] = {0};
+  L[0] = TEST_FXN(10);
+  L[1] = TEST_FXN(5);
+
+  step3_cb_count = 0;
+  fn(L);
+  fail += check("L[2] = 10+5",        L[2], TEST_FXN(15));
+  fail += check("L[3] = 42 (cb)",     L[3], TEST_FXN(42));
+  fail += check("L[4] = 15+42 (post)",L[4], TEST_FXN(57));
+  fail += check("L[5] = 57*5",        L[5], TEST_FXN(285));
+  if (step3_cb_count != 1) {
+    printf("FAIL  counter cb fired %d times (want 1)\n", step3_cb_count);
+    fail++;
+  } else {
+    printf("OK   counter cb fired once\n");
+  }
+
+  /* Call twice -- counter should reach 2. */
+  fn(L);
+  if (step3_cb_count != 2) {
+    printf("FAIL  counter cb fired %d times (want 2)\n", step3_cb_count);
+    fail++;
+  } else {
+    printf("OK   counter cb fired twice across two invocations\n");
+  }
+
+  jit_buf_free(b);
+  return fail;
+}
+
 int main(void) {
   int fail = 0;
   printf("=== step 0: hand-coded add ===\n");
@@ -642,6 +811,8 @@ int main(void) {
   fail += step2_loop();
   printf("\n=== step 2c: forward-jump branch ===\n");
   fail += step2_forward_jmp();
+  printf("\n=== step 3: C-runtime trampoline ===\n");
+  fail += step3_call();
   if (fail) {
     fprintf(stderr, "\n%d check(s) failed\n", fail);
     return 1;

@@ -78,6 +78,11 @@ void jit_emit_isub(jit_buf *b, int dst, int a, int x);
 void jit_emit_imul(jit_buf *b, int dst, int a, int x);
 void jit_emit_idiv(jit_buf *b, int dst, int a, int x);
 void jit_emit_irem(jit_buf *b, int dst, int a, int x);
+
+/* Bare `ret` -- 1 byte.  Useful for hand-coded test fns that
+ * don't run through the standard prologue/epilogue.  Real JIT'd
+ * functions use jit_emit_prologue + ... + jit_emit_epilogue
+ * instead.  Don't mix the two for one function. */
 void jit_emit_ret(jit_buf *b);
 
 /* ============================================================
@@ -121,5 +126,35 @@ void jit_patch_jmp_here(jit_buf *b, size_t patch_off);
 
 /* Resolve to an explicit target offset (backward jump). */
 void jit_patch_jmp_to(jit_buf *b, size_t patch_off, size_t target);
+
+/* ============================================================
+ * Step 3: prologue / epilogue / C-runtime trampoline.
+ *
+ * Real JIT'd functions bracket their body with prologue +
+ * epilogue.  The prologue saves callee-saved RBX, loads it with
+ * the platform's arg0 (the locals pointer), and allocates 32
+ * bytes of shadow space so any inner C call has Win64-correct
+ * stack alignment.  The epilogue tears it down and returns.
+ *
+ * Inside the prologue..epilogue window, all arith/jump emitters
+ * address [rbx + slot*8] (LOCALS_RM is RBX).  RBX is callee-
+ * saved on both Win64 and SysV, so it survives inner calls
+ * without per-call save/restore.
+ *
+ * `jit_emit_mov_arg0_from_locals` puts RBX back into arg0
+ * (RCX on Win64, RDI on SysV) just before a C call.
+ *
+ * `jit_emit_call_abs(target)` emits the 12-byte sequence
+ *   mov rax, imm64
+ *   call rax
+ * which works regardless of how far `target` is from the JIT
+ * region.  Caller is responsible for loading any other arg
+ * registers BEFORE this call.
+ * ============================================================ */
+
+void jit_emit_prologue(jit_buf *b);
+void jit_emit_epilogue(jit_buf *b);
+void jit_emit_mov_arg0_from_locals(jit_buf *b);
+void jit_emit_call_abs(jit_buf *b, void *target);
 
 #endif
