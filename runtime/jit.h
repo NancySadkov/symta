@@ -204,6 +204,16 @@ struct sbc_t;
 extern uint8_t jit_last_fail_opcode;
 extern size_t  jit_last_fail_offset;
 
+/* FXN* arith helpers -- function pointers so jit_sbc.c can swap
+ * in full 3-way-dispatch impls (int-int / int-float / non-int).
+ * Default (set in jit.c) is the int-only fast path, which is
+ * sufficient for the standalone self-test. */
+extern void (*jit_rt_fxnadd_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fxnsub_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fxnmul_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fxndiv_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fxnrem_helper)(int64_t *L, int dst, int a, int b);
+
 /* Trampoline-helper function pointers.  Set by the runtime
  * (jit_sbc.c) at first audit; left NULL in the standalone
  * self-test build, in which case the corresponding opcodes

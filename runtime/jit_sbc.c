@@ -20,6 +20,100 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <float.h>
+
+/* Full FXN* helpers.  Each mirrors the corresponding interpreter
+ * opcode's 3-way dispatch from sbc.c -- int-int via the FXN*
+ * macro, int-float via float promotion, non-int via MCALL to
+ * the m_<op> method id.  Without these the JIT'd code uses the
+ * int-only fallbacks in jit.c, which produces garbage for any
+ * non-int operand (the game's `Seconds*$ups` where $ups is
+ * float was the original failure mode). */
+extern int m_add, m_sub, m_mul, m_div, m_rem;
+
+static void jit_rt_fxnadd_full(int64_t *L, int dst, int a, int b) {
+  dyn aa = (dyn)L[a];
+  if (TAGIS(T_INT, aa)) {
+    dyn bb = (dyn)L[b];
+    if (TAGIS(T_INT, bb)) FXNADD(((dyn*)L)[dst], aa, bb);
+    else {
+      float fa, fb;
+      fa = (float)UNFXN(aa);
+      STFLT(fb, bb);
+      LDFLT(((dyn*)L)[dst], fa + fb);
+    }
+  } else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_add);
+  }
+}
+static void jit_rt_fxnsub_full(int64_t *L, int dst, int a, int b) {
+  dyn aa = (dyn)L[a];
+  if (TAGIS(T_INT, aa)) {
+    dyn bb = (dyn)L[b];
+    if (TAGIS(T_INT, bb)) FXNSUB(((dyn*)L)[dst], aa, bb);
+    else {
+      float fa, fb;
+      fa = (float)UNFXN(aa);
+      STFLT(fb, bb);
+      LDFLT(((dyn*)L)[dst], fa - fb);
+    }
+  } else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_sub);
+  }
+}
+static void jit_rt_fxnmul_full(int64_t *L, int dst, int a, int b) {
+  dyn aa = (dyn)L[a];
+  if (TAGIS(T_INT, aa)) {
+    dyn bb = (dyn)L[b];
+    if (TAGIS(T_INT, bb)) FXNMUL(((dyn*)L)[dst], aa, bb);
+    else {
+      float fa, fb;
+      fa = (float)UNFXN(aa);
+      STFLT(fb, bb);
+      LDFLT(((dyn*)L)[dst], fa * fb);
+    }
+  } else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_mul);
+  }
+}
+static void jit_rt_fxndiv_full(int64_t *L, int dst, int a, int b) {
+  dyn aa = (dyn)L[a];
+  if (TAGIS(T_INT, aa)) {
+    dyn bb = (dyn)L[b];
+    if (TAGIS(T_INT, bb)) FXNDIV(((dyn*)L)[dst], aa, bb);
+    else {
+      float fa, fb;
+      fa = (float)UNFXN(aa);
+      STFLT(fb, bb);
+      if (fb == 0.0f) fb = FLT_MIN;
+      LDFLT(((dyn*)L)[dst], fa / fb);
+    }
+  } else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_div);
+  }
+}
+static void jit_rt_fxnrem_full(int64_t *L, int dst, int a, int b) {
+  dyn aa = (dyn)L[a];
+  if (TAGIS(T_INT, aa)) {
+    dyn bb = (dyn)L[b];
+    if (TAGIS(T_INT, bb)) FXNREM(((dyn*)L)[dst], aa, bb);
+    else {
+      float fa, fb, r;
+      fa = (float)UNFXN(aa);
+      STFLT(fb, bb);
+      if (fb == 0.0f) fb = FLT_MIN;
+      r = fa / fb;
+      LDFLT(((dyn*)L)[dst], (r - (float)(int64_t)r) * fb);
+    }
+  } else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_rem);
+  }
+}
 
 /* Trampoline helper for SBC_LD4_0..SBC_LD4_F.  Mirrors the
  * interpreter body in sbc.c:1129:
@@ -221,6 +315,13 @@ static void jit_rt_closure_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) 
  * NULL and bails out cleanly on the corresponding opcodes. */
 static void jit_install_helpers_once(void) {
   if (jit_rt_ld4_helper) return;
+  /* Swap the FXN* helpers from int-only fallbacks to full
+   * dispatch -- the game's `Seconds*$ups` etc. need this. */
+  jit_rt_fxnadd_helper  = jit_rt_fxnadd_full;
+  jit_rt_fxnsub_helper  = jit_rt_fxnsub_full;
+  jit_rt_fxnmul_helper  = jit_rt_fxnmul_full;
+  jit_rt_fxndiv_helper  = jit_rt_fxndiv_full;
+  jit_rt_fxnrem_helper  = jit_rt_fxnrem_full;
   jit_rt_ld4_helper     = jit_rt_ld4_impl;
   jit_rt_st4_helper     = jit_rt_st4_impl;
   jit_rt_list_helper    = jit_rt_list_impl;

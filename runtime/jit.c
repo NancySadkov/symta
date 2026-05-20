@@ -449,41 +449,40 @@ static void emit_mov_rax_imm64(jit_buf *b, uint64_t imm) {
 }
 
 /* ============================================================
- * Step 5c runtime helpers (called from JIT'd code).
+ * Step 5c/5l runtime helpers (called from JIT'd code).
  *
- * Each helper mirrors one of the FXN* macros in runtime/symta.h
- * but in function form so the JIT can defer the opcode via a
- * trampolined call instead of inlining the encoding.  All five
- * take (L, dst, a, b) and write L[dst]; the return value is
- * ignored (Win64 RAX, SysV RAX -- both writable, no caller-side
- * cost).
+ * Each FXN* opcode's full semantics is a 3-way dispatch:
+ *   (a is int, b is int)  -> bit-arithmetic via the FXN* macro
+ *   (a is int, b is float)-> convert to float, compute
+ *   (a is not int)        -> ARGLIST2 + MCALL via m_<op>
  *
- * Kept here (rather than in symta.h's macro form) because the
- * JIT needs function-pointer targets and the macros aren't
- * addressable.  Semantics must stay bit-identical with the
- * macros -- divergence would silently desync interpreter and
- * JIT for any function the JIT defers. */
-void jit_rt_fxnadd(int64_t *L, int dst, int a, int b) {
+ * The runtime side (jit_sbc.c) installs full impls that cover
+ * all three paths.  The fallback impls below cover only the
+ * int-int case, sufficient for the standalone self-test that
+ * doesn't link jit_sbc.c.  Production code MUST go through
+ * sbc_jit_audit or sbc_jit_install first so the full helpers
+ * are installed before any JIT'd code calls them. */
+static void fallback_fxnadd(int64_t *L, int dst, int a, int b) {
   L[dst] = L[a] + L[b];
 }
-void jit_rt_fxnsub(int64_t *L, int dst, int a, int b) {
+static void fallback_fxnsub(int64_t *L, int dst, int a, int b) {
   L[dst] = L[a] - L[b];
 }
-void jit_rt_fxnmul(int64_t *L, int dst, int a, int b) {
-  /* FXNMUL: dst = UNFXN(a) * b -- the >> 16 detags one side so
-   * the product has exactly one tag's worth of low-zero bits.
-   * GID_SHFT = TAG_BITS = 16 (runtime/symta.h). */
+static void fallback_fxnmul(int64_t *L, int dst, int a, int b) {
   L[dst] = (L[a] >> 16) * L[b];
 }
-void jit_rt_fxndiv(int64_t *L, int dst, int a, int b) {
-  /* FXNDIV: dst = FXN(a / b) -- integer-div the tagged values
-   * (tags cancel), then re-tag.  No zero check; relies on the
-   * existing SEH/SIGFPE handler. */
+static void fallback_fxndiv(int64_t *L, int dst, int a, int b) {
   L[dst] = (L[a] / L[b]) << 16;
 }
-void jit_rt_fxnrem(int64_t *L, int dst, int a, int b) {
+static void fallback_fxnrem(int64_t *L, int dst, int a, int b) {
   L[dst] = L[a] % L[b];
 }
+
+void (*jit_rt_fxnadd_helper)(int64_t*, int, int, int) = fallback_fxnadd;
+void (*jit_rt_fxnsub_helper)(int64_t*, int, int, int) = fallback_fxnsub;
+void (*jit_rt_fxnmul_helper)(int64_t*, int, int, int) = fallback_fxnmul;
+void (*jit_rt_fxndiv_helper)(int64_t*, int, int, int) = fallback_fxndiv;
+void (*jit_rt_fxnrem_helper)(int64_t*, int, int, int) = fallback_fxnrem;
 
 /* L[dst] = FXN(imm).  Tagged-int store via mov rax, imm64; mov [rbx+dst*8], rax.
  * The caller passes the un-tagged signed value; we shift left
@@ -1099,11 +1098,11 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
       uint32_t x   = (uint32_t)bc_rd16(bc + i + 5);
       void *helper;
       switch (op) {
-        case BC_FXNADD: helper = (void*)jit_rt_fxnadd; break;
-        case BC_FXNSUB: helper = (void*)jit_rt_fxnsub; break;
-        case BC_FXNMUL: helper = (void*)jit_rt_fxnmul; break;
-        case BC_FXNDIV: helper = (void*)jit_rt_fxndiv; break;
-        case BC_FXNREM: helper = (void*)jit_rt_fxnrem; break;
+        case BC_FXNADD: helper = (void*)jit_rt_fxnadd_helper; break;
+        case BC_FXNSUB: helper = (void*)jit_rt_fxnsub_helper; break;
+        case BC_FXNMUL: helper = (void*)jit_rt_fxnmul_helper; break;
+        case BC_FXNDIV: helper = (void*)jit_rt_fxndiv_helper; break;
+        case BC_FXNREM: helper = (void*)jit_rt_fxnrem_helper; break;
         default: helper = NULL;  /* unreachable */
       }
       jit_emit_call_helper3(b, helper, dst, a, x);
