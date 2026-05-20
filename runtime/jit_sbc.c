@@ -471,7 +471,27 @@ int sbc_jit_install(struct sbc_t *sbc) {
   int installed = 0;
   const size_t HEADER = 5;
 
+  /* Bisection helpers:
+   *   SYMTA_JIT_MAX_FN=N    -- install at most N functions
+   *   SYMTA_JIT_SKIP_FN=N   -- install all EXCEPT the Nth
+   * Combined with SYMTA_JIT_FILTER, isolates a single fn. */
+  int max_fn  = -1;
+  int skip_fn = -1;
+  {
+    const char *v;
+    if ((v = getenv("SYMTA_JIT_MAX_FN"))  && v[0]) max_fn  = atoi(v);
+    if ((v = getenv("SYMTA_JIT_SKIP_FN")) && v[0]) skip_fn = atoi(v);
+  }
+
   for (int i = 0; i < nfns; i++) {
+    if (max_fn >= 0 && installed >= max_fn) break;
+    if (skip_fn >= 0 && installed == skip_fn) {
+      /* Skip THIS one but keep going.  We need to bump
+       * `installed` to keep the indices aligned with the
+       * print log; do that by translating-and-discarding. */
+      installed++;
+      continue;
+    }
     uint32_t start = offs[i];
     /* Find this start's slot in sorted -> next-sorted is the
      * upper bound on the body's bytecode range. */
@@ -507,6 +527,31 @@ int sbc_jit_install(struct sbc_t *sbc) {
     uint32_t hook_idx = (uint32_t)sbc->hooks[i];
     hooks_heap[hook_idx].handler = (psf_t)&jit_adapter;
     hooks_heap[hook_idx].payload = (uint8_t*)payload;
+    if (getenv("SYMTA_JIT_PRINT_FNS")) {
+      /* Print each installed fn's index + byte range + name (if
+       * fnmeta is populated) so we can map "the 38th translated
+       * fn crashes" back to a specific source-level fn. */
+      const char *fname = "?";
+      int row = 0, col = 0;
+      if (sbc->rtot && sbc->rtot[0].table) {
+        fn_meta_t *t = (fn_meta_t*)sbc->rtot[0].table;
+        if (i < (int)sbc->rtot[0].size && t[i].name) {
+          fname = (const char*)t[i].name;
+          row = t[i].row;
+          col = t[i].col;
+        }
+      }
+      fprintf(stderr, "jit-fn[%d]: idx=%d body_offset=0x%x len=%zu row=%d col=%d name=%s\n",
+              installed, i, (unsigned)(start + HEADER), body_len, row, col, fname);
+      /* Dump the opcode stream so we can see what shape this
+       * function has -- helps spot which BC_* path is buggy. */
+      fprintf(stderr, "  bytes:");
+      for (size_t k = 0; k < body_len; k++) {
+        fprintf(stderr, " %02x", body[k]);
+      }
+      fprintf(stderr, "\n");
+      fflush(stderr);
+    }
     installed++;
   }
 
