@@ -157,4 +157,27 @@ void jit_emit_epilogue(jit_buf *b);
 void jit_emit_mov_arg0_from_locals(jit_buf *b);
 void jit_emit_call_abs(jit_buf *b, void *target);
 
+/* ============================================================
+ * Step 4: SBC bytecode -> x86 translator.
+ *
+ * Walks `n` bytes of SBC bytecode starting at `bc` and emits an
+ * equivalent x86_64 function (prologue + body + epilogue).  The
+ * returned buffer is freshly allocated and not yet finalized --
+ * the caller should `jit_buf_finalize` it and cast to the
+ * appropriate function pointer.
+ *
+ * The translator handles a strict subset: SBC_NOP, the typed-
+ * int arith family (IADD/ISUB/IMUL/IDIV/IREM), the typed-int
+ * comparisons (ILT/IGT/ILTE/IGTE), and the LEAVE/LEAVE0
+ * terminators.  Any other opcode -- function calls, allocation,
+ * branches, MCALL, etc. -- causes the translator to free the
+ * buffer and return NULL so the caller falls back to the
+ * interpreter.  Step 5 will widen this via the C-runtime
+ * trampoline.
+ *
+ * Return value: a fresh `jit_buf` on success (the caller owns
+ * it), NULL if any opcode in the stream isn't supported.
+ * ============================================================ */
+jit_buf *jit_translate(const uint8_t *bc, size_t n);
+
 #endif

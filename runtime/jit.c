@@ -346,6 +346,110 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #endif
 }
 
+/* ============================================================
+ * Step 4: SBC opcode constants (subset).
+ *
+ * Locally `#define`d rather than `#include`d from runtime/sif.h
+ * so the self-test build stays independent of the rest of the
+ * runtime headers.  These numeric values are the on-disk format
+ * and shouldn't change; if they ever do, the divergence will
+ * surface as a self-test failure here.
+ * ============================================================ */
+#define BC_NOP    0x00
+#define BC_LEAVE  0x02
+#define BC_LEAVE0 0x03
+#define BC_IADD   0xA3
+#define BC_ISUB   0xA4
+#define BC_IMUL   0xA5
+#define BC_IDIV   0xA6
+#define BC_IREM   0xA7
+#define BC_ILT    0xAA
+#define BC_IGT    0xAB
+#define BC_ILTE   0xAC
+#define BC_IGTE   0xAD
+
+/* Little-endian uint16_t read.  SBC operands are encoded LE; the
+ * RD16 macro in sbc.c does the same thing inline. */
+static uint16_t bc_rd16(const uint8_t *p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+/* Zero RAX -- emitted as the return value for SBC_LEAVE0.
+ * Encoding: xor eax, eax (0x31 0xc0).  Zeroes the full RAX
+ * because writes to 32-bit subregs implicitly clear the upper
+ * 32 bits.  Shorter than `mov rax, 0`. */
+static void emit_xor_rax_rax(jit_buf *b) {
+  jit_emit_u8(b, 0x31);
+  jit_emit_u8(b, 0xc0);
+}
+
+jit_buf *jit_translate(const uint8_t *bc, size_t n) {
+  /* 16 bytes of x86 per SBC instruction is a generous upper bound
+   * (IDIV/IREM emit ~14, comparisons ~16, arith ~10).  Plus 6
+   * for prologue and 7 for epilogue. */
+  jit_buf *b = jit_buf_new(n * 16 + 64);
+  if (!b) return NULL;
+
+  jit_emit_prologue(b);
+
+  size_t i = 0;
+  while (i < n) {
+    uint8_t op = bc[i];
+    switch (op) {
+    case BC_NOP:
+      i += 1;
+      break;
+
+    case BC_IADD: case BC_ISUB: case BC_IMUL: case BC_IDIV:
+    case BC_IREM: case BC_ILT:  case BC_IGT:  case BC_ILTE: case BC_IGTE: {
+      if (i + 7 > n) { jit_buf_free(b); return NULL; }
+      int dst = bc_rd16(bc + i + 1);
+      int a   = bc_rd16(bc + i + 3);
+      int x   = bc_rd16(bc + i + 5);
+      switch (op) {
+        case BC_IADD: jit_emit_iadd(b, dst, a, x); break;
+        case BC_ISUB: jit_emit_isub(b, dst, a, x); break;
+        case BC_IMUL: jit_emit_imul(b, dst, a, x); break;
+        case BC_IDIV: jit_emit_idiv(b, dst, a, x); break;
+        case BC_IREM: jit_emit_irem(b, dst, a, x); break;
+        case BC_ILT:  jit_emit_ilt (b, dst, a, x); break;
+        case BC_IGT:  jit_emit_igt (b, dst, a, x); break;
+        case BC_ILTE: jit_emit_ilte(b, dst, a, x); break;
+        case BC_IGTE: jit_emit_igte(b, dst, a, x); break;
+      }
+      i += 7;
+      break;
+    }
+
+    case BC_LEAVE: {
+      if (i + 3 > n) { jit_buf_free(b); return NULL; }
+      int src = bc_rd16(bc + i + 1);
+      emit_mov_rax_from_slot(b, src);
+      jit_emit_epilogue(b);
+      return b;
+    }
+
+    case BC_LEAVE0:
+      emit_xor_rax_rax(b);
+      jit_emit_epilogue(b);
+      return b;
+
+    default:
+      /* Unsupported opcode -- bail out so the caller falls back
+       * to the interpreter.  Step 5 will widen coverage by
+       * trampolining unsupported opcodes through the C runtime. */
+      jit_buf_free(b);
+      return NULL;
+    }
+  }
+
+  /* Fell off the end without a LEAVE.  Real SBC functions always
+   * end in some flavour of LEAVE, but be defensive. */
+  emit_xor_rax_rax(b);
+  jit_emit_epilogue(b);
+  return b;
+}
+
 void jit_emit_call_abs(jit_buf *b, void *target) {
   /* Two-instruction call: load the absolute address into RAX
    * via `mov rax, imm64` (10 bytes) then `call rax` (2 bytes).
@@ -799,6 +903,86 @@ static int step3_call(void) {
   return fail;
 }
 
+/* Step 4 proof: feed a hand-crafted SBC bytecode stream
+ * through jit_translate and verify the resulting x86 function
+ * computes the same thing the interpreter would.
+ *
+ * Program:
+ *   L[2] = L[0] + L[1]         IADD
+ *   L[3] = L[0] * L[1]         IMUL
+ *   L[4] = L[3] - L[2]         ISUB
+ *   L[5] = L[0] < L[1]         ILT  (0 or 1, FXN-tagged)
+ *   return L[4]                LEAVE
+ *
+ * Inputs: L[0]=FXN(10), L[1]=FXN(3).
+ * Expected:
+ *   L[2] = FXN(13)
+ *   L[3] = FXN(30)
+ *   L[4] = FXN(17)
+ *   L[5] = FXN(0)  (10 < 3 is false)
+ *   return value = L[4] = FXN(17)
+ */
+static int step4_translate(void) {
+  static const uint8_t bytecode[] = {
+    BC_IADD, 2,0, 0,0, 1,0,   /* L[2] = L[0] + L[1] */
+    BC_IMUL, 3,0, 0,0, 1,0,   /* L[3] = L[0] * L[1] */
+    BC_ISUB, 4,0, 3,0, 2,0,   /* L[4] = L[3] - L[2] */
+    BC_ILT,  5,0, 0,0, 1,0,   /* L[5] = L[0] < L[1] */
+    BC_LEAVE, 4,0,            /* return L[4]        */
+  };
+
+  jit_buf *b = jit_translate(bytecode, sizeof(bytecode));
+  if (!b) {
+    printf("FAIL  jit_translate returned NULL\n");
+    return 1;
+  }
+  int64_t (*fn)(int64_t*) = (int64_t(*)(int64_t*))jit_buf_finalize(b);
+
+  int fail = 0;
+  int64_t L[10] = {0};
+  L[0] = TEST_FXN(10);
+  L[1] = TEST_FXN(3);
+  int64_t ret = fn(L);
+  fail += check("IADD L[2] = 10+3",   L[2], TEST_FXN(13));
+  fail += check("IMUL L[3] = 10*3",   L[3], TEST_FXN(30));
+  fail += check("ISUB L[4] = 30-13",  L[4], TEST_FXN(17));
+  fail += check("ILT  L[5] = 10<3",   L[5], TEST_FXN(0));
+  fail += check("LEAVE returns L[4]", ret,  TEST_FXN(17));
+
+  jit_buf_free(b);
+
+  /* Negative test: unsupported opcode -- jit_translate must
+   * return NULL so the caller knows to fall back. */
+  static const uint8_t bad_bytecode[] = {
+    BC_IADD, 2,0, 0,0, 1,0,
+    0xFF,                     /* not a real opcode */
+    BC_LEAVE0,
+  };
+  jit_buf *b2 = jit_translate(bad_bytecode, sizeof(bad_bytecode));
+  if (b2 != NULL) {
+    printf("FAIL  jit_translate accepted unsupported opcode 0xFF\n");
+    jit_buf_free(b2);
+    fail++;
+  } else {
+    printf("OK   jit_translate rejected unsupported opcode 0xFF\n");
+  }
+
+  /* Negative test: truncated operand stream. */
+  static const uint8_t truncated[] = {
+    BC_IADD, 2,0, 0,0,        /* missing two bytes of `x` operand */
+  };
+  jit_buf *b3 = jit_translate(truncated, sizeof(truncated));
+  if (b3 != NULL) {
+    printf("FAIL  jit_translate accepted truncated stream\n");
+    jit_buf_free(b3);
+    fail++;
+  } else {
+    printf("OK   jit_translate rejected truncated stream\n");
+  }
+
+  return fail;
+}
+
 int main(void) {
   int fail = 0;
   printf("=== step 0: hand-coded add ===\n");
@@ -813,6 +997,8 @@ int main(void) {
   fail += step2_forward_jmp();
   printf("\n=== step 3: C-runtime trampoline ===\n");
   fail += step3_call();
+  printf("\n=== step 4: SBC -> x86 translator ===\n");
+  fail += step4_translate();
   if (fail) {
     fprintf(stderr, "\n%d check(s) failed\n", fail);
     return 1;
