@@ -271,6 +271,115 @@ void jit_emit_ret(jit_buf *b) {
   jit_emit_u8(b, 0xc3);
 }
 
+/* ============================================================
+ * Step 2: comparisons + jumps.
+ * ============================================================ */
+
+/* cmp rax, [locals_reg + slot*8] -- 48 3B + ModR/M + disp */
+static void emit_cmp_rax_to_slot(jit_buf *b, int slot) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x3b);
+  emit_mem_op(b, 0, slot);
+}
+
+/* setcc al -- one of 0F 9C/9D/9E/9F + C0 */
+static void emit_setcc_al(jit_buf *b, uint8_t cc_opcode) {
+  jit_emit_u8(b, 0x0f);
+  jit_emit_u8(b, cc_opcode);  /* 0x9c=setl 0x9d=setge 0x9e=setle 0x9f=setg */
+  jit_emit_u8(b, 0xc0);
+}
+
+/* movzx rax, al -- 48 0F B6 C0 */
+static void emit_movzx_rax_al(jit_buf *b) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x0f);
+  jit_emit_u8(b, 0xb6);
+  jit_emit_u8(b, 0xc0);
+}
+
+/* Compare-and-FXN-store helper shared by ILT/IGT/ILTE/IGTE. */
+static void emit_cmp_op(jit_buf *b, int dst, int a, int x, uint8_t setcc_opcode) {
+  emit_mov_rax_from_slot(b, a);
+  emit_cmp_rax_to_slot(b, x);
+  emit_setcc_al(b, setcc_opcode);
+  emit_movzx_rax_al(b);
+  emit_shl_rax(b, 16);  /* FXN-tag the 0/1 result */
+  emit_mov_slot_from_rax(b, dst);
+}
+
+void jit_emit_ilt (jit_buf *b, int dst, int a, int x) {
+  emit_cmp_op(b, dst, a, x, 0x9c);  /* setl */
+}
+void jit_emit_igt (jit_buf *b, int dst, int a, int x) {
+  emit_cmp_op(b, dst, a, x, 0x9f);  /* setg */
+}
+void jit_emit_ilte(jit_buf *b, int dst, int a, int x) {
+  emit_cmp_op(b, dst, a, x, 0x9e);  /* setle */
+}
+void jit_emit_igte(jit_buf *b, int dst, int a, int x) {
+  emit_cmp_op(b, dst, a, x, 0x9d);  /* setge */
+}
+
+size_t jit_here(jit_buf *b) { return b->len; }
+
+size_t jit_emit_jmp(jit_buf *b) {
+  jit_emit_u8(b, 0xe9);
+  size_t patch = b->len;
+  jit_emit_u32(b, 0);  /* placeholder */
+  return patch;
+}
+
+/* cmp qword ptr [locals_reg + slot*8], 0 -- compare a slot
+ * against zero so the following jcc tests slot truthiness.
+ * Encoding: 48 83 + ModR/M(/7) + disp + imm8(0). */
+static void emit_cmp_slot_zero(jit_buf *b, int slot) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x83);
+  emit_mem_op(b, 7, slot);  /* /7 = cmp imm */
+  jit_emit_u8(b, 0x00);
+}
+
+size_t jit_emit_jnz_slot(jit_buf *b, int slot) {
+  emit_cmp_slot_zero(b, slot);
+  jit_emit_u8(b, 0x0f);
+  jit_emit_u8(b, 0x85);  /* jne rel32 */
+  size_t patch = b->len;
+  jit_emit_u32(b, 0);
+  return patch;
+}
+
+size_t jit_emit_jz_slot(jit_buf *b, int slot) {
+  emit_cmp_slot_zero(b, slot);
+  jit_emit_u8(b, 0x0f);
+  jit_emit_u8(b, 0x84);  /* je rel32 */
+  size_t patch = b->len;
+  jit_emit_u32(b, 0);
+  return patch;
+}
+
+/* Write disp32 = target - (patch_off + 4) into the placeholder. */
+void jit_patch_jmp_to(jit_buf *b, size_t patch_off, size_t target) {
+  int64_t rel = (int64_t)target - (int64_t)(patch_off + 4);
+  /* Programmer error if the displacement doesn't fit; we'd
+   * have to emit a long-form jump or chain trampolines, which
+   * is out of scope for step 2.  Aborting here is louder than
+   * silently truncating. */
+  if (rel < INT32_MIN || rel > INT32_MAX) {
+    fprintf(stderr, "jit_patch_jmp_to: rel32 overflow (%lld bytes)\n",
+            (long long)rel);
+    abort();
+  }
+  uint32_t disp = (uint32_t)(int32_t)rel;
+  b->code[patch_off + 0] = (uint8_t)(disp & 0xff);
+  b->code[patch_off + 1] = (uint8_t)((disp >> 8) & 0xff);
+  b->code[patch_off + 2] = (uint8_t)((disp >> 16) & 0xff);
+  b->code[patch_off + 3] = (uint8_t)((disp >> 24) & 0xff);
+}
+
+void jit_patch_jmp_here(jit_buf *b, size_t patch_off) {
+  jit_patch_jmp_to(b, patch_off, b->len);
+}
+
 #ifdef JIT_SELF_TEST
 
 /* Mirror the FXN tag-encoding from runtime/symta.h so the test
@@ -385,12 +494,154 @@ static int step1_arith(void) {
   return fail;
 }
 
+/* Step 2 proof, part A: comparison emitters store FXN-tagged
+ * 0/1 in the dst slot.  Tests all four predicates on positive
+ * and negative operand pairs. */
+static int step2_compares(void) {
+  jit_buf *b = jit_buf_new(256);
+  if (!b) return 1;
+
+  /* L[2]=ILT(0,1) L[3]=IGT(0,1) L[4]=ILTE(0,1) L[5]=IGTE(0,1) */
+  jit_emit_ilt (b, 2, 0, 1);
+  jit_emit_igt (b, 3, 0, 1);
+  jit_emit_ilte(b, 4, 0, 1);
+  jit_emit_igte(b, 5, 0, 1);
+  jit_emit_ret(b);
+
+  void (*fn)(int64_t*) = (void(*)(int64_t*))jit_buf_finalize(b);
+
+  int fail = 0;
+  int64_t L[10] = {0};
+
+  L[0] = TEST_FXN(3); L[1] = TEST_FXN(5);
+  fn(L);
+  fail += check("ILT  3<5",   L[2], TEST_FXN(1));
+  fail += check("IGT  3>5",   L[3], TEST_FXN(0));
+  fail += check("ILTE 3<=5",  L[4], TEST_FXN(1));
+  fail += check("IGTE 3>=5",  L[5], TEST_FXN(0));
+
+  L[0] = TEST_FXN(5); L[1] = TEST_FXN(5);
+  fn(L);
+  fail += check("ILT  5<5",   L[2], TEST_FXN(0));
+  fail += check("IGT  5>5",   L[3], TEST_FXN(0));
+  fail += check("ILTE 5<=5",  L[4], TEST_FXN(1));
+  fail += check("IGTE 5>=5",  L[5], TEST_FXN(1));
+
+  L[0] = TEST_FXN(-3); L[1] = TEST_FXN(-5);
+  fn(L);
+  fail += check("ILT  -3<-5", L[2], TEST_FXN(0));
+  fail += check("IGT  -3>-5", L[3], TEST_FXN(1));
+
+  jit_buf_free(b);
+  return fail;
+}
+
+/* Step 2 proof, part B: assemble a countdown-and-sum loop
+ * entirely in emitted x86 and verify the result matches the
+ * closed-form formula.
+ *
+ *   L[0] = 0                      ; accumulator (init by caller)
+ *   L[1] = N                      ; counter   (init by caller)
+ *   L[2] = 1                      ; step      (init by caller)
+ *  loop:
+ *   L[0] = L[0] + L[1]            ; iadd
+ *   L[1] = L[1] - L[2]            ; isub
+ *   if L[1] != 0: goto loop       ; jnz_slot L[1]
+ *   ret
+ *
+ * For N=10, expect L[0] = 10+9+...+1 = 55. */
+static int step2_loop(void) {
+  jit_buf *b = jit_buf_new(256);
+  if (!b) return 1;
+
+  size_t loop_start = jit_here(b);
+  jit_emit_iadd(b, 0, 0, 1);
+  jit_emit_isub(b, 1, 1, 2);
+  size_t back = jit_emit_jnz_slot(b, 1);
+  jit_patch_jmp_to(b, back, loop_start);
+  jit_emit_ret(b);
+
+  void (*fn)(int64_t*) = (void(*)(int64_t*))jit_buf_finalize(b);
+
+  int64_t L[10] = {0};
+  L[0] = 0;
+  L[1] = TEST_FXN(10);
+  L[2] = TEST_FXN(1);
+  fn(L);
+
+  int fail = 0;
+  fail += check("loop sum 1..10", L[0], TEST_FXN(55));
+
+  /* Also try N=100 -> 5050. */
+  L[0] = 0;
+  L[1] = TEST_FXN(100);
+  L[2] = TEST_FXN(1);
+  fn(L);
+  fail += check("loop sum 1..100", L[0], TEST_FXN(5050));
+
+  jit_buf_free(b);
+  return fail;
+}
+
+/* Step 2 proof, part C: forward jump.  Emits an `if (L[0] > L[1])
+ * L[2] = L[0]; else L[2] = L[1]` max-of-two using a comparison
+ * + jump-forward sequence. */
+static int step2_forward_jmp(void) {
+  jit_buf *b = jit_buf_new(256);
+  if (!b) return 1;
+
+  /* L[3] = IGT L[0] L[1]      ; 1 if L[0] > L[1] */
+  jit_emit_igt(b, 3, 0, 1);
+
+  /* if L[3]: jump to "take_a" branch */
+  size_t take_a = jit_emit_jnz_slot(b, 3);
+
+  /* else: L[2] = L[1] (b is bigger); jump to end */
+  jit_emit_iadd(b, 2, 1, 4);  /* L[2] = L[1] + L[4] where L[4]=0 */
+  size_t end_jmp = jit_emit_jmp(b);
+
+  /* take_a:  L[2] = L[0] */
+  jit_patch_jmp_here(b, take_a);
+  jit_emit_iadd(b, 2, 0, 4);  /* L[2] = L[0] + L[4] where L[4]=0 */
+
+  /* end: */
+  jit_patch_jmp_here(b, end_jmp);
+  jit_emit_ret(b);
+
+  void (*fn)(int64_t*) = (void(*)(int64_t*))jit_buf_finalize(b);
+
+  int fail = 0;
+  int64_t L[10] = {0};
+  L[4] = 0;  /* zero scratch */
+
+  L[0] = TEST_FXN(10); L[1] = TEST_FXN(3);
+  fn(L);
+  fail += check("max(10,3)", L[2], TEST_FXN(10));
+
+  L[0] = TEST_FXN(-5); L[1] = TEST_FXN(7);
+  fn(L);
+  fail += check("max(-5,7)", L[2], TEST_FXN(7));
+
+  L[0] = TEST_FXN(4); L[1] = TEST_FXN(4);
+  fn(L);
+  fail += check("max(4,4)", L[2], TEST_FXN(4));
+
+  jit_buf_free(b);
+  return fail;
+}
+
 int main(void) {
   int fail = 0;
   printf("=== step 0: hand-coded add ===\n");
   fail += step0_add();
   printf("\n=== step 1: typed-int arith emitters ===\n");
   fail += step1_arith();
+  printf("\n=== step 2a: comparison emitters ===\n");
+  fail += step2_compares();
+  printf("\n=== step 2b: backward-jump loop ===\n");
+  fail += step2_loop();
+  printf("\n=== step 2c: forward-jump branch ===\n");
+  fail += step2_forward_jmp();
   if (fail) {
     fprintf(stderr, "\n%d check(s) failed\n", fail);
     return 1;

@@ -80,4 +80,46 @@ void jit_emit_idiv(jit_buf *b, int dst, int a, int x);
 void jit_emit_irem(jit_buf *b, int dst, int a, int x);
 void jit_emit_ret(jit_buf *b);
 
+/* ============================================================
+ * Step 2: control flow + typed-int comparison emitters.
+ *
+ * Comparisons (SBC_I{LT,GT,LTE,GTE}) write a FXN-tagged 0/1
+ * into L[dst].  Sequence: mov rax, [a]; cmp rax, [b]; setcc al;
+ * movzx rax, al; shl rax, 16; mov [dst], rax.
+ *
+ * Jumps use rel32 displacements.  Forward references emit a
+ * placeholder displacement and return the OFFSET of that
+ * 4-byte slot; once the target is known, `jit_patch_jmp_here`
+ * (target = current emit position) or `jit_patch_jmp_to`
+ * (explicit target offset, for backward jumps via
+ * `jit_here`) writes the real displacement.
+ *
+ * Slot-truthy branches (SBC_B-equivalent for typed-int) emit
+ * `cmp qword ptr [L + slot*8], 0` then `jnz`/`jz rel32`.
+ * ============================================================ */
+
+void jit_emit_ilt (jit_buf *b, int dst, int a, int x);
+void jit_emit_igt (jit_buf *b, int dst, int a, int x);
+void jit_emit_ilte(jit_buf *b, int dst, int a, int x);
+void jit_emit_igte(jit_buf *b, int dst, int a, int x);
+
+/* Current emit position -- used as a label target for back-jumps. */
+size_t jit_here(jit_buf *b);
+
+/* Unconditional jmp rel32 with a placeholder displacement;
+ * returns the offset of the 4-byte disp field for patching. */
+size_t jit_emit_jmp(jit_buf *b);
+
+/* Conditional jump on L[slot]'s truthiness (0 => falsy).
+ * Returns the displacement-field offset for patching. */
+size_t jit_emit_jnz_slot(jit_buf *b, int slot);
+size_t jit_emit_jz_slot (jit_buf *b, int slot);
+
+/* Resolve a pending jump's displacement: target = current
+ * emit position (forward jump completing here). */
+void jit_patch_jmp_here(jit_buf *b, size_t patch_off);
+
+/* Resolve to an explicit target offset (backward jump). */
+void jit_patch_jmp_to(jit_buf *b, size_t patch_off, size_t target);
+
 #endif
