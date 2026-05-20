@@ -169,10 +169,44 @@ method_return_type RT M =
   // expand_block_item_method.
   | KnownRet GMethodReturns.("[RT].[M]")
   | when got KnownRet: ret KnownRet
-  // Stage 3: hardcoded universal shortcuts.
+  // Stage 3: hardcoded universal shortcuts.  Methods whose return
+  // type is uniform across all receivers in their category --
+  // adding these avoids needing 80+ per-method annotations in
+  // core_.s to register the same fact.
+  //
+  // Size / hash / char-code returners produce int.
   | when M >< "n" and RT^is_sequence_type: ret "int"
   | when M >< "hash": ret "int"
   | when M >< "code" and (RT >< "text" or RT >< "fixtext"): ret "int"
+  // Sequence navigation: returning a portion of a list-shaped
+  // receiver preserves shape.  Conservative -- only fires for
+  // list-shaped (NOT text/fixtext/bytes), since their analogous
+  // methods (text.tail, text.take) return text, not list.
+  | when (M >< "tail" or M >< "lead" or M >< "take" or M >< "drop")
+         and RT^is_list_shaped_receiver:
+    | ret RT
+  // text-receiver navigation returns text.
+  | when (M >< "tail" or M >< "lead" or M >< "take" or M >< "drop"
+          or M >< "upto" or M >< "wout" or M >< "u" or M >< "d"
+          or M >< "title")
+         and (RT >< "text" or RT >< "fixtext"):
+    | ret "text"
+  // Universal `.l` -- convert receiver to list view.  Defined
+  // on text/fixtext/bytes/all list-shaped types -- all return
+  // a concrete list.
+  | when M >< "l" and (RT^is_sequence_type or RT^is_list_shaped_receiver):
+    | ret "list"
+  // Universal `.f` -- "force to plain list" (drops cons/view
+  // structure).  Same return regardless of subtype.
+  | when M >< "f" and RT^is_list_shaped_receiver: ret "list"
+  // Filter/transform methods return a plain list.  These
+  // include keep/skip/map/rmap on list-shaped receivers (text
+  // versions return text, handled separately above).
+  | when (M >< "keep" or M >< "skip" or M >< "map" or M >< "rmap")
+         and RT^is_list_shaped_receiver:
+    | ret "list"
+  // `is_*` predicates universally return int (0/1).
+  | when M.is_text and M.n > 3 and M.take(3) >< "is_": ret "int"
   | No
 
 // TS-3.13: unify the types of a list of case-arm body expressions.

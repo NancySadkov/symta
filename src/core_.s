@@ -355,7 +355,7 @@ text.change K V = [@$take(K) V @$drop(K+1)].text
 
 list.n =
   @"Length of a list -- O(1) on regular lists."
-  S 0
+  S 0^int
   till $end
   | Me =  $tail
   | S+
