@@ -359,6 +359,9 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_LEAVE  0x02
 #define BC_LEAVE0 0x03
 #define BC_CNAS   0x14    /* function-prologue nargs check */
+#define BC_MOVE   0x19    /* dst=u16 src=u16; L[dst]=L[src] */
+#define BC_MOVE8  0x1A    /* dst=u8  src=u8;  L[dst]=L[src] */
+#define BC_MOVENO 0x1C    /* dst=u16; L[dst]=No (a fixed immediate) */
 #define BC_JMP    0x04
 #define BC_JMP16  0x05    /* opcode + int16 PC-relative diff */
 #define BC_B      0x06
@@ -485,6 +488,9 @@ typedef struct {
 uint8_t jit_last_fail_opcode = 0;
 size_t  jit_last_fail_offset = 0;
 
+/* Trampoline helpers set by the runtime side.  See jit.h. */
+void (*jit_rt_ld4_helper)(int64_t *L, int dst, int src, int index) = NULL;
+
 jit_buf *jit_translate(const uint8_t *bc, size_t n) {
   /* x86 expansion factor.  Worst case so far is the comparison
    * sequence at ~16 bytes per opcode; B is ~12 bytes; prologue
@@ -527,6 +533,74 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
                        fail = 1; goto done; }
       i += 3;
       break;
+
+    case BC_MOVE: {
+      /* SBC_MOVE: opcode + dst(u16) + src(u16).
+       * L[dst] = L[src]  via  mov rax, [src]; mov [dst], rax. */
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      int dst = bc_rd16(bc + i + 1);
+      int src = bc_rd16(bc + i + 3);
+      emit_mov_rax_from_slot(b, src);
+      emit_mov_slot_from_rax(b, dst);
+      i += 5;
+      break;
+    }
+    case BC_MOVE8: {
+      /* SBC_MOVE8: opcode + dst(u8) + src(u8). */
+      if (i + 3 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      int dst = bc[i + 1];
+      int src = bc[i + 2];
+      emit_mov_rax_from_slot(b, src);
+      emit_mov_slot_from_rax(b, dst);
+      i += 3;
+      break;
+    }
+    case 0x6A: case 0x6B: case 0x6C: case 0x6D:
+    case 0x6E: case 0x6F: case 0x70: case 0x71:
+    case 0x72: case 0x73: case 0x74: case 0x75:
+    case 0x76: case 0x77: case 0x78: case 0x79: {
+      /* SBC_LD4_0 .. SBC_LD4_F (struct field load family).
+       * Encoding: opcode byte (carries the field index in its
+       * low nibble of `op - 0x6A`) + 1 operand byte where
+       * dst = opr & 0xF, src = opr >> 4 -- both 4-bit slot
+       * indices into L[0..15].  Body:
+       *   L[dst] = ((void**)O_PTR(L[src]))[index]
+       * Requires HEAP_BASE access; trampolined via a runtime
+       * helper installed by jit_sbc.c.  In the standalone
+       * self-test build the helper is NULL and we bail out. */
+      if (i + 2 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_ld4_helper) { jit_last_fail_opcode = op;
+                                jit_last_fail_offset = i;
+                                fail = 1; goto done; }
+      int index = op - 0x6A;
+      uint8_t opr = bc[i + 1];
+      uint32_t dst = (uint32_t)(opr & 0xF);
+      uint32_t src = (uint32_t)(opr >> 4);
+      jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper,
+                            dst, src, (uint32_t)index);
+      i += 2;
+      break;
+    }
+
+    case BC_MOVENO: {
+      /* SBC_MOVENO: opcode + dst(u16); L[dst] = No.
+       * No = MKIMM(T_NO=14, 0) = (0 << GID_SHFT=16) | (14 << FLG_BITS=1) = 28
+       * (i.e. the constant 0x1C as a tagged dyn). */
+      if (i + 3 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      int dst = bc_rd16(bc + i + 1);
+      emit_mov_rax_imm64(b, 0x1C);
+      emit_mov_slot_from_rax(b, dst);
+      i += 3;
+      break;
+    }
 
     case BC_IADD: case BC_ISUB: case BC_IMUL: case BC_IDIV:
     case BC_IREM: case BC_ILT:  case BC_IGT:  case BC_ILTE: case BC_IGTE: {

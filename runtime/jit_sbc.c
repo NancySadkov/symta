@@ -21,6 +21,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Trampoline helper for SBC_LD4_0..SBC_LD4_F.  Mirrors the
+ * interpreter body in sbc.c:1129:
+ *   L[dst] = ((void**)O_PTR(L[src]))[index]
+ * O_PTR un-tags the dyn into a heap pointer.  Requires access
+ * to HEAP_BASE (api_g.heap0) and the GID_SHFT constant from
+ * runtime/symta.h. */
+static void jit_rt_ld4_impl(int64_t *L, int dst, int src, int index) {
+  void **base = (void**)O_PTR((dyn)L[src]);
+  L[dst] = (int64_t)base[index];
+}
+
+/* Install the helper on first audit so the standalone JIT
+ * self-test (which doesn't link jit_sbc.c) keeps the pointer
+ * NULL and bails out cleanly on BC_LD4_*. */
+static void jit_install_helpers_once(void) {
+  if (jit_rt_ld4_helper) return;
+  jit_rt_ld4_helper = jit_rt_ld4_impl;
+}
+
 /* Read a 24-bit little-endian unsigned int.  Mirrors the
  * RD24 macro used by the interpreter's main dispatch loop. */
 static uint32_t fntbl_read24(const uint8_t *p) {
@@ -38,6 +57,7 @@ static int u32_cmp(const void *a, const void *b) {
 
 int sbc_jit_audit(struct sbc_t *sbc) {
   if (!sbc || !sbc->fntbl || sbc->fntbl_sz < 3) return 0;
+  jit_install_helpers_once();
 
   int nfns = (int)(sbc->fntbl_sz / 3);
   if (nfns <= 0) return 0;
