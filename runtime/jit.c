@@ -1754,6 +1754,45 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       break;
     }
 
+    case 0x2F: case 0x30: {
+      /* SBC_IMMB64 (0x2F): opcode + dst(u8) + imm(u64) = 10 bytes.
+       * SBC_IMM64  (0x30): opcode + dst(u16) + imm(u64) = 11 bytes.
+       * Body: L[dst] = (dyn)imm -- the imm is a pre-tagged 64-bit
+       * value (the compiler bakes in the dyn-format constant).
+       * Inline as `mov rax, imm64` + slot store; 17 bytes per site
+       * vs ~30 bytes for a helper call, AND no call overhead. */
+      int wide = (op == 0x30);
+      int op_len = wide ? 11 : 10;
+      if (i + op_len > n) { fail = 1; goto done; }
+      int dst;
+      uint64_t imm;
+      if (wide) {
+        dst = bc_rd16(bc + i + 1);
+        imm = (uint64_t)bc[i + 3]
+            | ((uint64_t)bc[i + 4]  << 8)
+            | ((uint64_t)bc[i + 5]  << 16)
+            | ((uint64_t)bc[i + 6]  << 24)
+            | ((uint64_t)bc[i + 7]  << 32)
+            | ((uint64_t)bc[i + 8]  << 40)
+            | ((uint64_t)bc[i + 9]  << 48)
+            | ((uint64_t)bc[i + 10] << 56);
+      } else {
+        dst = bc[i + 1];
+        imm = (uint64_t)bc[i + 2]
+            | ((uint64_t)bc[i + 3] << 8)
+            | ((uint64_t)bc[i + 4] << 16)
+            | ((uint64_t)bc[i + 5] << 24)
+            | ((uint64_t)bc[i + 6] << 32)
+            | ((uint64_t)bc[i + 7] << 40)
+            | ((uint64_t)bc[i + 8] << 48)
+            | ((uint64_t)bc[i + 9] << 56);
+      }
+      emit_mov_rax_imm64(b, imm);
+      emit_mov_slot_from_rax(b, dst);
+      i += op_len;
+      break;
+    }
+
     case BC_LEAVE: {
       if (i + 3 > n) { fail = 1; goto done; }
       int src = bc_rd16(bc + i + 1);
