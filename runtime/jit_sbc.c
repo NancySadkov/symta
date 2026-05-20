@@ -32,12 +32,51 @@ static void jit_rt_ld4_impl(int64_t *L, int dst, int src, int index) {
   L[dst] = (int64_t)base[index];
 }
 
-/* Install the helper on first audit so the standalone JIT
- * self-test (which doesn't link jit_sbc.c) keeps the pointer
- * NULL and bails out cleanly on BC_LD4_*. */
+/* Trampoline helper for SBC_LIST.  Mirrors sbc.c:973:
+ *   LIST(L[dst], size)  (== OBJECT(dst, T_LIST, size) == gc_alloc).
+ * `size` is the number of slots in the new list, not a slot
+ * index -- the third "slot" arg of helper3 is repurposed as
+ * a literal. */
+static void jit_rt_list_impl(int64_t *L, int dst, int size, int unused) {
+  (void)unused;
+  LIST(((dyn*)L)[dst], size);
+}
+
+/* Trampoline helper for SBC_ST4_0..SBC_ST4_F.  Mirrors the
+ * interpreter body in sbc.c:1089:
+ *   STOR(L[dst], index, L[src])  (== LSET / lsetm)
+ * `dst` is the slot holding the target heap object; `src` is
+ * the slot holding the value to write into its `index`-th
+ * field.  lsetm handles the GC write barrier. */
+static void jit_rt_st4_impl(int64_t *L, int dst, int src, int index) {
+  STOR((dyn)L[dst], index, (dyn)L[src]);
+}
+
+/* Trampoline helper for SBC_CLOSURE.  Mirrors sbc.c:864:
+ *   void *fn = (void*)sbc->hooks[idx];
+ *   CLOSURE(L[dst], fn, size);
+ *
+ * Args packed into one 64-bit word so the call fits in three
+ * integer-arg registers (L, sbc, packed) -- no Win64 stack arg
+ * required.  See the BC_CLOSURE handler in jit.c for the
+ * packing layout. */
+static void jit_rt_closure_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t dst  = (uint32_t)(packed >> 32);
+  uint32_t idx  = (uint32_t)((packed >> 16) & 0xFFFF);
+  uint32_t size = (uint32_t)(packed & 0xFF);
+  void *fn = (void*)sbc->hooks[idx];
+  CLOSURE(((dyn*)L)[dst], fn, size);
+}
+
+/* Install the helpers on first audit so the standalone JIT
+ * self-test (which doesn't link jit_sbc.c) keeps the pointers
+ * NULL and bails out cleanly on the corresponding opcodes. */
 static void jit_install_helpers_once(void) {
   if (jit_rt_ld4_helper) return;
-  jit_rt_ld4_helper = jit_rt_ld4_impl;
+  jit_rt_ld4_helper     = jit_rt_ld4_impl;
+  jit_rt_st4_helper     = jit_rt_st4_impl;
+  jit_rt_list_helper    = jit_rt_list_impl;
+  jit_rt_closure_helper = jit_rt_closure_impl;
 }
 
 /* Read a 24-bit little-endian unsigned int.  Mirrors the
@@ -96,7 +135,7 @@ int sbc_jit_audit(struct sbc_t *sbc) {
     const uint8_t *body = sbc->code + start + HEADER;
     size_t body_len = (size_t)end - start - HEADER;
 
-    jit_buf *jit = jit_translate(body, body_len);
+    jit_buf *jit = jit_translate_with_sbc(body, body_len);
     if (jit) {
       jit_count++;
       jit_buf_free(jit);

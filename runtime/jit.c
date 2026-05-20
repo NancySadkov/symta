@@ -365,6 +365,8 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_LOAD   0x24    /* dst=u16 src=u16 index=u16; L[dst]=O_PTR(L[src])[index] */
 #define BC_LOAD8  0x25    /* dst=u8 src=u8 index=u8; same body */
 #define BC_MOVE4  0x97    /* opr=u8; dst=opr&0xF src=opr>>4; L[dst]=L[src] */
+#define BC_CLOSURE 0x10   /* dst=u16 idx=u16 size=u8; L[dst]=CLOSURE(sbc->hooks[idx],size) */
+#define BC_LIST    0x12   /* dst=u16 size=u16; L[dst]=LIST(size) */
 #define BC_JMP    0x04
 #define BC_JMP16  0x05    /* opcode + int16 PC-relative diff */
 #define BC_B      0x06
@@ -493,8 +495,21 @@ size_t  jit_last_fail_offset = 0;
 
 /* Trampoline helpers set by the runtime side.  See jit.h. */
 void (*jit_rt_ld4_helper)(int64_t *L, int dst, int src, int index) = NULL;
+void (*jit_rt_st4_helper)(int64_t *L, int dst, int src, int index) = NULL;
+void (*jit_rt_list_helper)(int64_t *L, int dst, int size, int unused) = NULL;
+void (*jit_rt_closure_helper)(int64_t *L, struct sbc_t *sbc,
+                              uint64_t packed) = NULL;
+
+static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc);
 
 jit_buf *jit_translate(const uint8_t *bc, size_t n) {
+  return jit_translate_core(bc, n, 0);
+}
+jit_buf *jit_translate_with_sbc(const uint8_t *bc, size_t n) {
+  return jit_translate_core(bc, n, 1);
+}
+
+static jit_buf *jit_translate_core(const uint8_t *bc, size_t n, int have_sbc) {
   /* x86 expansion factor.  Worst case so far is the comparison
    * sequence at ~16 bytes per opcode; B is ~12 bytes; prologue
    * 6, epilogue 7.  Round up to 20/opcode to leave headroom. */
@@ -512,7 +527,8 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
   size_t patches_n = 0;
   int fail = 0;
 
-  jit_emit_prologue(b);
+  if (have_sbc) jit_emit_prologue2(b);
+  else          jit_emit_prologue(b);
 
   size_t i = 0;
   while (i < n) {
@@ -562,6 +578,31 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
       i += 3;
       break;
     }
+    case 0x7A: case 0x7B: case 0x7C: case 0x7D:
+    case 0x7E: case 0x7F: case 0x80: case 0x81:
+    case 0x82: case 0x83: case 0x84: case 0x85:
+    case 0x86: case 0x87: case 0x88: case 0x89: {
+      /* SBC_ST4_0 .. SBC_ST4_F (struct field store family).
+       * Same encoding as LD4 but stores instead of loads:
+       *   STOR(L[dst], index, L[src])
+       * Writes go through lsetm (GC write barrier) -- needs the
+       * trampoline helper. */
+      if (i + 2 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_st4_helper) { jit_last_fail_opcode = op;
+                                jit_last_fail_offset = i;
+                                fail = 1; goto done; }
+      int index = op - 0x7A;
+      uint8_t opr = bc[i + 1];
+      uint32_t dst = (uint32_t)(opr & 0xF);
+      uint32_t src = (uint32_t)(opr >> 4);
+      jit_emit_call_helper3(b, (void*)jit_rt_st4_helper,
+                            dst, src, (uint32_t)index);
+      i += 2;
+      break;
+    }
+
     case 0x6A: case 0x6B: case 0x6C: case 0x6D:
     case 0x6E: case 0x6F: case 0x70: case 0x71:
     case 0x72: case 0x73: case 0x74: case 0x75:
@@ -621,6 +662,53 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
       i += 4;
       break;
     }
+    case BC_LIST: {
+      /* SBC_LIST: opcode + dst(u16) + size(u16).  Allocates a
+       * size-slot list via gc_alloc; no sbc context required.
+       * Helper3 calling convention: pass `size` as the third
+       * "slot" arg -- the helper interprets it as a literal int. */
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_list_helper) { jit_last_fail_opcode = op;
+                                 jit_last_fail_offset = i;
+                                 fail = 1; goto done; }
+      uint32_t dst  = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t size = (uint32_t)bc_rd16(bc + i + 3);
+      jit_emit_call_helper3(b, (void*)jit_rt_list_helper, dst, size, 0);
+      i += 5;
+      break;
+    }
+
+    case BC_CLOSURE: {
+      /* SBC_CLOSURE: opcode + dst(u16) + idx(u16) + size(u8).
+       * Allocates a closure object referencing sbc->hooks[idx].
+       * Only available when the JIT'd function carries the sbc
+       * pointer (have_sbc) -- the 1-arg path can't reach hooks[]. */
+      if (i + 6 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_closure_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t dst  = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t idx  = (uint64_t)bc_rd16(bc + i + 3);
+      uint64_t size = (uint64_t)bc[i + 5];
+      /* Pack into one 64-bit immediate so the call fits in three
+       * integer-arg registers (L, sbc, packed) without needing
+       * stack args on Win64.  Layout:
+       *   [63:32] = dst   (16 bits used, zero-extended)
+       *   [31:16] = idx
+       *   [15: 0] = size
+       */
+      uint64_t packed = (dst << 32) | (idx << 16) | (size & 0xFF);
+      jit_emit_call_with_sbc(b, (void*)jit_rt_closure_helper, packed);
+      i += 6;
+      break;
+    }
+
     case BC_MOVE4: {
       /* SBC_MOVE4: 1 operand byte holds dst (low 4 bits) and
        * src (high 4 bits) -- both 4-bit slot indices into
@@ -835,14 +923,16 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
       if (i + 3 > n) { fail = 1; goto done; }
       int src = bc_rd16(bc + i + 1);
       emit_mov_rax_from_slot(b, src);
-      jit_emit_epilogue(b);
+      if (have_sbc) jit_emit_epilogue2(b);
+      else          jit_emit_epilogue(b);
       i += 3;
       break;
     }
 
     case BC_LEAVE0:
       emit_xor_rax_rax(b);
-      jit_emit_epilogue(b);
+      if (have_sbc) jit_emit_epilogue2(b);
+      else          jit_emit_epilogue(b);
       i += 1;
       break;
 
@@ -870,7 +960,8 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
      * byte is 0xc3 we know epilogue's `ret` just landed. */
     if (b->len == 0 || b->code[b->len - 1] != 0xc3) {
       emit_xor_rax_rax(b);
-      jit_emit_epilogue(b);
+      if (have_sbc) jit_emit_epilogue2(b);
+      else          jit_emit_epilogue(b);
     }
   }
 
@@ -956,6 +1047,118 @@ static void emit_mov_arg3_imm32(jit_buf *b, uint32_t imm) {
   jit_emit_u32(b, imm);
 }
 #endif
+
+/* ============================================================
+ * Step 5g: 2-arg prologue/epilogue + SBC-pointer plumbing.
+ *
+ * The 2-arg form is identical to the 1-arg one except it also
+ * saves R12 (callee-saved) and loads R12 with arg1 (the sbc_t
+ * pointer).  RBX holds L, R12 holds sbc, both survive across
+ * inner C calls without per-call save.
+ *
+ * Stack alignment math:
+ *   entry:           RSP%16 == 8     (CALL pushed 8)
+ *   push rbx (-8):   RSP%16 == 0
+ *   push r12 (-8):   RSP%16 == 8
+ *   sub rsp, 40:     RSP%16 == 0    <- ready for inner CALL
+ *                                       (Win64 needs +32 shadow,
+ *                                        the extra 8 is alignment)
+ * ============================================================ */
+
+void jit_emit_prologue2(jit_buf *b) {
+  /* push rbx              :  53                        */
+  jit_emit_u8(b, 0x53);
+  /* push r12              :  41 54  (REX.B + push)     */
+  jit_emit_u8(b, 0x41);
+  jit_emit_u8(b, 0x54);
+  /* mov rbx, <arg0>       :  48 89 cb (Win) / fb (SysV) */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x89);
+#ifdef _WIN32
+  jit_emit_u8(b, 0xcb);  /* mov rbx, rcx -- ModR/M 11 001 011 */
+#else
+  jit_emit_u8(b, 0xfb);  /* mov rbx, rdi -- ModR/M 11 111 011 */
+#endif
+  /* mov r12, <arg1>       :  49 89 d4 (Win) / f4 (SysV)
+   *   REX = 0100 W R X B = 0100 1 0 0 1 = 0x49
+   *   opcode 89 (mov r/m64, r64)
+   *   Win64:  ModR/M 11 010 100  (reg=rdx,    r/m=r12)
+   *   SysV:   ModR/M 11 110 100  (reg=rsi,    r/m=r12) */
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x89);
+#ifdef _WIN32
+  jit_emit_u8(b, 0xd4);
+#else
+  jit_emit_u8(b, 0xf4);
+#endif
+  /* sub rsp, 40           :  48 83 ec 28 */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x83);
+  jit_emit_u8(b, 0xec);
+  jit_emit_u8(b, 0x28);  /* 40 = 32 shadow + 8 align */
+}
+
+void jit_emit_epilogue2(jit_buf *b) {
+  /* add rsp, 40 */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x83);
+  jit_emit_u8(b, 0xc4);
+  jit_emit_u8(b, 0x28);
+  /* pop r12               :  41 5c */
+  jit_emit_u8(b, 0x41);
+  jit_emit_u8(b, 0x5c);
+  /* pop rbx               :  5b */
+  jit_emit_u8(b, 0x5b);
+  /* ret */
+  jit_emit_u8(b, 0xc3);
+}
+
+/* mov <arg1>, r12 -- copy the saved sbc pointer into the
+ * platform's second integer-arg register for a helper call. */
+static void emit_mov_arg1_from_sbc(jit_buf *b) {
+#ifdef _WIN32
+  /* mov rdx, r12 :  4c 89 e2  (REX.R=1 for r12 as reg, r/m=rdx) */
+  jit_emit_u8(b, 0x4c);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, 0xe2);
+#else
+  /* mov rsi, r12 :  4c 89 e6 */
+  jit_emit_u8(b, 0x4c);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, 0xe6);
+#endif
+}
+
+/* mov <arg2>, imm64 -- 10 bytes.  Used by call_with_sbc to load
+ * the packed (dst<<32 | idx<<16 | size) word. */
+static void emit_mov_arg2_imm64(jit_buf *b, uint64_t imm) {
+#ifdef _WIN32
+  /* mov r8, imm64 :  49 b8 <8 bytes>  (REX.W + REX.B for r8) */
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0xb8);
+#else
+  /* mov rdx, imm64 :  48 ba <8 bytes> */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0xba);
+#endif
+  for (int k = 0; k < 8; k++) jit_emit_u8(b, (uint8_t)(imm >> (k * 8)));
+}
+
+/* Emit a 3-arg helper call:
+ *   arg0 = L   (from rbx)
+ *   arg1 = sbc (from r12)
+ *   arg2 = packed_imm (64-bit immediate)
+ * The helper signature: void(*)(int64_t*L, sbc_t*sbc, uint64_t).
+ * Used by SBC_CLOSURE / SBC_LIST / etc. -- opcodes whose
+ * implementation needs both L and the owning sbc. */
+void jit_emit_call_with_sbc(jit_buf *b, void *target, uint64_t packed) {
+  emit_mov_arg2_imm64(b, packed);     /* arg2 = packed first --
+                                         frees the imm-write reg
+                                         before the rbx/r12 copies */
+  emit_mov_arg1_from_sbc(b);          /* arg1 = sbc  */
+  jit_emit_mov_arg0_from_locals(b);   /* arg0 = L    */
+  jit_emit_call_abs(b, target);
+}
 
 void jit_emit_call_helper3(jit_buf *b, void *target,
                            uint32_t slot_dst, uint32_t slot_a, uint32_t slot_b) {

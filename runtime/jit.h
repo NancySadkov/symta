@@ -183,6 +183,18 @@ void jit_emit_call_abs(jit_buf *b, void *target);
 void jit_emit_call_helper3(jit_buf *b, void *target,
                            uint32_t slot_dst, uint32_t slot_a, uint32_t slot_b);
 
+/* 2-arg prologue/epilogue (saves R12 in addition to RBX,
+ * loads R12 with arg1).  Used by jit_translate_with_sbc. */
+void jit_emit_prologue2(jit_buf *b);
+void jit_emit_epilogue2(jit_buf *b);
+
+/* SBC-aware 3-arg helper call:
+ *   arg0 = L   (from RBX)
+ *   arg1 = sbc (from R12)
+ *   arg2 = packed_imm
+ * Helper signature: void(*)(int64_t *L, struct sbc_t *sbc, uint64_t). */
+void jit_emit_call_with_sbc(jit_buf *b, void *target, uint64_t packed);
+
 /* Forward decl so callers don't need to include runtime/sif.h. */
 struct sbc_t;
 
@@ -192,12 +204,35 @@ struct sbc_t;
 extern uint8_t jit_last_fail_opcode;
 extern size_t  jit_last_fail_offset;
 
-/* Trampoline-helper function pointer.  Set by the runtime
+/* Trampoline-helper function pointers.  Set by the runtime
  * (jit_sbc.c) at first audit; left NULL in the standalone
- * self-test build, in which case the BC_LD4_* opcodes refuse
- * to translate and the function falls back to interpretation.
+ * self-test build, in which case the corresponding opcodes
+ * refuse to translate and the function falls back to
+ * interpretation. */
+
+/* SBC_LD4_* / SBC_LOAD / SBC_LOAD8.
  * Signature: (L, dst_slot, src_slot, struct_field_index). */
 extern void (*jit_rt_ld4_helper)(int64_t *L, int dst, int src, int index);
+
+/* SBC_ST4_* / SBC_STOR (when added).
+ * Signature: (L, target_obj_slot, value_slot, struct_field_index).
+ * Writes L[value] into the indexed field of the object L[target]. */
+extern void (*jit_rt_st4_helper)(int64_t *L, int dst, int src, int index);
+
+/* SBC_LIST.  Allocates an `size`-slot list, leaves the dyn in
+ * L[dst].  Signature reuses the helper3 calling convention --
+ * the third int is the size (treated as a literal, not a slot
+ * index).  No sbc pointer needed, the LIST macro routes via
+ * gc_alloc which uses thread-local heap state. */
+extern void (*jit_rt_list_helper)(int64_t *L, int dst, int size, int unused);
+
+/* SBC_CLOSURE.  Builds a closure object via the CLOSURE
+ * allocator macro.  The third arg packs (dst<<32|idx<<16|size)
+ * so the call fits in three integer-arg registers; the helper
+ * unpacks.  Requires the 2-arg JIT'd function form (sbc in
+ * R12) -- see jit_translate_with_sbc. */
+extern void (*jit_rt_closure_helper)(int64_t *L, struct sbc_t *sbc,
+                                     uint64_t packed);
 
 /* ============================================================
  * Step 5d: SBC-level JIT integration.
@@ -237,5 +272,15 @@ int sbc_jit_audit(struct sbc_t *sbc);
  * it), NULL if any opcode in the stream isn't supported.
  * ============================================================ */
 jit_buf *jit_translate(const uint8_t *bc, size_t n);
+
+/* Same translator, but emits a 2-arg function: L in arg0, the
+ * owning `sbc_t *` in arg1.  Prologue saves R12 in addition to
+ * RBX and loads R12 with arg1 -- both callee-saved on Win64
+ * and SysV so they survive across inner C calls.  Opcodes that
+ * need sbc access (SBC_CLOSURE) only translate in this mode;
+ * the 1-arg path bails on them.
+ *
+ * Caller invokes the JIT'd code as `fn(L, sbc)`. */
+jit_buf *jit_translate_with_sbc(const uint8_t *bc, size_t n);
 
 #endif
