@@ -359,7 +359,17 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_LEAVE  0x02
 #define BC_LEAVE0 0x03
 #define BC_JMP    0x04
+#define BC_JMP16  0x05    /* opcode + int16 PC-relative diff */
 #define BC_B      0x06
+#define BC_B8     0x07    /* opcode + uint8 cnd + int16 PC-relative diff */
+#define BC_FXNB0  0x27    /* dst=RD8; L[dst]=0 */
+#define BC_FXNB8  0x28    /* dst=RD8; L[dst]=FXN(int8) */
+#define BC_FXNB16 0x29    /* dst=RD8; L[dst]=FXN(int16) */
+#define BC_FXNB32 0x2A    /* dst=RD8; L[dst]=FXN(int32) */
+#define BC_FXN0   0x2B    /* dst=RD16; L[dst]=0 */
+#define BC_FXN8   0x2C    /* dst=RD16; L[dst]=FXN(int8) */
+#define BC_FXN16  0x2D    /* dst=RD16; L[dst]=FXN(int16) */
+#define BC_FXN32  0x2E    /* dst=RD16; L[dst]=FXN(int32) */
 #define BC_IADD   0xA3
 #define BC_ISUB   0xA4
 #define BC_IMUL   0xA5
@@ -383,6 +393,27 @@ static uint16_t bc_rd16(const uint8_t *p) {
 static void emit_xor_rax_rax(jit_buf *b) {
   jit_emit_u8(b, 0x31);
   jit_emit_u8(b, 0xc0);
+}
+
+/* mov rax, imm64 -- 10 bytes (REX.W + opcode b8+rax + 8-byte imm).
+ * Always full 64-bit form; the cost is uniform regardless of
+ * the immediate's magnitude.  Smaller immediates could use
+ * `mov rax, imm32` (sign-extended, 7 bytes) but the savings
+ * aren't worth a special path at this stage. */
+static void emit_mov_rax_imm64(jit_buf *b, uint64_t imm) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0xb8);
+  for (int k = 0; k < 8; k++) jit_emit_u8(b, (uint8_t)(imm >> (k * 8)));
+}
+
+/* L[dst] = FXN(imm).  Tagged-int store via mov rax, imm64; mov [rbx+dst*8], rax.
+ * The caller passes the un-tagged signed value; we shift left
+ * by TAG_BITS (16) here.  Handles negative imm correctly via
+ * arithmetic shift semantics (cast to int64_t before shifting). */
+static void emit_fxn_imm(jit_buf *b, int dst, int64_t imm) {
+  uint64_t tagged = (uint64_t)((int64_t)imm << 16);
+  emit_mov_rax_imm64(b, tagged);
+  emit_mov_slot_from_rax(b, dst);
 }
 
 /* Read a 24-bit little-endian unsigned int from bc[off..off+2]. */
@@ -463,6 +494,22 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
       break;
     }
 
+    case BC_JMP16: {
+      /* SBC_JMP16: opcode + signed 16-bit PC-relative diff.
+       * Target = (end-of-instruction in bc) + diff. */
+      if (i + 3 > n) { fail = 1; goto done; }
+      int16_t diff = (int16_t)(uint16_t)bc_rd16(bc + i + 1);
+      int64_t target = (int64_t)i + 3 + diff;
+      if (target < 0 || (uint64_t)target > n) { fail = 1; goto done; }
+      size_t patch_off = jit_emit_jmp(b);
+      if (patches_n >= JIT_MAX_PATCHES) { fail = 1; goto done; }
+      patches[patches_n].jit_off = patch_off;
+      patches[patches_n].bc_target = (size_t)target;
+      patches_n++;
+      i += 3;
+      break;
+    }
+
     case BC_B: {
       /* SBC_B: opcode + 16-bit cnd slot + 24-bit absolute target. */
       if (i + 6 > n) { fail = 1; goto done; }
@@ -476,6 +523,93 @@ jit_buf *jit_translate(const uint8_t *bc, size_t n) {
       patches[patches_n].bc_target = target;
       patches_n++;
       i += 6;
+      break;
+    }
+
+    case BC_B8: {
+      /* SBC_B8: opcode + 8-bit cnd slot + signed 16-bit PC-relative diff. */
+      if (i + 4 > n) { fail = 1; goto done; }
+      int cnd = bc[i + 1];
+      int16_t diff = (int16_t)(uint16_t)bc_rd16(bc + i + 2);
+      int64_t target = (int64_t)i + 4 + diff;
+      if (target < 0 || (uint64_t)target > n) { fail = 1; goto done; }
+      size_t patch_off = jit_emit_jnz_slot(b, cnd);
+      if (patches_n >= JIT_MAX_PATCHES) { fail = 1; goto done; }
+      patches[patches_n].jit_off = patch_off;
+      patches[patches_n].bc_target = (size_t)target;
+      patches_n++;
+      i += 4;
+      break;
+    }
+
+    case BC_FXNB0: {
+      if (i + 2 > n) { fail = 1; goto done; }
+      int dst = bc[i + 1];
+      emit_fxn_imm(b, dst, 0);
+      i += 2;
+      break;
+    }
+    case BC_FXNB8: {
+      if (i + 3 > n) { fail = 1; goto done; }
+      int dst = bc[i + 1];
+      int64_t imm = (int8_t)bc[i + 2];  /* sign-extend */
+      emit_fxn_imm(b, dst, imm);
+      i += 3;
+      break;
+    }
+    case BC_FXNB16: {
+      if (i + 4 > n) { fail = 1; goto done; }
+      int dst = bc[i + 1];
+      int64_t imm = (int16_t)(uint16_t)bc_rd16(bc + i + 2);
+      emit_fxn_imm(b, dst, imm);
+      i += 4;
+      break;
+    }
+    case BC_FXNB32: {
+      if (i + 6 > n) { fail = 1; goto done; }
+      int dst = bc[i + 1];
+      uint32_t u = (uint32_t)bc[i + 2]
+                 | ((uint32_t)bc[i + 3] << 8)
+                 | ((uint32_t)bc[i + 4] << 16)
+                 | ((uint32_t)bc[i + 5] << 24);
+      int64_t imm = (int32_t)u;
+      emit_fxn_imm(b, dst, imm);
+      i += 6;
+      break;
+    }
+    case BC_FXN0: {
+      if (i + 3 > n) { fail = 1; goto done; }
+      int dst = bc_rd16(bc + i + 1);
+      emit_fxn_imm(b, dst, 0);
+      i += 3;
+      break;
+    }
+    case BC_FXN8: {
+      if (i + 4 > n) { fail = 1; goto done; }
+      int dst = bc_rd16(bc + i + 1);
+      int64_t imm = (int8_t)bc[i + 3];
+      emit_fxn_imm(b, dst, imm);
+      i += 4;
+      break;
+    }
+    case BC_FXN16: {
+      if (i + 5 > n) { fail = 1; goto done; }
+      int dst = bc_rd16(bc + i + 1);
+      int64_t imm = (int16_t)(uint16_t)bc_rd16(bc + i + 3);
+      emit_fxn_imm(b, dst, imm);
+      i += 5;
+      break;
+    }
+    case BC_FXN32: {
+      if (i + 7 > n) { fail = 1; goto done; }
+      int dst = bc_rd16(bc + i + 1);
+      uint32_t u = (uint32_t)bc[i + 3]
+                 | ((uint32_t)bc[i + 4] << 8)
+                 | ((uint32_t)bc[i + 5] << 16)
+                 | ((uint32_t)bc[i + 6] << 24);
+      int64_t imm = (int32_t)u;
+      emit_fxn_imm(b, dst, imm);
+      i += 7;
       break;
     }
 
@@ -1175,6 +1309,158 @@ static int step5_branches(void) {
   return fail;
 }
 
+/* Step 5b proof: immediate-load opcodes and PC-relative
+ * branches.  Test program is a self-contained factorial that
+ * initializes its accumulators in-band:
+ *
+ *   bc[ 0..3 ]: FXN8 dst=0, imm=1        ; L[0] = FXN(1)  (acc)
+ *   bc[ 4..7 ]: FXN8 dst=2, imm=1        ; L[2] = FXN(1)  (step)
+ *  loop:
+ *   bc[ 8..14]: IMUL L[0] = L[0] * L[1]
+ *   bc[15..21]: ISUB L[1] = L[1] - L[2]
+ *   bc[22..27]: B    L[1], 8             ; (absolute target back to loop)
+ *   bc[28..30]: LEAVE L[0]
+ *
+ * Inputs: L[1] = FXN(N) (the value to factorial-ize).
+ * Expected: L[0] = N! (FXN-tagged).
+ */
+static int step5b_immediates(void) {
+  int fail = 0;
+
+  /* Factorial via FXN8 loads + IMUL/ISUB + absolute B + LEAVE. */
+  {
+    static const uint8_t bc[] = {
+      BC_FXN8, 0,0, 1,            /*  0..3 : L[0] = FXN(1) */
+      BC_FXN8, 2,0, 1,            /*  4..7 : L[2] = FXN(1) */
+      BC_IMUL, 0,0, 0,0, 1,0,     /*  8..14: L[0] *= L[1]  */
+      BC_ISUB, 1,0, 1,0, 2,0,     /* 15..21: L[1] -= L[2]  */
+      BC_B,    1,0, 8,0,0,        /* 22..27: if L[1] -> 8  */
+      BC_LEAVE, 0,0,              /* 28..30                */
+    };
+    jit_buf *b = jit_translate(bc, sizeof(bc));
+    if (!b) { printf("FAIL  factorial returned NULL\n"); return 1; }
+    int64_t (*fn)(int64_t*) = (int64_t(*)(int64_t*))jit_buf_finalize(b);
+
+    int64_t L[10] = {0};
+    L[1] = TEST_FXN(5);
+    int64_t ret = fn(L);
+    fail += check("factorial(5)", ret, TEST_FXN(120));
+
+    L[1] = TEST_FXN(7);
+    ret = fn(L);
+    fail += check("factorial(7)", ret, TEST_FXN(5040));
+
+    L[1] = TEST_FXN(10);
+    ret = fn(L);
+    fail += check("factorial(10)", ret, TEST_FXN(3628800));
+
+    jit_buf_free(b);
+  }
+
+  /* FXNB16 / FXN32 -- larger immediate paths.  Verify both
+   * the 8-bit-dst-slot family and the wider immediate
+   * encodings produce identical results. */
+  {
+    static const uint8_t bc[] = {
+      BC_FXNB16, 0, 0xE8,0x03,   /* 0..3:  L[0] = FXN(1000)         */
+      BC_FXN32,  1,0, 0x40,0x42,0x0F,0x00,  /* 4..10: L[1] = FXN(1000000) */
+      BC_IADD, 2,0, 0,0, 1,0,    /* 11..17: L[2] = L[0] + L[1] = 1001000 */
+      BC_LEAVE, 2,0,             /* 18..20 */
+    };
+    jit_buf *b = jit_translate(bc, sizeof(bc));
+    if (!b) { printf("FAIL  larger-imm returned NULL\n"); return 1; }
+    int64_t (*fn)(int64_t*) = (int64_t(*)(int64_t*))jit_buf_finalize(b);
+
+    int64_t L[10] = {0};
+    int64_t ret = fn(L);
+    fail += check("L[0] = FXN(1000)", L[0], TEST_FXN(1000));
+    fail += check("L[1] = FXN(1000000)", L[1], TEST_FXN(1000000));
+    fail += check("sum = FXN(1001000)", ret, TEST_FXN(1001000));
+
+    jit_buf_free(b);
+  }
+
+  /* Negative immediate path -- FXN8 with -5. */
+  {
+    static const uint8_t bc[] = {
+      BC_FXN8, 0,0, (uint8_t)(int8_t)-5,  /* L[0] = FXN(-5) */
+      BC_FXN8, 1,0, 3,                    /* L[1] = FXN(3)  */
+      BC_IADD, 2,0, 0,0, 1,0,             /* L[2] = -5 + 3 = -2 */
+      BC_LEAVE, 2,0,
+    };
+    jit_buf *b = jit_translate(bc, sizeof(bc));
+    if (!b) { printf("FAIL  negative-imm returned NULL\n"); return 1; }
+    int64_t (*fn)(int64_t*) = (int64_t(*)(int64_t*))jit_buf_finalize(b);
+
+    int64_t L[10] = {0};
+    int64_t ret = fn(L);
+    fail += check("L[0] = FXN(-5)", L[0], TEST_FXN(-5));
+    fail += check("L[2] = -5+3",     ret,  TEST_FXN(-2));
+
+    jit_buf_free(b);
+  }
+
+  /* PC-relative jump (JMP16): unconditional skip-forward.
+   *   bc[0..3]:  FXN8 dst=0, imm=10   (L[0] = 10)
+   *   bc[4..6]:  JMP16 diff=+7        (skip past the next FXN8)
+   *   bc[7..10]: FXN8 dst=0, imm=99   (would overwrite L[0])
+   *   bc[11..13]: LEAVE L[0]
+   * After JMP16 at bc[4]: pin = bc[7]; target = 4 + 3 + diff = 7 + diff.
+   * For diff=4 the target lands at bc[11] (the LEAVE), bypassing
+   * the second FXN8.  Expected: L[0] stays 10.
+   */
+  {
+    static const uint8_t bc[] = {
+      BC_FXN8, 0,0, 10,            /* 0..3 */
+      BC_JMP16, 4,0,               /* 4..6  diff=+4 -> target bc[11] */
+      BC_FXN8, 0,0, 99,            /* 7..10 (skipped) */
+      BC_LEAVE, 0,0,               /* 11..13 */
+    };
+    jit_buf *b = jit_translate(bc, sizeof(bc));
+    if (!b) { printf("FAIL  JMP16 returned NULL\n"); return 1; }
+    int64_t (*fn)(int64_t*) = (int64_t(*)(int64_t*))jit_buf_finalize(b);
+
+    int64_t L[10] = {0};
+    int64_t ret = fn(L);
+    fail += check("JMP16 skipped overwrite", ret, TEST_FXN(10));
+
+    jit_buf_free(b);
+  }
+
+  /* PC-relative conditional branch (B8): back-jump loop.
+   *   bc[ 0..3]: FXN8 dst=0, imm=0       (acc = 0)
+   *   bc[ 4..7]: FXN8 dst=2, imm=1       (step = 1)
+   *  loop (bc[8]):
+   *   bc[ 8..14]: IADD L[0] = L[0] + L[1]
+   *   bc[15..21]: ISUB L[1] = L[1] - L[2]
+   *   bc[22..25]: B8   cnd=1, diff=-18    (back to loop = bc[8])
+   *               target = 22 + 4 + (-18) = 8 ✓
+   *   bc[26..28]: LEAVE L[0]
+   */
+  {
+    static const uint8_t bc[] = {
+      BC_FXN8, 0,0, 0,
+      BC_FXN8, 2,0, 1,
+      BC_IADD, 0,0, 0,0, 1,0,
+      BC_ISUB, 1,0, 1,0, 2,0,
+      BC_B8,   1, (uint8_t)(int16_t)-18, (uint8_t)(((int16_t)-18) >> 8),
+      BC_LEAVE, 0,0,
+    };
+    jit_buf *b = jit_translate(bc, sizeof(bc));
+    if (!b) { printf("FAIL  B8 loop returned NULL\n"); return 1; }
+    int64_t (*fn)(int64_t*) = (int64_t(*)(int64_t*))jit_buf_finalize(b);
+
+    int64_t L[10] = {0};
+    L[1] = TEST_FXN(10);
+    int64_t ret = fn(L);
+    fail += check("B8 backward loop sum 1..10", ret, TEST_FXN(55));
+
+    jit_buf_free(b);
+  }
+
+  return fail;
+}
+
 int main(void) {
   int fail = 0;
   printf("=== step 0: hand-coded add ===\n");
@@ -1193,6 +1479,8 @@ int main(void) {
   fail += step4_translate();
   printf("\n=== step 5a: branch resolution (loop + max) ===\n");
   fail += step5_branches();
+  printf("\n=== step 5b: immediate-loads + relative branches ===\n");
+  fail += step5b_immediates();
   if (fail) {
     fprintf(stderr, "\n%d check(s) failed\n", fail);
     return 1;
