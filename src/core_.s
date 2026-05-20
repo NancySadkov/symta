@@ -757,7 +757,7 @@ list.find F =
   | when F><It: ret   It
 
 hard_list.find F =
-| if F.is_fn
+  if F.is_fn
   then | times I $n:
          | It $I
          | when F(It): ret   It
@@ -766,7 +766,7 @@ hard_list.find F =
          | when F><It: ret   It
 
 _list_.find F =
-| if F.is_fn
+  if F.is_fn
   then | times I Me^_size:
          | It _lget Me I
          | when F(It): ret   It
