@@ -776,68 +776,68 @@ _list_.find F =
 
 
 list.group N =
-| @"Group a list into chunks of N elements.
+  @"Group a list into chunks of N elements.
 Example:  \[1 2 3 4 5 6\].group(2)   // ((1 2) (3 4) (5 6))
           \[1 2 3 4 5\].group(2)     // ((1 2) (3 4) (5)) -- trailing partial"
-| Y Ys []
-| I 0
-| till $end
+  Y Ys []
+  I 0
+  till $end
   | push Me^pop Y
   | I+
   | when I >< N
     | push Y.f Ys
     | Y =  []
     | I =  0
-| when Y.n: push Y.f Ys
-| Ys.f
+  when Y.n: push Y.f Ys
+  Ys.f
 
 text.group N = $l.group(N){?text}
 
 list.all F =
-| if F.is_fn then for X Me: less F(X): ret   0
+  if F.is_fn then for X Me: less F(X): ret   0
   else for X Me: less F >< X: ret   0
-| 1
+  1
 
 list.any F =
-| if F.is_fn then for X Me: when F(X): ret   1
+  if F.is_fn then for X Me: when F(X): ret   1
   else for X Me: when F >< X: ret   1
-| 0
+  0
 
 list.max =
-| @"Largest element of a list, by < comparison.  Empty list returns No."
-| when $end: ret   No
-| M $head
-| for X Me: when X > M: M =  X
-| M
+  @"Largest element of a list, by < comparison.  Empty list returns No."
+  when $end: ret   No
+  M $head
+  for X Me: when X > M: M =  X
+  M
 
 list.min =
-| @"Smallest element of a list, by < comparison.  Empty list returns No."
-| when $end: ret   No
-| M $head
-| for X Me: when X < M: M =  X
-| M
+  @"Smallest element of a list, by < comparison.  Empty list returns No."
+  when $end: ret   No
+  M $head
+  for X Me: when X < M: M =  X
+  M
 
 list.maxBy F =
-| when $end: ret   No
-| M $head
-| FM F(M)
-| for X Me:
+  when $end: ret   No
+  M $head
+  FM F(M)
+  for X Me:
   | FX F(X)
   | when FX > FM:
     | M =  X
     | FM =  FX
-| M
+  M
 
 list.minBy F =
-| when $end: ret   No
-| M $head
-| FM F(M)
-| for X Me:
+  when $end: ret   No
+  M $head
+  FM F(M)
+  for X Me:
   | FX F(X)
   | when FX < FM:
     | M =  X
     | FM =  FX
-| M
+  M
 
 //list.has Item = got $find(Item)
 list.has Item = bad "list.has is obsolete" 
