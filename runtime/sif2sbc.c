@@ -1038,17 +1038,56 @@ uint8_t *sif2sbc(sif_t *sif) {
     EMIT24(val_ofs);
   }
 
+  /* NATIVE/IA64 section (step 6a scaffold).
+   *
+   * For now this is a stub: header + empty per-fn directory.  No
+   * machine code yet; loader-side install (step 6c) currently
+   * ignores the section regardless.  The point of emitting the
+   * header now is to lock in the on-disk format ahead of the
+   * translate-and-bake pass: once 6b lands, only the payload
+   * grows -- writer/loader plumbing stays unchanged.
+   *
+   * Gated on SYMTA_AOT_IA64=1 so the default build round-trips
+   * byte-identically to the pre-6a SBCs (drift test stays
+   * 1-round byte-stable). */
+  int ia64_ofs = 0;
+  int ia64_count = 0;
+  if (getenv("SYMTA_AOT_IA64")) {
+    int nfns = shlen(label2fn);
+    ia64_ofs = arrlen(wb);
+    ia64_count = nfns;
+    /* Section header. */
+    EMIT8('I'); EMIT8('A'); EMIT8('6'); EMIT8('4');  /* magic */
+    EMIT16(1);                                       /* version */
+    EMIT32(nfns);                                    /* nfns   */
+    /* Per-fn directory -- 16 bytes per entry, all zeros for now.
+     * payload_offset=0 means "no native code; interpret".  This
+     * loops back to interpreter dispatch unchanged. */
+    for (i = 0; i < nfns; i++) {
+      EMIT32(0);   /* payload_offset */
+      EMIT32(0);   /* code_size      */
+      EMIT16(0);   /* reloc_count    */
+      EMIT16(0);   /* unwind_size    */
+      EMIT16(0);   /* nvars          */
+      EMIT16(0);   /* flags          */
+    }
+  }
+
   tbls = wb;
   wb = 0;
 
   /* tot_sz counts the (count, offset) pairs in the trailing tot:
-   * 7 lookup tables + nrs + linenos + RT-7 mcache + HELP-3 docs.
-   * The RT-7 mcache entry's offset field doubles as a format flag
-   * for stage 2 -- see the EMIT24 pair near the bottom of this
-   * function.  The HELP-3 docs entry (count, offset) points to
-   * a flat array of (sym_ofs:24, val_ofs:24) pairs, both offsets
-   * referring into the data section. */
-  int tot_sz = 7 + 3 + 1;
+   * 7 lookup tables + nrs + linenos + RT-7 mcache + HELP-3 docs
+   * + IA64 native section.  The RT-7 mcache entry's offset field
+   * doubles as a format flag for stage 2 -- see the EMIT24 pair
+   * near the bottom of this function.  The HELP-3 docs entry
+   * (count, offset) points to a flat array of (sym_ofs:24,
+   * val_ofs:24) pairs, both offsets referring into the data
+   * section.  The IA64 entry (count = function count, offset =
+   * section start inside tbls) is present in all SBCs emitted by
+   * this writer revision; when SYMTA_AOT_IA64 is unset the count
+   * is 0 and the loader treats the SBC as bytecode-only. */
+  int tot_sz = 7 + 3 + 1 + 1;
 
   /* Format identification: 4-byte magic + 2-byte revision.
    * `sbc_new` checks both before touching anything else.  See
@@ -1090,6 +1129,11 @@ uint8_t *sif2sbc(sif_t *sif) {
   /* HELP-3: docstring section -- count + offset into tbls. */
   EMIT24(doc_sz);
   EMIT24(doc_ofs);
+  /* IA64 native section -- count = function count, offset =
+   * section start inside tbls.  Count of 0 means "no native
+   * payload"; loader will fall through to interpreter dispatch. */
+  EMIT24(ia64_count);
+  EMIT24(ia64_ofs);
 
 
   hdr = wb;

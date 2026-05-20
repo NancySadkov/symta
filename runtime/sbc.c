@@ -127,6 +127,20 @@ sbc_t *sbc_new(uint8_t *pin, int64_t size, char *path) {
     sbc->doc_sz = 0;
     sbc->doc_table = 0;
   }
+  /* NATIVE/IA64 section (tot[11]).  Optional -- present only on
+   * SBCs emitted by an AOT-capable writer.  Count is the number
+   * of functions described in the section (matches fntbl_sz/3
+   * when populated).  Offset points to the section header inside
+   * tbls.  The section header begins with magic "IA64" (4 bytes)
+   * + version (2 bytes); sbc_prepare validates these on adopt. */
+  if (tot_sz >= 12) {
+    sbc->ia64_sz = (uint32_t)RD24;
+    uint32_t ia64_ofs = (uint32_t)RD24;
+    sbc->ia64_table = sbc->ia64_sz ? (sbc->tbls + ia64_ofs) : 0;
+  } else {
+    sbc->ia64_sz = 0;
+    sbc->ia64_table = 0;
+  }
 
   sbc->filename = strdup(path);
   sbc->mt = 0;

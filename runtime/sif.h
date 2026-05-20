@@ -371,6 +371,37 @@ typedef struct sbc_t {
    * a `char *` directly without copying. */
   uint8_t *doc_table;
   uint32_t doc_sz;
+  /* NATIVE/IA64 section.  Optional; present when tot_sz >= 12
+   * and the writer emitted machine code alongside the bytecode.
+   * Layout inside the blob:
+   *   [0..3]   magic "IA64"  (0x34364149u, little-endian)
+   *   [4..5]   version (currently 1)
+   *   [6..9]   nfns (function count; matches fntbl_sz/3)
+   *   [10..]   per-fn directory, 16 bytes/entry:
+   *      u32  payload_offset    (0 = no native code for this fn,
+   *                              else offset from section start
+   *                              to this fn's code bytes)
+   *      u32  code_size         (machine-code byte count)
+   *      u16  reloc_count       (number of helper-pointer relocs
+   *                              embedded right after the code)
+   *      u16  unwind_size       (UNWIND_INFO+RUNTIME_FUNCTION
+   *                              blob bytes after code+relocs;
+   *                              0 on POSIX targets)
+   *      u16  nvars             (duplicated from SBC_SUBR header,
+   *                              so the adapter doesn't reparse)
+   *      u16  flags             (reserved; 0)
+   *   [...]    payload bytes -- per-fn blobs at the offsets
+   *            recorded in the directory.  Each blob is laid out
+   *            as [code][relocs][unwind] back-to-back, with code
+   *            16-byte aligned to keep call/jmp targets clean.
+   * Loader: when present on a matching host, sbc_prepare maps
+   * each blob into executable memory, applies the relocs against
+   * the runtime's helper-pointer table, registers unwind, and
+   * rewrites the corresponding hooks_heap entry to dispatch
+   * straight to native code.  Functions whose payload_offset is
+   * 0 fall back to interpreter via sbc_exec_fn. */
+  uint8_t *ia64_table;
+  uint32_t ia64_sz;       /* function count (mirrors tot[11].count) */
   tot_entry_t rtot[7]; //relocated tot
   dyn *tx;
   dyn *ty;
