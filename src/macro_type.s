@@ -134,6 +134,32 @@ declared_compare_result_type A B =
   | when NumA and NumB: ret "int"
   | No
 
+// TS-4.5 Phase 2: look up the return type of a method call given
+// the receiver's static type and the method name.  Returns No
+// when nothing is statically provable.  Used from BOTH the
+// pre-mex `.` arm (where `Recv.M` is still `[`.` Recv M]`) and
+// the post-mex `_mcall` arm in infer_type / infer_declared_type.
+//
+// Lookup order:
+//   1. M is itself a known type-name -- conversion method
+//      (TS-3.4 logic).  e.g. `Xs.int -> int` regardless of Xs.
+//   2. GMethodReturns registry, populated at method-def time
+//      from `infer_declared_type Body`.  Keyed "Type.Method".
+//   3. Hardcoded universal shortcuts (KISS) for the highest-
+//      impact methods (`n`, `hash`, `code`) so the immediate
+//      wins land without waiting for Phase 4 to refactor every
+//      core_.s method body.
+method_return_type RT M =
+  | when M.is_text and M^is_known_type: ret M
+  | when no RT: ret No
+  | when no M.is_text: ret No
+  | KnownRet GMethodReturns.("[RT].[M]")
+  | when got KnownRet: ret KnownRet
+  | when M >< "n" and RT^is_sequence_type: ret "int"
+  | when M >< "hash": ret "int"
+  | when M >< "code" and (RT >< "text" or RT >< "fixtext"): ret "int"
+  | No
+
 // TS-3.13: unify the types of a list of case-arm body expressions.
 // Returns the common type if every arm has the same statically-
 // known type, else No (== "can't prove").  Two skip-rules:
@@ -216,8 +242,17 @@ infer_type Expr =
       // defined per-type in core_.s.  The method name after
       // mex is `[_quote M]`; bare text would mean a dynamic
       // dispatch we can't statically resolve.
-      [`_mcall` _ [`_quote` M] @_]
-        | when M.is_text and M^is_known_type: ret M
+      [`_mcall` Recv [`_quote` M] @_]
+        | R method_return_type (infer_type Recv) M
+        | when got R: ret R
+      // TS-4.5 Phase 2: pre-mex `.` shape `Recv.M` -- runs before
+      // the `.` macro expands to `_mcall`.  bin_op calls
+      // infer_type on the pre-mex args, so this arm is what
+      // makes `Xs.n + 1` route to _iadd at the surrounding op's
+      // mex time.
+      [`.` Recv M]
+        | R method_return_type (infer_type Recv) M
+        | when got R: ret R
       // TS-3.7: `_if cond Then Else` (post-mex `if`-form) --
       // if both branches have the same inferable type, the
       // if-expression has that type.  Used by `if`, `when`,
@@ -381,8 +416,12 @@ infer_declared_type Expr =
         | R infer_declared_type B
         | GVarsTypes.V =  Old
         | ret R
-      [`_mcall` _ [`_quote` M] @_]
-        | when M.is_text and M^is_known_type: ret M
+      [`_mcall` Recv [`_quote` M] @_]
+        | R method_return_type (infer_declared_type Recv) M
+        | when got R: ret R
+      [`.` Recv M]
+        | R method_return_type (infer_declared_type Recv) M
+        | when got R: ret R
       // TS-3.10: pre-mex `|` block and post-mex `_progn`: value
       // is the LAST statement.  Recurse to find the block's
       // declared type.

@@ -496,6 +496,15 @@ expand_block_item_method Type Name Args Body =
   // `iter`/`tbl`/`tok` excluded.
   | when got GTypes.Type or Type^is_auto_typed_receiver:
     | Body = form: _type Type $\Me Body
+  // TS-4.5 Phase 2: register the method's static return type
+  // (if any) so callers can infer the type of `Recv.M`.  We use
+  // `infer_declared_type` (not `infer_type`) on purpose -- the
+  // method body needs an EXPLICIT type signal (a `_the T E`
+  // wrap, a typed last-stmt declaration, an arith op on typed
+  // operands, etc.) to register.  Bare-literal-only bodies
+  // don't get registered, matching the TS-3.6 conservative rule.
+  | RetT infer_declared_type Body
+  | when got RetT: GMethodReturns.("[Type].[Name]") =  RetT
 | when Name >< __:
   | case Args
     [Method As] | Args =  [['@' As]]

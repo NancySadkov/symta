@@ -446,6 +446,7 @@ macroexpand Expr Macros ModuleCompiler ModuleFolders =
       GTypes (!)
       GVarsTypes (!)
       GFnReturns (!)
+      GMethodReturns (!)
       GMexLets (!)
       GLastType 0
       GStaticMode 0

@@ -33,6 +33,11 @@ GFnReturns No // TS-3.8: hash: fnname -> return-type-text.
               // Populated by expand_block_item_fn when the
               // function body has a statically inferable
               // return.  Read by infer_type to type call sites.
+GMethodReturns No // TS-4.5 Phase 2: hash: "Type.Method" -> return-type.
+                  // Populated by expand_block_item_method when the
+                  // method body has a statically inferable return.
+                  // Read by infer_type's `_mcall` arm to type
+                  // `Recv.M` calls where Recv has a known type.
 GMexLets No //verb mexlets
 GLastType 0
 GStaticMode No  // TS-4.4: when set, the surrounding `static Expr`
@@ -132,6 +137,28 @@ is_auto_typed_receiver T =
     \view  | 1
     \fn    | 1
     Else   | 0
+
+// TS-4.5 Phase 2: types whose `.n` method returns int.  Covers
+// the sequence-like and table-like receivers that `Xs.n` is
+// the natural size accessor on.  Used as a KISS shortcut in
+// `infer_type`'s `_mcall` arm before the registry lookup so
+// the common `Xs.n + K` case routes to _iadd without requiring
+// every individual `T.n -> int` to be explicitly registered.
+is_sequence_type T =
+| case T
+    \list      | 1
+    \hard_list | 1
+    \_list_    | 1
+    \cons      | 1
+    \view      | 1
+    \text      | 1
+    \fixtext   | 1
+    \_text_    | 1
+    \_fixtext_ | 1
+    \bytes     | 1
+    \_bytes_   | 1
+    \tbl       | 1
+    Else       | 0
 
 is_list_case V =
   V(:[_ _ @_]+[]+[['@'+'/' @_]+['+'+'*' _]+['<' _ ['+'+'*'+'/' _]]])
