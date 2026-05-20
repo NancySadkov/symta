@@ -408,6 +408,17 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_MOVEIM  0x21    /* dst=u16 src=u24; L[dst]=sbc->im[src] */
 #define BC_MOVEMT  0x1F    /* dst=u16 src=u24; L[dst]=FXN(sbc->mt[src]) */
 #define BC_MOVEMT8 0x20    /* dst=u8  src=u8;  L[dst]=FXN(sbc->mt[src]) */
+#define BC_IMMEQ   0x3E    /* dst,a,b=u16; mcache=u16; L[dst]=FXN(a==b)  */
+#define BC_IMMNE   0x3F    /* dst,a,b=u16; mcache=u16; L[dst]=FXN(a!=b)  */
+#define BC_FXNLISTN  0x32  /* dst=u16 src=u16; L[dst]=LIST(UNFXN(L[src])) */
+#define BC_FXNLSETIR 0x36  /* src,index,val=u16 + mcache=u16; LSET ignored */
+#define BC_ABS     0x33    /* dst,a=u16; abs(L[a]) */
+#define BC_NEG     0x38    /* dst,a=u16; -L[a] */
+#define BC_FXNAND  0x44    /* dst,a,b=u16; L[a] & L[b] */
+#define BC_FXNIOR  0x45
+#define BC_FXNXOR  0x46
+#define BC_FXNSHL  0x47
+#define BC_FXNSHR  0x48
 #define BC_INC     0x9E    /* dst=u16 a=u16; INC(L[dst], L[a]) */
 #define BC_DEC     0x9F    /* dst=u16 a=u16; DEC(L[dst], L[a]) */
 #define BC_LOAD   0x24    /* dst=u16 src=u16 index=u16; L[dst]=O_PTR(L[src])[index] */
@@ -618,6 +629,20 @@ void (*jit_rt_inc_helper)(int64_t *L, int dst, int a, int u) = NULL;
 void (*jit_rt_dec_helper)(int64_t *L, int dst, int a, int u) = NULL;
 void (*jit_rt_movemt_helper)(int64_t *L, struct sbc_t *sbc,
                              uint64_t packed) = NULL;
+void (*jit_rt_immeq_helper)(int64_t *L, struct sbc_t *sbc,
+                            uint64_t packed) = NULL;
+void (*jit_rt_immne_helper)(int64_t *L, struct sbc_t *sbc,
+                            uint64_t packed) = NULL;
+void (*jit_rt_fxnlistn_helper)(int64_t *L, int dst, int src, int u) = NULL;
+void (*jit_rt_fxnlsetir_helper)(int64_t *L, struct sbc_t *sbc,
+                                uint64_t packed) = NULL;
+void (*jit_rt_neg_helper)(int64_t *L, int dst, int a, int u) = NULL;
+void (*jit_rt_abs_helper)(int64_t *L, int dst, int a, int u) = NULL;
+void (*jit_rt_fxnand_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fxnior_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fxnxor_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fxnshl_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fxnshr_helper)(int64_t *L, int dst, int a, int b) = NULL;
 
 /* Step 8: platform-aware default for the AOT pipeline.  Windows
  * has SEH unwind registered (step 5n) so longjmp through native
@@ -1109,6 +1134,80 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       i += 9;
       break;
     }
+
+    case BC_FXNLISTN: {
+      /* SBC_FXNLISTN: opcode + dst(u16) + src(u16) = 5 bytes.
+       * L[dst] = LIST(UNFXN(L[src])) -- variable-size list alloc
+       * with size from a runtime slot.  Helper3 trampoline. */
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_fxnlistn_helper) { jit_last_fail_opcode = op;
+                                     jit_last_fail_offset = i;
+                                     fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t src = (uint32_t)bc_rd16(bc + i + 3);
+      b->pending_helper_id = JIT_HELPER_FXNLISTN;
+      jit_emit_call_helper3(b, (void*)jit_rt_fxnlistn_helper, dst, src, 0);
+      i += 5;
+      break;
+    }
+
+    case BC_FXNLSETIR: {
+      /* SBC_FXNLSETIR: opcode + src(u16) + index(u16) + val(u16) +
+       * mcache_idx(u16) = 9 bytes.  List-element set with ignored
+       * result.  Same 3-way dispatch as FXNLGET (T_LIST+T_INT+
+       * in-bounds direct LSET; else MCACHE_CALL m_set).  All
+       * four operands fit in one packed u64, so the helper uses
+       * the call_with_sbc trampoline.  Packed: [15:0]=src,
+       * [31:16]=index, [47:32]=val, [63:48]=mcache_idx. */
+      if (i + 9 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_fxnlsetir_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t src    = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t index  = (uint64_t)bc_rd16(bc + i + 3);
+      uint64_t val    = (uint64_t)bc_rd16(bc + i + 5);
+      uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 7);
+      uint64_t packed = (mcidx << 48) | (val << 32) | (index << 16) | src;
+      b->pending_helper_id = JIT_HELPER_FXNLSETIR;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_fxnlsetir_helper, packed);
+      i += 9;
+      break;
+    }
+
+    case BC_IMMEQ: case BC_IMMNE: {
+      /* SBC_IMMEQ / SBC_IMMNE: opcode + dst(u16) + a(u16) + b(u16) +
+       * mcache_idx(u16) = 9 bytes.  3-way dispatch in the helper:
+       *   T_INT-T_INT      -> bitwise IMMEQ/IMMNE
+       *   text-vs-text     -> texts_equal direct call
+       *   otherwise        -> MCACHE_CALL m_eq / m_ne
+       * Packed: [15:0]=dst, [31:16]=a, [47:32]=b, [63:48]=mcache_idx. */
+      if (i + 9 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      void *helper; jit_helper_id_t hid;
+      if (op == BC_IMMEQ) { helper = (void*)jit_rt_immeq_helper; hid = JIT_HELPER_IMMEQ; }
+      else                { helper = (void*)jit_rt_immne_helper; hid = JIT_HELPER_IMMNE; }
+      if (!have_sbc || !helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t dst    = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t a      = (uint64_t)bc_rd16(bc + i + 3);
+      uint64_t bb     = (uint64_t)bc_rd16(bc + i + 5);
+      uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 7);
+      uint64_t packed = (mcidx << 48) | (bb << 32) | (a << 16) | dst;
+      b->pending_helper_id = hid;
+      jit_emit_call_with_sbc(b, helper, packed);
+      i += 9;
+      break;
+    }
     case BC_MCALLIR: {
       /* opcode + obj(u16) + met(u16) + mcache_idx(u16) = 7 bytes */
       if (i + 7 > n) { jit_last_fail_opcode = op;
@@ -1492,7 +1591,38 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       break;
     }
 
-    case BC_FXNTAG: case BC_NOT: case BC_GOT: case BC_NO: {
+    case BC_FXNAND: case BC_FXNIOR: case BC_FXNXOR:
+    case BC_FXNSHL: case BC_FXNSHR: {
+      /* Bitwise ops -- same wire shape as the FXN-arith family
+       * (7 bytes) but routed straight to a helper.  T_INT-T_INT
+       * fast path is in the helper; an inline fast path is
+       * possible (one x86 AND/OR/XOR/SHL/SHR after the tag check)
+       * but the call cost dominates only on bitwise-heavy code,
+       * which we don't currently see.  Helper for now. */
+      if (i + 7 > n) { fail = 1; goto done; }
+      void *helper; jit_helper_id_t hid;
+      switch (op) {
+        case BC_FXNAND: helper = (void*)jit_rt_fxnand_helper; hid = JIT_HELPER_FXNAND; break;
+        case BC_FXNIOR: helper = (void*)jit_rt_fxnior_helper; hid = JIT_HELPER_FXNIOR; break;
+        case BC_FXNXOR: helper = (void*)jit_rt_fxnxor_helper; hid = JIT_HELPER_FXNXOR; break;
+        case BC_FXNSHL: helper = (void*)jit_rt_fxnshl_helper; hid = JIT_HELPER_FXNSHL; break;
+        case BC_FXNSHR: helper = (void*)jit_rt_fxnshr_helper; hid = JIT_HELPER_FXNSHR; break;
+        default: helper = NULL; hid = JIT_HELPER_NONE;
+      }
+      if (!helper) { jit_last_fail_opcode = op;
+                     jit_last_fail_offset = i;
+                     fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t a   = (uint32_t)bc_rd16(bc + i + 3);
+      uint32_t x   = (uint32_t)bc_rd16(bc + i + 5);
+      b->pending_helper_id = hid;
+      jit_emit_call_helper3(b, helper, dst, a, x);
+      i += 7;
+      break;
+    }
+
+    case BC_FXNTAG: case BC_NOT: case BC_GOT: case BC_NO:
+    case BC_NEG: case BC_ABS: {
       /* All 4 share: opcode + dst(u16) + src(u16) = 5 bytes.
        * FXNTAG returns FXN(O_TAG(src)); NOT/GOT/NO return FXN(0)
        * or FXN(1) based on truthy / No comparison.  Pure
@@ -1508,6 +1638,8 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
         case BC_NOT:    helper = (void*)jit_rt_not_helper;    hid = JIT_HELPER_NOT;    break;
         case BC_GOT:    helper = (void*)jit_rt_got_helper;    hid = JIT_HELPER_GOT;    break;
         case BC_NO:     helper = (void*)jit_rt_no_helper;     hid = JIT_HELPER_NO;     break;
+        case BC_NEG:    helper = (void*)jit_rt_neg_helper;    hid = JIT_HELPER_NEG;    break;
+        case BC_ABS:    helper = (void*)jit_rt_abs_helper;    hid = JIT_HELPER_ABS;    break;
         default: helper = NULL; hid = JIT_HELPER_NONE;
       }
       if (!helper) { jit_last_fail_opcode = op;

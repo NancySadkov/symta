@@ -360,6 +360,124 @@ static void jit_rt_list_impl(int64_t *L, int dst, int size, int unused) {
   LIST(((dyn*)L)[dst], size);
 }
 
+/* SBC_FXNLISTN: L[dst] = LIST(UNFXN(L[src])).  Mirrors sbc.c's
+ * SBC_FXNLISTN body exactly -- the size comes from a runtime
+ * slot containing a FXN-tagged int, not a literal. */
+static void jit_rt_fxnlistn_impl(int64_t *L, int dst, int src, int u) {
+  (void)u;
+  FXNLISTN(((dyn*)L)[dst], ((dyn*)L)[src]);
+}
+
+/* SBC_NEG / SBC_ABS: unary arith.  Match sbc.c bodies.
+ * NEG: T_INT inline (FXNNEG); else MCALL m_neg.
+ * ABS: T_INT inline (|val|); T_FLOAT inline (fabsf); else MCALL m_abs. */
+static void jit_rt_neg_impl(int64_t *L, int dst, int a, int u) {
+  (void)u;
+  dyn aa = ((dyn*)L)[a];
+  if (TAGIS(T_INT, aa)) {
+    FXNNEG(((dyn*)L)[dst], aa);
+  } else {
+    ARGLIST1(((dyn*)L)[a]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_neg);
+  }
+}
+static void jit_rt_abs_impl(int64_t *L, int dst, int a, int u) {
+  (void)u;
+  dyn aa = ((dyn*)L)[a];
+  if (TAGIS(T_INT, aa)) {
+    int64_t val = UNFXN(aa);
+    if (val < 0) aa = (dyn)(int64_t)FXN(-val);
+    ((dyn*)L)[dst] = aa;
+  } else if (TAGIS(T_FLOAT, aa)) {
+    float fa;
+    STFLT(fa, aa);
+    if (fa < 0.0f) fa = -fa;
+    LDFLT(((dyn*)L)[dst], fa);
+  } else {
+    ARGLIST1(((dyn*)L)[a]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_abs);
+  }
+}
+
+/* SBC_FXNAND / IOR / XOR / SHL / SHR: bitwise ops with T_INT-T_INT
+ * fast path and MCALL fallback (m_and/m_ior/m_xor/m_shl/m_shr). */
+static void jit_rt_fxnand_impl(int64_t *L, int dst, int a, int b) {
+  dyn aa = ((dyn*)L)[a], bb = ((dyn*)L)[b];
+  if (TAGIS(T_INT, aa) && TAGIS(T_INT, bb)) FXNAND(((dyn*)L)[dst], aa, bb);
+  else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_and);
+  }
+}
+static void jit_rt_fxnior_impl(int64_t *L, int dst, int a, int b) {
+  dyn aa = ((dyn*)L)[a], bb = ((dyn*)L)[b];
+  if (TAGIS(T_INT, aa) && TAGIS(T_INT, bb)) FXNIOR(((dyn*)L)[dst], aa, bb);
+  else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_ior);
+  }
+}
+static void jit_rt_fxnxor_impl(int64_t *L, int dst, int a, int b) {
+  dyn aa = ((dyn*)L)[a], bb = ((dyn*)L)[b];
+  if (TAGIS(T_INT, aa) && TAGIS(T_INT, bb)) FXNXOR(((dyn*)L)[dst], aa, bb);
+  else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_xor);
+  }
+}
+static void jit_rt_fxnshl_impl(int64_t *L, int dst, int a, int b) {
+  dyn aa = ((dyn*)L)[a], bb = ((dyn*)L)[b];
+  if (TAGIS(T_INT, aa) && TAGIS(T_INT, bb)) FXNSHL(((dyn*)L)[dst], aa, bb);
+  else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_shl);
+  }
+}
+static void jit_rt_fxnshr_impl(int64_t *L, int dst, int a, int b) {
+  dyn aa = ((dyn*)L)[a], bb = ((dyn*)L)[b];
+  if (TAGIS(T_INT, aa) && TAGIS(T_INT, bb)) FXNSHR(((dyn*)L)[dst], aa, bb);
+  else {
+    ARGLIST2(((dyn*)L)[a], ((dyn*)L)[b]);
+    MCALL(((dyn*)L)[dst], ((dyn*)L)[a], m_shr);
+  }
+}
+
+/* SBC_FXNLSETIR: list-set with ignored result.  3-way dispatch:
+ *   T_LIST + T_INT + in-bounds  -> direct FXNLSET (lsetm barrier)
+ *   else                         -> MCACHE_CALL m_set on L[src]
+ * Packed: [15:0]=src, [31:16]=index, [47:32]=val, [63:48]=mcache_idx. */
+static void jit_rt_fxnlsetir_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t src   = (uint32_t)(packed & 0xFFFF);
+  uint32_t index = (uint32_t)((packed >> 16) & 0xFFFF);
+  uint32_t val   = (uint32_t)((packed >> 32) & 0xFFFF);
+  uint32_t mcidx = (uint32_t)((packed >> 48) & 0xFFFF);
+  dyn ss = ((dyn*)L)[src];
+  dyn ii = ((dyn*)L)[index];
+  if (TAGIS(T_LIST, ss) && TAGIS(T_INT, ii)
+      && (uint64_t)ii < (uint64_t)FXN(LIST_SIZE(ss))) {
+    dyn dummy;
+    FXNLSET(dummy, ss, ii, ((dyn*)L)[val]);
+    (void)dummy;
+  } else {
+    ARGLIST3(ss, ii, ((dyn*)L)[val]);
+    api.method = m_set;
+    mcache_t *mce = &sbc->mcaches[mcidx];
+    uint32_t tid = O_TAG(ss);
+    dyn mfn;
+    if (mce->tid != tid || mce->mid != (uint32_t)m_set) {
+      mfn = get_method_for_tag(m_set, tid);
+      mce->tid = tid;
+      mce->mid = (uint32_t)m_set;
+      mce->fn  = mfn;
+    } else {
+      mfn = mce->fn;
+    }
+    dyn dummy;
+    CALL(dummy, mfn);
+    (void)dummy;
+  }
+}
+
 /* SBC_LIST1 / SBC_LIST2 (RT-9 fused list literals).  Mirror the
  * interpreter bodies in sbc.c:SBC_LIST1 / SBC_LIST2 -- allocate
  * a size-1 or size-2 list and stash the source slot(s) into
@@ -460,6 +578,71 @@ static void jit_rt_movemt_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
   uint32_t dst = (uint32_t)(packed & 0xFFFF);
   uint32_t src = (uint32_t)((packed >> 16) & 0xFFFFFF);
   ((dyn*)L)[dst] = (dyn)(int64_t)FXN(sbc->mt[src]);
+}
+
+/* SBC_IMMEQ / SBC_IMMNE: 3-way dispatch matching sbc.c.
+ *   T_INT-anything    -> bitwise compare on tagged dyns
+ *   text-vs-text      -> texts_equal direct call
+ *   otherwise         -> MCACHE_CALL m_eq / m_ne
+ * Packed: [15:0]=dst, [31:16]=a_slot, [47:32]=b_slot,
+ *         [63:48]=mcache_idx. */
+static void jit_rt_immeq_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t dst   = (uint32_t)(packed & 0xFFFF);
+  uint32_t a_sl  = (uint32_t)((packed >> 16) & 0xFFFF);
+  uint32_t b_sl  = (uint32_t)((packed >> 32) & 0xFFFF);
+  uint32_t mcidx = (uint32_t)((packed >> 48) & 0xFFFF);
+  dyn aa = ((dyn*)L)[a_sl];
+  dyn bb = ((dyn*)L)[b_sl];
+  if (TAGIS(T_INT, aa)) {
+    ((dyn*)L)[dst] = (dyn)(int64_t)FXN(aa == bb);
+  } else if ((TAGIS(T_TEXT, aa) || TAGIS(T_FIXTEXT, aa))
+          && (TAGIS(T_TEXT, bb) || TAGIS(T_FIXTEXT, bb))) {
+    ((dyn*)L)[dst] = (dyn)(int64_t)FXN(texts_equal(aa, bb));
+  } else {
+    ARGLIST2(aa, bb);
+    api.method = m_eq;
+    mcache_t *mce = &sbc->mcaches[mcidx];
+    uint32_t tid = O_TAG(aa);
+    dyn mfn;
+    if (mce->tid != tid || mce->mid != (uint32_t)m_eq) {
+      mfn = get_method_for_tag(m_eq, tid);
+      mce->tid = tid;
+      mce->mid = (uint32_t)m_eq;
+      mce->fn  = mfn;
+    } else {
+      mfn = mce->fn;
+    }
+    CALL(((dyn*)L)[dst], mfn);
+  }
+}
+static void jit_rt_immne_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t dst   = (uint32_t)(packed & 0xFFFF);
+  uint32_t a_sl  = (uint32_t)((packed >> 16) & 0xFFFF);
+  uint32_t b_sl  = (uint32_t)((packed >> 32) & 0xFFFF);
+  uint32_t mcidx = (uint32_t)((packed >> 48) & 0xFFFF);
+  dyn aa = ((dyn*)L)[a_sl];
+  dyn bb = ((dyn*)L)[b_sl];
+  if (TAGIS(T_INT, aa)) {
+    ((dyn*)L)[dst] = (dyn)(int64_t)FXN(aa != bb);
+  } else if ((TAGIS(T_TEXT, aa) || TAGIS(T_FIXTEXT, aa))
+          && (TAGIS(T_TEXT, bb) || TAGIS(T_FIXTEXT, bb))) {
+    ((dyn*)L)[dst] = (dyn)(int64_t)FXN(!texts_equal(aa, bb));
+  } else {
+    ARGLIST2(aa, bb);
+    api.method = m_ne;
+    mcache_t *mce = &sbc->mcaches[mcidx];
+    uint32_t tid = O_TAG(aa);
+    dyn mfn;
+    if (mce->tid != tid || mce->mid != (uint32_t)m_ne) {
+      mfn = get_method_for_tag(m_ne, tid);
+      mce->tid = tid;
+      mce->mid = (uint32_t)m_ne;
+      mce->fn  = mfn;
+    } else {
+      mfn = mce->fn;
+    }
+    CALL(((dyn*)L)[dst], mfn);
+  }
 }
 
 /* SBC_INC / SBC_DEC: T_INT fast path = FXNADD/SUB(_, _, FXN(1)),
@@ -626,6 +809,17 @@ static void jit_install_helpers_once(void) {
   jit_rt_inc_helper      = jit_rt_inc_impl;
   jit_rt_dec_helper      = jit_rt_dec_impl;
   jit_rt_movemt_helper   = jit_rt_movemt_impl;
+  jit_rt_immeq_helper    = jit_rt_immeq_impl;
+  jit_rt_immne_helper    = jit_rt_immne_impl;
+  jit_rt_fxnlistn_helper = jit_rt_fxnlistn_impl;
+  jit_rt_fxnlsetir_helper = jit_rt_fxnlsetir_impl;
+  jit_rt_neg_helper      = jit_rt_neg_impl;
+  jit_rt_abs_helper      = jit_rt_abs_impl;
+  jit_rt_fxnand_helper   = jit_rt_fxnand_impl;
+  jit_rt_fxnior_helper   = jit_rt_fxnior_impl;
+  jit_rt_fxnxor_helper   = jit_rt_fxnxor_impl;
+  jit_rt_fxnshl_helper   = jit_rt_fxnshl_impl;
+  jit_rt_fxnshr_helper   = jit_rt_fxnshr_impl;
 }
 
 void jit_install_helpers_public(void) {
@@ -681,6 +875,17 @@ void *jit_helper_pointer(int helper_id) {
     case JIT_HELPER_INC:      return (void*)jit_rt_inc_helper;
     case JIT_HELPER_DEC:      return (void*)jit_rt_dec_helper;
     case JIT_HELPER_MOVEMT:   return (void*)jit_rt_movemt_helper;
+    case JIT_HELPER_IMMEQ:    return (void*)jit_rt_immeq_helper;
+    case JIT_HELPER_IMMNE:    return (void*)jit_rt_immne_helper;
+    case JIT_HELPER_FXNLISTN: return (void*)jit_rt_fxnlistn_helper;
+    case JIT_HELPER_FXNLSETIR: return (void*)jit_rt_fxnlsetir_helper;
+    case JIT_HELPER_NEG:      return (void*)jit_rt_neg_helper;
+    case JIT_HELPER_ABS:      return (void*)jit_rt_abs_helper;
+    case JIT_HELPER_FXNAND:   return (void*)jit_rt_fxnand_helper;
+    case JIT_HELPER_FXNIOR:   return (void*)jit_rt_fxnior_helper;
+    case JIT_HELPER_FXNXOR:   return (void*)jit_rt_fxnxor_helper;
+    case JIT_HELPER_FXNSHL:   return (void*)jit_rt_fxnshl_helper;
+    case JIT_HELPER_FXNSHR:   return (void*)jit_rt_fxnshr_helper;
     default:                  return NULL;
   }
 }

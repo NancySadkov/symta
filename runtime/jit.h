@@ -93,6 +93,17 @@ typedef enum {
   JIT_HELPER_INC      = 39,
   JIT_HELPER_DEC      = 40,
   JIT_HELPER_MOVEMT   = 41,
+  JIT_HELPER_IMMEQ    = 42,
+  JIT_HELPER_IMMNE    = 43,
+  JIT_HELPER_FXNLISTN = 44,
+  JIT_HELPER_FXNLSETIR = 45,
+  JIT_HELPER_NEG      = 46,
+  JIT_HELPER_ABS      = 47,
+  JIT_HELPER_FXNAND   = 48,
+  JIT_HELPER_FXNIOR   = 49,
+  JIT_HELPER_FXNXOR   = 50,
+  JIT_HELPER_FXNSHL   = 51,
+  JIT_HELPER_FXNSHR   = 52,
   JIT_HELPER_MAX
 } jit_helper_id_t;
 
@@ -475,6 +486,47 @@ extern void (*jit_rt_moveim_helper)(int64_t *L, struct sbc_t *sbc,
  * identical to MOVEIM. */
 extern void (*jit_rt_movemt_helper)(int64_t *L, struct sbc_t *sbc,
                                     uint64_t packed);
+
+/* SBC_IMMEQ / SBC_IMMNE: immediate equality / inequality with
+ * per-call-site mcache.  Three-way dispatch (T_INT inline, text-
+ * vs-text via texts_equal, fallback via MCACHE_CALL m_eq/m_ne)
+ * mirrors sbc.c exactly.  Packed: [15:0]=dst, [31:16]=a,
+ * [47:32]=b, [63:48]=mcache_idx. */
+extern void (*jit_rt_immeq_helper)(int64_t *L, struct sbc_t *sbc,
+                                   uint64_t packed);
+extern void (*jit_rt_immne_helper)(int64_t *L, struct sbc_t *sbc,
+                                   uint64_t packed);
+
+/* SBC_FXNLISTN: L[dst] = LIST(UNFXN(L[src])).  Variable-size list
+ * allocator -- size comes from a slot at runtime.  Helper3 sig:
+ * (L, dst_slot, src_slot, unused). */
+extern void (*jit_rt_fxnlistn_helper)(int64_t *L, int dst, int src, int u);
+
+/* SBC_FXNLSETIR: list-element-set, ignore-result.  Body:
+ *   FXNLSET(_, L[src], L[index], L[val])  on T_LIST+T_INT+inbounds
+ *   else MCACHE_CALL(m_set, L[src]) with args (src, index, val)
+ * Packed (4 u16 fields):
+ *   [15:0]   = src   (slot)
+ *   [31:16]  = index (slot)
+ *   [47:32]  = val   (slot)
+ *   [63:48]  = mcache_idx */
+extern void (*jit_rt_fxnlsetir_helper)(int64_t *L, struct sbc_t *sbc,
+                                       uint64_t packed);
+
+/* SBC_NEG / SBC_ABS: unary arith with T_INT fast path and MCALL
+ * fallback (m_neg / m_abs).  ABS additionally has a T_FLOAT
+ * fast path (fabs).  Helper3 sig: (L, dst, a, _). */
+extern void (*jit_rt_neg_helper)(int64_t *L, int dst, int a, int u);
+extern void (*jit_rt_abs_helper)(int64_t *L, int dst, int a, int u);
+
+/* SBC_FXNAND / IOR / XOR / SHL / SHR: bitwise ops with T_INT-T_INT
+ * fast path and MCALL fallback (m_and / m_ior / m_xor / m_shl /
+ * m_shr).  Helper3 sig: (L, dst, a, b). */
+extern void (*jit_rt_fxnand_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fxnior_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fxnxor_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fxnshl_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fxnshr_helper)(int64_t *L, int dst, int a, int b);
 
 /* SBC_INC / SBC_DEC: T_INT fast path = FXNADD/SUB(_,_,FXN(1));
  * else MCALL m_inc / m_dec.  Helper3 sig: (L, dst, a, _). */
