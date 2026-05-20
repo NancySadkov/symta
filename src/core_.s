@@ -1166,23 +1166,23 @@ list.sortBy F =
 
 //= parse text as integer; an optional argument provides Radix
 text.int @Radix =
-| @"Parse a text as an integer.  Returns No on parse error."
-| Rdx 10
-| when Radix.n: Rdx =  Radix.0
-| T Me.u
-| N $n
-| R I 0
-| Sign if $I >< '-'
+  @"Parse a text as an integer.  Returns No on parse error."
+  Rdx 10
+  when Radix.n: Rdx =  Radix.0
+  T Me.u
+  N $n
+  R I 0
+  Sign if $I >< '-'
        then | I+
             | -1
        else 1
-| Base '0'.code
-| AlphaBase 'A'.code - 10
-| for (; I < N; I+)
+  Base '0'.code
+  AlphaBase 'A'.code - 10
+  for (; I < N; I+)
   | C T.I.code
   | V if '0'.code << C and C << '9'.code then C - Base else C - AlphaBase
   | R =  R*Rdx + V
-| R*Sign
+  R*Sign
 
 //tries parsing as int, or returns Default
 text.try_int Default = if $n>0 and $all(?is_digit): $int else Default
@@ -1201,20 +1201,20 @@ list.s2b = as R $u2b: when R-*-0x8000: R-=0x10000
 int.u4 = [Me%256 Me/0x100%256 Me/0x10000%256 Me/0x1000000%256]
 int.u4b = [Me/0x1000000%256 Me/0x10000%256 Me/0x100%256 Me%256]
 int.s4 =
-| when Me < 0: Me += 0x100000000
-| [Me%256 Me/0x100%256 Me/0x10000%256 Me/0x1000000%256]
+  when Me < 0: Me += 0x100000000
+  [Me%256 Me/0x100%256 Me/0x10000%256 Me/0x1000000%256]
 int.s4b =
-| when Me < 0: Me += 0x100000000
-| [Me/0x1000000%256 Me/0x10000%256 Me/0x100%256 Me%256]
+  when Me < 0: Me += 0x100000000
+  [Me/0x1000000%256 Me/0x10000%256 Me/0x100%256 Me%256]
 
 int.u2 = [Me%256 Me/0x100%256]
 int.u2b = [Me/0x100%256 Me%256]
-int.s2 = 
-| when Me < 0: Me += 0x10000
-| [Me%256 Me/0x100%256]
+int.s2 =
+  when Me < 0: Me += 0x10000
+  [Me%256 Me/0x100%256]
 int.s2b =
-| when Me < 0: Me += 0x10000
-| [Me/0x100%256 Me%256]
+  when Me < 0: Me += 0x10000
+  [Me/0x100%256 Me%256]
 
 int.bit N = _and 1: _shr Me N
 int.bitSet N Bit = _xor Me (_xor (_shl Bit N) (_and Me (_shl 1 N)))
@@ -1240,8 +1240,8 @@ float.clip A B = if Me < A then A
                  else Me
 
 atan2 X Y =
-| PI 3.141592653589793 //FIXME: use a macro
-| R if X > 0.0 then @atan Y/X
+  PI 3.141592653589793 //FIXME: use a macro
+  R if X > 0.0 then @atan Y/X
     else if Y > 0.0 then
       if X < 0.0 then PI + (Y/X).atan
       else PI/2.0
@@ -1250,8 +1250,8 @@ atan2 X Y =
       else PI*6.0/4.0
     else if X < 0.0 then PI
     else 0.0
-| when R < 0.0: R += 2.0*PI
-| R
+  when R < 0.0: R += 2.0*PI
+  R
 
 
 list.<= Src = times I $n: $I = Src.I
