@@ -609,21 +609,21 @@ text.urls = Me.paths{url}
 text.folders = Me.items{url}.keep(?(:_ '' '')){?0.lead}
 
 text.url =
-| Name Ext ""
-| Xs $l.f
-| Sep Xs.locate(?><'/')
-| Dot Xs.locate(?><'.')
-| when got Dot and (no Sep or Dot < Sep):
+  Name Ext ""
+  Xs $l.f
+  Sep Xs.locate(?><'/')
+  Dot Xs.locate(?><'.')
+  when got Dot and (no Sep or Dot < Sep):
   | Ext =  Xs.take(Dot).f.text
   | Xs =  Xs.drop(Dot+1)
   | when got Sep: Sep -= Dot+1
-| Folder Name No
-| if got Sep
+  Folder Name No
+  if got Sep
   then | Folder =  "[Xs.drop(Sep+1).f.text]/"
        | Name =  Xs.take(Sep).f.text
   else | Folder =  ''
        | Name =  Xs.f.text
-| [Folder Name Ext]
+  [Folder Name Ext]
 
 list.unurl =
   [Folder Name Ext] Me
