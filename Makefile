@@ -196,6 +196,8 @@ test-runtime: runtime
 	@bash tests/runtime/run.sh
 	@echo "[run] line-number regression tests"
 	@bash tests/runtime/lineno-check.sh
+	@echo "[run] tiny-gen0 GC regression test"
+	@bash tests/runtime/tiny-gen0.sh
 
 test-compiler: runtime
 	@echo "[run] compiler-output regression tests"
