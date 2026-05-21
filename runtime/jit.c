@@ -602,6 +602,15 @@ typedef struct {
 uint8_t jit_last_fail_opcode = 0;
 size_t  jit_last_fail_offset = 0;
 
+/* Step 12e: runtime address of `api_g.heap0` (the FIELD address,
+ * not its value).  Set by jit_install_helpers_once on first use.
+ * The inline LD4 emitter bakes this into the JIT'd code as imm64;
+ * the runtime then dereferences it to read the heap base pointer.
+ * Stays NULL in the standalone JIT_SELF_TEST build (the LD4 cases
+ * fall back to the helper-call path or to "bail out" if neither
+ * is installed). */
+void *jit_rt_heap0_addr = NULL;
+
 /* Trampoline helpers set by the runtime side.  See jit.h. */
 void (*jit_rt_ld4_helper)(int64_t *L, int dst, int src, int index) = NULL;
 void (*jit_rt_st4_helper)(int64_t *L, int dst, int src, int index) = NULL;
@@ -852,40 +861,52 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
        * dst = opr & 0xF, src = opr >> 4 -- both 4-bit slot
        * indices into L[0..15].  Body:
        *   L[dst] = ((void**)O_PTR(L[src]))[index]
-       * Requires HEAP_BASE access; trampolined via a runtime
-       * helper installed by jit_sbc.c.  In the standalone
-       * self-test build the helper is NULL and we bail out. */
+       *
+       * Step 12e: emit inline x86 (jit_emit_ld4) instead of the
+       * helper trampoline.  Falls back to the helper if
+       * SYMTA_NO_LD4_INLINE is set (env-gate for bisecting) or
+       * if jit_rt_heap0_addr isn't available (standalone
+       * self-test). */
       if (i + 2 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
-      if (!jit_rt_ld4_helper) { jit_last_fail_opcode = op;
-                                jit_last_fail_offset = i;
-                                fail = 1; goto done; }
       int index = op - 0x6A;
       uint8_t opr = bc[i + 1];
       uint32_t dst = (uint32_t)(opr & 0xF);
       uint32_t src = (uint32_t)(opr >> 4);
-      b->pending_helper_id = JIT_HELPER_LD4;
-      jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper,
-                            dst, src, (uint32_t)index);
+      if (jit_rt_heap0_addr && !getenv("SYMTA_NO_LD4_INLINE")) {
+        jit_emit_ld4(b, dst, src, (uint32_t)index, jit_rt_heap0_addr);
+      } else if (jit_rt_ld4_helper) {
+        b->pending_helper_id = JIT_HELPER_LD4;
+        jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper,
+                              dst, src, (uint32_t)index);
+      } else {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
       i += 2;
       break;
     }
 
     case BC_LOAD: {
-      /* SBC_LOAD: same body as LD4 but with u16 operands.  Reuses
-       * the LD4 helper directly. */
+      /* SBC_LOAD: same body as LD4 but with u16 operands. */
       if (i + 7 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
-      if (!jit_rt_ld4_helper) { jit_last_fail_opcode = op;
-                                jit_last_fail_offset = i;
-                                fail = 1; goto done; }
       uint32_t dst   = (uint32_t)bc_rd16(bc + i + 1);
       uint32_t src   = (uint32_t)bc_rd16(bc + i + 3);
       uint32_t index = (uint32_t)bc_rd16(bc + i + 5);
-      b->pending_helper_id = JIT_HELPER_LD4;
-      jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper, dst, src, index);
+      if (jit_rt_heap0_addr && !getenv("SYMTA_NO_LD4_INLINE")) {
+        jit_emit_ld4(b, dst, src, index, jit_rt_heap0_addr);
+      } else if (jit_rt_ld4_helper) {
+        b->pending_helper_id = JIT_HELPER_LD4;
+        jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper, dst, src, index);
+      } else {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
       i += 7;
       break;
     }
@@ -893,14 +914,19 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       if (i + 4 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
-      if (!jit_rt_ld4_helper) { jit_last_fail_opcode = op;
-                                jit_last_fail_offset = i;
-                                fail = 1; goto done; }
       uint32_t dst   = bc[i + 1];
       uint32_t src   = bc[i + 2];
       uint32_t index = bc[i + 3];
-      b->pending_helper_id = JIT_HELPER_LD4;
-      jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper, dst, src, index);
+      if (jit_rt_heap0_addr && !getenv("SYMTA_NO_LD4_INLINE")) {
+        jit_emit_ld4(b, dst, src, index, jit_rt_heap0_addr);
+      } else if (jit_rt_ld4_helper) {
+        b->pending_helper_id = JIT_HELPER_LD4;
+        jit_emit_call_helper3(b, (void*)jit_rt_ld4_helper, dst, src, index);
+      } else {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
       i += 4;
       break;
     }
@@ -2640,6 +2666,97 @@ void jit_emit_same(jit_buf *b, int dst, int a, int x) {
 }
 void jit_emit_vary(jit_buf *b, int dst, int a, int x) {
   emit_cmp_op(b, dst, a, x, 0x95);  /* setne */
+}
+
+/* ============================================================
+ * Step 12e: inline SBC_LD4_* / SBC_LOAD / SBC_LOAD8.
+ *
+ * Body in C:
+ *   L[dst] = ((void**)O_PTR(L[src]))[index]
+ *
+ * where O_PTR(o) = api_g.heap0 + (o >> 16).  The expansion in
+ * x86_64:
+ *
+ *   mov  rax, [rbx + src*8]            ; rax = L[src]   (tagged)
+ *   shr  rax, 16                        ; rax = gid
+ *   movabs rcx, &api_g.heap0            ; rcx = field address
+ *   mov  rcx, [rcx]                     ; rcx = api_g.heap0 value
+ *   mov  rax, [rcx + rax*8 + index*8]   ; rax = heap0[gid + index]
+ *   mov  [rbx + dst*8], rax             ; L[dst] = rax
+ *
+ * RAX and RCX are caller-saved on Win64 + SysV; the locals reg
+ * (RBX) is unchanged.  No call boundary -- the prologue's
+ * shadow space stays intact.
+ * ============================================================ */
+
+/* shr rax, imm8 (logical shift right -- zero-extends).  4 bytes.
+ * We use shr (not sar) because the dyn's high bits encode the
+ * GID, which is always non-negative; logical and arithmetic
+ * shift give the same result here and shr's encoding is one byte
+ * shorter on some assemblers.  Symmetric with emit_shl_rax. */
+static void emit_shr_rax(jit_buf *b, uint8_t imm) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0xc1);
+  jit_emit_u8(b, 0xe8);  /* mod=11 reg=/5=shr r/m=000=RAX */
+  jit_emit_u8(b, imm);
+}
+
+/* movabs rcx, imm64 -- 10 bytes (48 B9 + 8-byte imm).  The imm
+ * may be reloc-recorded (caller passes the helper_id; we record
+ * the imm64's byte offset). */
+static void emit_movabs_rcx_helper(jit_buf *b, uint64_t imm,
+                                    jit_helper_id_t hid) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0xb9);  /* mov rcx, imm64 -- opcode b8+reg, RCX=001 */
+  uint32_t imm_off = (uint32_t)b->len;
+  for (int i = 0; i < 8; i++) jit_emit_u8(b, (uint8_t)(imm >> (i*8)));
+  if (b->record_relocs && hid != JIT_HELPER_NONE) {
+    jit_record_reloc(b, imm_off, hid);
+  }
+}
+
+/* mov rcx, [rcx] -- 3 bytes (48 8B 09).  ModR/M = mod=00,
+ * reg=001(rcx), r/m=001(rcx).  No SIB, no disp -- direct deref
+ * of an unrelated-from-SIB-special register. */
+static void emit_mov_rcx_from_rcx_deref(jit_buf *b) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x8b);
+  jit_emit_u8(b, 0x09);
+}
+
+/* mov rax, [rcx + rax*8 + disp]   (5 bytes if disp fits in s8,
+ * else 8 bytes).  ModR/M = mod=01|10 (disp size), reg=000(rax),
+ * r/m=100 (SIB indicator).  SIB = scale=11(8x), index=000(rax),
+ * base=001(rcx).
+ *
+ * Used to fetch heap0[gid + index] in one instruction:
+ *   gid lives in RAX, heap0 base in RCX, index baked into disp. */
+static void emit_mov_rax_from_rcx_indexed8(jit_buf *b, int32_t disp) {
+  jit_emit_u8(b, 0x48);                    /* REX.W */
+  jit_emit_u8(b, 0x8b);                    /* mov r64, r/m64 */
+  if (disp >= -128 && disp <= 127) {
+    jit_emit_u8(b, 0x44);                   /* mod=01 reg=000 r/m=100(SIB) */
+    jit_emit_u8(b, 0xc1);                   /* SIB: scale=11 index=000 base=001 */
+    jit_emit_u8(b, (uint8_t)(int8_t)disp);
+  } else {
+    jit_emit_u8(b, 0x84);                   /* mod=10 reg=000 r/m=100(SIB) */
+    jit_emit_u8(b, 0xc1);
+    jit_emit_u32(b, (uint32_t)disp);
+  }
+}
+
+void jit_emit_ld4(jit_buf *b, uint32_t dst, uint32_t src, uint32_t index,
+                  void *heap0_addr_imm) {
+  emit_mov_rax_from_slot(b, (int)src);              /* rax = L[src]      */
+  emit_shr_rax(b, 16);                              /* rax = gid         */
+  emit_movabs_rcx_helper(b, (uint64_t)heap0_addr_imm,
+                         JIT_HELPER_AMP_HEAP0);     /* rcx = &heap0      */
+  emit_mov_rcx_from_rcx_deref(b);                   /* rcx = heap0 value */
+  /* index*8 fits in uint32_t for any sane SBC: even u16 index ->
+   * disp = 524280, well under int32_t max.  Cast to signed for
+   * the encoder. */
+  emit_mov_rax_from_rcx_indexed8(b, (int32_t)(index * 8u));
+  emit_mov_slot_from_rax(b, (int)dst);              /* L[dst] = rax      */
 }
 
 size_t jit_here(jit_buf *b) { return b->len; }

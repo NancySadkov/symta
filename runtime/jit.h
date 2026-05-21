@@ -118,6 +118,13 @@ typedef enum {
   JIT_HELPER_TINIT    = 64,
   JIT_HELPER_SUBTYPE  = 65,
   JIT_HELPER_MNAME    = 66,
+  /* Step 12e: address-of-runtime-field reloc kinds.  These resolve
+   * not to a function pointer but to the address of a stable global
+   * (e.g. `&api_g.heap0`).  The JIT-emitted code dereferences the
+   * imm64 once to read the runtime value.  Used by inline
+   * heap-deref opcodes (LD4 / LOAD / LOAD8 / FXNLGET fast path)
+   * to avoid the helper-call overhead. */
+  JIT_HELPER_AMP_HEAP0 = 67,
   JIT_HELPER_MAX
 } jit_helper_id_t;
 
@@ -204,6 +211,28 @@ void jit_emit_irem(jit_buf *b, int dst, int a, int x);
  * functions use jit_emit_prologue + ... + jit_emit_epilogue
  * instead.  Don't mix the two for one function. */
 void jit_emit_ret(jit_buf *b);
+
+/* Step 12e: inline heap-deref for SBC_LD4_* / SBC_LOAD / SBC_LOAD8.
+ *
+ *   L[dst] = ((void**)O_PTR(L[src]))[index]
+ *
+ * Expands O_PTR inline (`api_g.heap0 + (L[src] >> 16) * 8`) instead
+ * of routing through the LD4 helper trampoline.  Saves the helper-
+ * call overhead (~12 cycles + caller-saved register restore) on
+ * every struct-field read -- one of the hottest paths in the
+ * compile / macroexpand loop.
+ *
+ * `heap0_addr_imm` is the runtime address of `api_g.heap0` (the
+ * field, NOT its value).  The emitter bakes it as an imm64 and
+ * records a JIT_HELPER_AMP_HEAP0 reloc when reloc-recording is on
+ * so the AOT loader can rebind it after copying the code into
+ * its own executable mapping.
+ *
+ * Register clobbers: RAX, RCX (both caller-saved).  RBX (locals)
+ * preserved.  Slot indices are unsigned -- max useful is the SBC's
+ * u16 range. */
+void jit_emit_ld4(jit_buf *b, uint32_t dst, uint32_t src, uint32_t index,
+                  void *heap0_addr_imm);
 
 /* ============================================================
  * Step 2: control flow + typed-int comparison emitters.
@@ -376,6 +405,13 @@ extern void (*jit_rt_fxnrem_helper)(int64_t *L, int dst, int a, int b);
 /* SBC_LD4_* / SBC_LOAD / SBC_LOAD8.
  * Signature: (L, dst_slot, src_slot, struct_field_index). */
 extern void (*jit_rt_ld4_helper)(int64_t *L, int dst, int src, int index);
+
+/* Step 12e: address-of `api_g.heap0` (the field address, not the
+ * value).  Set by `jit_install_helpers_once`.  Read by the inline
+ * LD4 emitter to bake the field address as an imm64 -- the JIT'd
+ * code then dereferences it at run time to fetch the heap base
+ * pointer.  See jit.c:jit_emit_ld4. */
+extern void *jit_rt_heap0_addr;
 
 /* SBC_ST4_* / SBC_STOR (when added).
  * Signature: (L, target_obj_slot, value_slot, struct_field_index).

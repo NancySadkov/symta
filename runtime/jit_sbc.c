@@ -1011,6 +1011,11 @@ static void jit_install_helpers_once(void) {
   jit_rt_tinit_helper    = jit_rt_tinit_impl;
   jit_rt_subtype_helper  = jit_rt_subtype_impl;
   jit_rt_mname_helper    = jit_rt_mname_impl;
+  /* Step 12e: hand the inline LD4 emitter the address of
+   * `api_g.heap0` (the field) so it can bake it as an imm64.  At
+   * AOT install time the JIT_HELPER_AMP_HEAP0 reloc rebinds it
+   * to the current process's field address. */
+  jit_rt_heap0_addr      = (void*)&api_g.heap0;
 }
 
 void jit_install_helpers_public(void) {
@@ -1091,6 +1096,8 @@ void *jit_helper_pointer(int helper_id) {
     case JIT_HELPER_TINIT:    return (void*)jit_rt_tinit_helper;
     case JIT_HELPER_SUBTYPE:  return (void*)jit_rt_subtype_helper;
     case JIT_HELPER_MNAME:    return (void*)jit_rt_mname_helper;
+    /* Step 12e: address-of-runtime-field relocs.  See jit.h. */
+    case JIT_HELPER_AMP_HEAP0: return (void*)&api_g.heap0;
     default:                  return NULL;
   }
 }
