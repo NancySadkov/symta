@@ -460,10 +460,18 @@ static void jit_rt_fxnlset_impl(int64_t *L, struct sbc_t *sbc,
       && (uint64_t)ii < (uint64_t)FXN(LIST_SIZE(ss))) {
     FXNLSET(((dyn*)L)[dst], ss, ii, ((dyn*)L)[val]);
   } else {
-    ARGLIST3(ss, ii, ((dyn*)L)[val]);
+    /* Bug #14 fix: ARGLIST3 allocates; ss/ii are stale C-locals
+     * that could be invalidated by GC during the LIST alloc.
+     * Reload from frame slots after ARGLIST.  Tag bits in the stale
+     * `ss` are still valid (encoding-stable across GC), so the
+     * O_TAG-based mcache key below is safe to compute pre-reload. */
+    ARGLIST(3);
+    STARG(0, ((dyn*)L)[src]);
+    STARG(1, ((dyn*)L)[index]);
+    STARG(2, ((dyn*)L)[val]);
     api.method = m_set;
     mcache_t *mce = &sbc->mcaches[mcidx];
-    uint32_t tid = O_TAG(ss);
+    uint32_t tid = O_TAG(((dyn*)L)[src]);
     dyn mfn;
     if (mce->tid != tid || mce->mid != (uint32_t)m_set) {
       mfn = get_method_for_tag(m_set, tid);
@@ -610,10 +618,15 @@ static void jit_rt_fxnlsetir_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed
     FXNLSET(dummy, ss, ii, ((dyn*)L)[val]);
     (void)dummy;
   } else {
-    ARGLIST3(ss, ii, ((dyn*)L)[val]);
+    /* Bug #14 fix: reload from frame slots after ARGLIST.  See
+     * jit_rt_fxnlset_impl for the rationale. */
+    ARGLIST(3);
+    STARG(0, ((dyn*)L)[src]);
+    STARG(1, ((dyn*)L)[index]);
+    STARG(2, ((dyn*)L)[val]);
     api.method = m_set;
     mcache_t *mce = &sbc->mcaches[mcidx];
-    uint32_t tid = O_TAG(ss);
+    uint32_t tid = O_TAG(((dyn*)L)[src]);
     dyn mfn;
     if (mce->tid != tid || mce->mid != (uint32_t)m_set) {
       mfn = get_method_for_tag(m_set, tid);
@@ -750,10 +763,19 @@ static void jit_rt_immeq_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
           && (TAGIS(T_TEXT, bb) || TAGIS(T_FIXTEXT, bb))) {
     ((dyn*)L)[dst] = (dyn)(int64_t)FXN(texts_equal(aa, bb));
   } else {
-    ARGLIST2(aa, bb);
+    /* Bug #14 fix: ARGLIST2 allocates a fresh LIST, which can move
+     * heap objects via GC.  Frame slots L[a_sl] / L[b_sl] are GC
+     * roots (scanned via api.frame chain), but the C locals aa/bb
+     * are NOT -- they cache a stale pointer if their target moves.
+     * Re-load from the frame slots AFTER ARGLIST2 so STARG writes
+     * the post-GC pointers into api.args.  Pre-ARGLIST aa is fine
+     * for the O_TAG check below since the tag bits don't change. */
+    ARGLIST(2);
+    STARG(0, ((dyn*)L)[a_sl]);
+    STARG(1, ((dyn*)L)[b_sl]);
     api.method = m_eq;
     mcache_t *mce = &sbc->mcaches[mcidx];
-    uint32_t tid = O_TAG(aa);
+    uint32_t tid = O_TAG(((dyn*)L)[a_sl]);
     dyn mfn;
     if (mce->tid != tid || mce->mid != (uint32_t)m_eq) {
       mfn = get_method_for_tag(m_eq, tid);
@@ -779,10 +801,14 @@ static void jit_rt_immne_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
           && (TAGIS(T_TEXT, bb) || TAGIS(T_FIXTEXT, bb))) {
     ((dyn*)L)[dst] = (dyn)(int64_t)FXN(!texts_equal(aa, bb));
   } else {
-    ARGLIST2(aa, bb);
+    /* Bug #14 fix: see jit_rt_immeq_impl above -- reload from frame
+     * slots after ARGLIST so STARG sees post-GC pointers. */
+    ARGLIST(2);
+    STARG(0, ((dyn*)L)[a_sl]);
+    STARG(1, ((dyn*)L)[b_sl]);
     api.method = m_ne;
     mcache_t *mce = &sbc->mcaches[mcidx];
-    uint32_t tid = O_TAG(aa);
+    uint32_t tid = O_TAG(((dyn*)L)[a_sl]);
     dyn mfn;
     if (mce->tid != tid || mce->mid != (uint32_t)m_ne) {
       mfn = get_method_for_tag(m_ne, tid);

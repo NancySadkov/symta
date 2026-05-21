@@ -323,72 +323,72 @@ should be the first stop when a regression surfaces.  Each entry
 records the minimal trigger, the surface symptom, and what we
 already know about the source.
 
-### Bug #14 (P1, near-heisenbug) -- JIT mis-sets api.args during compile
+### Bug #14 (FIXED) -- JIT helpers leaked stale C-local dyns past ARGLIST
 
-- **Trigger.**  Set `game/build.sh` back to `--jit` (or pass it
-  manually), then `rm -rf game/cache game/sbc; bash build.sh`.
-  Crashes during macroexpansion with a "has no method" error
-  on a `No` (tag-14) object.  The exact callee and
-  missing-method vary between binary layouts:
-  - `qlmb_supply_cvars:204` calling `.n` on `No` (current main).
-  - `ssa_mark` receiving `Name = No` (commit `f7885bd` era).
-  - other `expand_block_item_qlmb` chains in past runs.
-- **Confessed shape (per commit `f7885bd`'s message).**
-  "the caller chain `ssa_form -> fn.() -> <wrapper> -> ssa_mark`
-  **mis-set `api.args[0]` somewhere in the JIT'd `ssa_form`'s
-  body**".  The bug isn't a regression from a single recent
-  commit -- it's a pre-existing, allocation-pattern-sensitive
-  api.args-management bug in the JIT'd `ARGLIST + CALL` /
-  `MCALL` sequence.  Commit `2db44fb`'s message: "the bug is
-  allocation-pattern-sensitive and may resurface".  Whether it
-  fires depends on the symta.exe link layout (which shifts
-  heap base addresses and timing).
-- **What we know.**
-  - Reproduces only under `--jit`.  `--no-jit` builds cleanly
-    in ~20 s.  The compiled game's runtime never enters the
-    JIT, so the workaround ships correct output.
-  - **Bisect is unreliable here.**  Committed `sbc/` files
-    drift across history (commits `5659713..1ff250e` had
-    progressively larger SBCs from one bootstrap; `237c89f`
-    spiked to 424 KB; `0666c3b..a2bdcf9` reverted; `0b2d433`
-    spiked again; `970c3ad` "refresh SBCs" caught up).  A
-    "good"/"bad" answer per commit reflects whether the
-    committed SBC matches that commit's binary, not whether
-    the JIT itself works.  A clean rebuild at `970c3ad`
-    happens to pass; at `2db44fb`, `1ca8e6e`, current main
-    happen to fail -- consistent with the
-    allocation-pattern-sensitive shape.
-  - Individually disabling each new JIT translation
-    (`SYMTA_NO_FXNLSET` / `SYMTA_NO_OBJECT` / `SYMTA_NO_ARGLIST`
-    / `SYMTA_NO_DMET` / `SYMTA_NO_CURMET` / `SYMTA_NO_MNAME` /
-    `SYMTA_NO_SUBTYPE` / `SYMTA_NO_TINIT` / `SYMTA_NO_FARITH`)
-    does NOT fix the bug.  All nine together also doesn't.  So
-    the bug is in an older translation or in shared
-    helper-trampoline code (`jit_emit_call_helper3` /
-    `jit_emit_call_with_sbc{,2}`), or in `api.args` setup.
-  - Workaround in `game/build.sh` (commit `1b2c8e4`): `--no-jit`.
-- **Next experiments.**
-  - Snapshot `api.args[0..n]` at the entry of every wrapper /
-    closure-body under both `--jit` and `--no-jit`; diff the
-    traces to find the first divergent slot.
-  - Audit `jit_emit_call_helper3` / `jit_emit_call_with_sbc{,2}`
-    for a missing save/restore around the helper call.  If
-    the helper clobbers something that the post-call code
-    expects intact (e.g. a register holding the args list),
-    every subsequent CALL in the same SBC would see the wrong
-    value -- matches the
-    "later-call-receives-No" shape.
-  - Try disabling JIT for `CALL` / `MCALL` specifically (not
-    just the arg-list opcodes).  If that fixes it, the bug is
-    in the call-emit path.
-  - Reproduce on Linux to check platform-specific helper-
-    trampoline differences (SEH-aware Windows vs POSIX).
-- **Categorisation.**  Sits right on the heisenbug boundary.
-  Strictly speaking it's deterministic given a fixed binary
-  layout, but the layout itself shifts with every source
-  change, so the bug acts like an intermittent.  Apply the
-  exclude-environmental-causes checklist if you see it on a
-  user's machine and nowhere else.
+- **Trigger.**  `rm -rf game/sbc; bash game/build.sh` (with
+  `--jit`).  Crashed during macroexpansion with a "has no
+  method" error on a `No` (tag-14) or `int 0` object.  Surface
+  varied between runs (`qlmb_supply_cvars:204` calling `.n` on
+  `No`, `ssa_mark` receiving `Name = No`, etc.) because the
+  bug was allocation-pattern-sensitive.
+- **Root cause.**  The JIT trampolines `jit_rt_immeq_impl`,
+  `jit_rt_immne_impl`, `jit_rt_fxnlset_impl`, and
+  `jit_rt_fxnlsetir_impl` cached frame-slot reads in C locals
+  *before* calling `ARGLIST2` / `ARGLIST3`, then passed the
+  stale C locals into `STARG` after the allocation:
+
+    ```c
+    dyn aa = ((dyn*)L)[a_sl];       // <-- snapshot
+    dyn bb = ((dyn*)L)[b_sl];
+    ...
+    ARGLIST2(aa, bb);               // GC may run here
+    // STARG(0, aa); STARG(1, bb);  // stale pointers leaked
+    ```
+
+  `ARGLIST*` calls `LIST(api.args, n)` which can trigger GC.
+  Frame slots are GC roots (scanned via `api.frame`) so the
+  slot value is updated to the new heap address, but the C
+  local `aa` still holds the *old* pointer.  When `STARG`
+  wrote `aa` into the newly-allocated args list, the args
+  list ended up with a dangling pointer to recycled memory --
+  which read back as `No` (or whatever else was now at that
+  address).  The first method dispatch through that args
+  list then saw the wrong receiver and crashed.
+- **Why bisect was so painful.**  The trigger depends on the
+  binary's link layout because that shifts heap addresses and
+  GC timing.  The disabled-opcode bisect under
+  `SYMTA_NO_FXNLSET` / `SYMTA_NO_OBJECT` / etc. didn't catch
+  it because those flags gated the *JIT translator's*
+  opcode-emission path, not the *trampoline helper bodies*
+  the AOT-installed code calls into.  The buggy helpers are
+  reached through pre-existing translations (IMMEQ / IMMNE
+  from commit `237c89f`; FXNLSET / FXNLSETIR from `0b2d433`).
+- **Tool that found it.**  Same methodology as bugs #12/#13:
+  pin a deterministic reproducer (`bash build.sh` always
+  failed on the qlmb path), bisect with `SYMTA_JIT_FILTER` +
+  `SYMTA_JIT_MAX_FN` / `SYMTA_JIT_SKIP_FN` to a single
+  function (`fnmeta.name` at compiler.sbc fn-index 207),
+  decode that function's bytecode (`SYMTA_JIT_PRINT_FNS=1`),
+  read the opcode trace -- IMMEQ stood out -- then audit the
+  matching helper for the C-local-before-allocation pattern.
+- **Fix.**  Commit `<TBD>`.  Rewrote the affected helpers so
+  every `STARG` reads from the frame slot post-`ARGLIST`:
+
+    ```c
+    ARGLIST(2);
+    STARG(0, ((dyn*)L)[a_sl]);    // fresh read; post-GC
+    STARG(1, ((dyn*)L)[b_sl]);
+    ```
+
+  Also reload for the `O_TAG`-driven mcache key.  The pre-
+  `ARGLIST` C locals are kept for the fast-path tag checks
+  (tag bits are GC-stable), but never re-used after the
+  allocation point.
+- **Verified.**  `rm -rf game/sbc; bash game/build.sh` now
+  succeeds three runs in a row.  Drift PASS 5/5.  Runtime
+  tests 34/34 PASS.  `tests/runtime/tiny-gen0.sh` still
+  pinned.  Game `build.sh` restored to `--jit` (commit
+  `1b2c8e4`'s `--no-jit` workaround reverted).
 
 ### Bug #13 (FIXED) -- tiny-gen0 secondary GC corruption
 
@@ -441,11 +441,20 @@ already know about the source.
   through to the interpreter for the setjmp call, costing a
   helper-trampoline jump per `try` block.  An inline emission
   would let JIT'd code stay on the hot path through try / catch.
-- **Blocked by.**  Bug #14.  Don't touch the JIT translator
-  while it's known broken; fix correctness first.
+- **Blocked by.**  Was bug #14; now unblocked.
 
 ### Resolved (kept for context)
 
+- **Bug #14** -- the JIT api.args corruption crash under
+  `--jit` on game compile.  Fixed in commit `<TBD>` by
+  reordering `STARG` reads to happen *after* `ARGLIST` in
+  `jit_rt_immeq_impl` / `jit_rt_immne_impl` /
+  `jit_rt_fxnlset_impl` / `jit_rt_fxnlsetir_impl`.  Pre-fix
+  the helpers snapshotted L-slot dyns into C locals, then
+  called `ARGLIST*` (which can GC), then passed the stale
+  C locals to `STARG` -- leaking dangling pointers into
+  api.args.  Three consecutive clean game compiles confirm
+  the fix.
 - **Bug #13** -- the tiny-gen0 expand_qlmb_r segfault.  Same
   source line as bug #12 (`parse_term`'s parsed-cache write)
   but a different failure mode: cross-gen write without
