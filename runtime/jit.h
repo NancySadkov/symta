@@ -192,6 +192,7 @@ typedef struct jit_buf {
    * entries in use (0..JIT_MAX_PINNED). */
   jit_pinned_t pinned[JIT_MAX_PINNED];
   int pinned_count;
+
 } jit_buf;
 
 /* Allocate an executable buffer of `cap` bytes.  Returns NULL on

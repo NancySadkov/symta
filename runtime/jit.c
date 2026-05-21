@@ -527,9 +527,33 @@ void jit_emit_ret(jit_buf *b) {
  * mid-function.
  * ============================================================ */
 
+/* push R<n> for n in 8..15: 41 50+(n-8).  Used by the prologue
+ * extensions when any slots are pinned to R13..R15. */
+static void emit_push_r13_15(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x41);  /* REX.B */
+  jit_emit_u8(b, (uint8_t)(0x50 | (reg - 8)));
+}
+static void emit_pop_r13_15(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x41);  /* REX.B */
+  jit_emit_u8(b, (uint8_t)(0x58 | (reg - 8)));
+}
+
+/* Always reserve all three Phase-2a callee-saved registers when
+ * pinning is active so the stack-alignment math stays uniform
+ * regardless of how many slots actually get pinned (1, 2, or 3).
+ * The unused pushes cost 6 bytes prologue + 6 bytes epilogue --
+ * negligible vs the memory-op savings on the hot path. */
+#define JIT_PHASE2A_HAS_PINS(b) ((b)->pinned_count > 0)
+
 void jit_emit_prologue(jit_buf *b) {
   /* push rbx -- one byte (PUSH r64 family: 50+reg, RBX=011) */
   jit_emit_u8(b, 0x53);
+  if (JIT_PHASE2A_HAS_PINS(b)) {
+    /* push r13, r14, r15 -- three more callee-saved slots. */
+    emit_push_r13_15(b, 13);
+    emit_push_r13_15(b, 14);
+    emit_push_r13_15(b, 15);
+  }
   /* mov rbx, <arg0>  --  rbx is the new home of the locals ptr */
 #ifdef _WIN32
   /* mov rbx, rcx :  48 89 cb (ModR/M 11 001 011, r=rcx, r/m=rbx) */
@@ -542,21 +566,39 @@ void jit_emit_prologue(jit_buf *b) {
   jit_emit_u8(b, 0x89);
   jit_emit_u8(b, 0xfb);
 #endif
-  /* sub rsp, 32 :  48 83 ec 20 (Win64 shadow space + alignment
-   * marker; harmless on SysV).  Keeps RSP%16==0 before any
-   * inner CALL. */
+  if (JIT_PHASE2A_HAS_PINS(b)) {
+    /* Initial-load: each pinned register snapshots its slot's
+     * current memory value.  Same encoding as emit_reload_pinned. */
+    emit_reload_pinned(b);
+  }
+  /* sub rsp, K -- Win64 shadow space + alignment marker, harmless
+   * on SysV.  Stack-alignment math (entry RSP%16 == 8):
+   *   no pins:  push rbx (-8 -> %16=0)            +  sub 32  -> %16=0 ✓
+   *   3 pins:   push rbx + 3 more (-32 -> %16=8)  +  sub 40  -> %16=0 ✓
+   */
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x83);
   jit_emit_u8(b, 0xec);
-  jit_emit_u8(b, 0x20);
+  jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x28 : 0x20);
 }
 
 void jit_emit_epilogue(jit_buf *b) {
-  /* add rsp, 32 :  48 83 c4 20 */
+  if (JIT_PHASE2A_HAS_PINS(b)) {
+    /* Final-store: each pinned register's current value back to
+     * its L[slot] memory cell so the caller observes the right
+     * state. */
+    emit_spill_pinned(b);
+  }
+  /* add rsp, K -- mirrors prologue's sub rsp choice. */
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x83);
   jit_emit_u8(b, 0xc4);
-  jit_emit_u8(b, 0x20);
+  jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x28 : 0x20);
+  if (JIT_PHASE2A_HAS_PINS(b)) {
+    emit_pop_r13_15(b, 15);
+    emit_pop_r13_15(b, 14);
+    emit_pop_r13_15(b, 13);
+  }
   /* pop rbx :  5b */
   jit_emit_u8(b, 0x5b);
   /* ret :  c3 */
@@ -907,6 +949,289 @@ jit_buf *jit_translate_with_sbc_record(const uint8_t *bc, size_t n) {
   return jit_translate_core(bc, n, 1, 1);
 }
 
+/* ============================================================
+ * Phase 2a pre-scan: select the slots to pin to R13..R15.
+ *
+ * Walks the bytecode opcode-by-opcode using a length table that
+ * mirrors the translator's `i += N` increments.  For each opcode
+ * whose operands are slot indices, increments a per-slot
+ * counter.  After the walk, picks the top JIT_MAX_PINNED slots
+ * by count and writes them into b->pinned[].
+ *
+ * Bailing on unknown opcodes is critical for correctness:
+ * mis-skipping an opcode would shift the walk out of phase and
+ * cause us to read random bytes as slot indices.  Those bogus
+ * slot indices might be valid-looking (small ints) and we'd
+ * pin a slot the function never actually uses -- which then
+ * gets garbage-read in the prologue and garbage-written in the
+ * epilogue, corrupting the C stack.  Conservative bail-out
+ * keeps the system safe.
+ *
+ * Disable with SYMTA_NO_REGALLOC. */
+static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
+  b->pinned_count = 0;
+  for (int i = 0; i < JIT_MAX_PINNED; i++) {
+    b->pinned[i].slot = -1;
+    b->pinned[i].reg = 0;
+  }
+  if (getenv("SYMTA_NO_REGALLOC")) return;
+
+  enum { JIT_SCAN_MAX_SLOT = 4096 };
+  uint32_t counts[JIT_SCAN_MAX_SLOT];
+  memset(counts, 0, sizeof(counts));
+
+#define BUMP(slot_expr) do { \
+  uint32_t _s = (uint32_t)(slot_expr); \
+  if (_s < JIT_SCAN_MAX_SLOT && counts[_s] != UINT32_MAX) counts[_s]++; \
+} while (0)
+
+  /* Opcode-length-aware walk.  Lengths cribbed from each `case
+   * BC_*: { ...; i += N; break; }` in the translator's switch.
+   * For opcodes that don't appear in the translator (i.e. we
+   * couldn't translate them) we bail out and pin nothing. */
+  size_t i = 0;
+  while (i < n) {
+    uint8_t op = bc[i];
+    switch (op) {
+    case BC_NOP:                       i += 1; break;
+    case BC_LEAVE:                     i += 1; break;
+    case BC_LEAVE0:                    i += 1; break;
+    case BC_CNAS:                      i += 3; break;
+    case BC_IFFXN:                     i += 4; break;
+    case BC_JMP:                       i += 4; break;
+    case BC_FATAL:                     i += 3; break;
+
+    /* 5-byte slot pairs: opcode + dst(u16) + src(u16) */
+    case BC_MOVE:
+    case BC_INC: case BC_DEC: {
+      if (i + 5 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      i += 5; break;
+    }
+    /* 3-byte slot pairs: opcode + dst(u8) + src(u8) */
+    case BC_MOVE8: case BC_MOVEMT8: {
+      if (i + 3 > n) return;
+      BUMP(bc[i + 1]);
+      BUMP(bc[i + 2]);
+      i += 3; break;
+    }
+    /* 3-byte dst-only u16 */
+    case BC_MOVEEMT: case BC_MOVENO: {
+      if (i + 3 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      i += 3; break;
+    }
+    /* 6-byte: dst(u16) + src(u24) -- MOVEIM, MOVEMT */
+    case BC_MOVEIM: case BC_MOVEMT: {
+      if (i + 6 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      i += 6; break;
+    }
+    /* 7-byte slot triples: opcode + dst(u16) + a(u16) + b(u16).
+     * Covers typed arith / cmp, FXN-arith / cmp, FXN-bitops,
+     * OBJECT (dst tid size -- last is size, count anyway). */
+    case BC_IADD: case BC_ISUB: case BC_IMUL: case BC_IDIV: case BC_IREM:
+    case BC_ILT:  case BC_IGT:  case BC_ILTE: case BC_IGTE:
+    case BC_SAME: case BC_VARY:
+    case BC_FXNADD: case BC_FXNSUB: case BC_FXNMUL: case BC_FXNDIV: case BC_FXNREM:
+    case BC_FXNLT:  case BC_FXNGT:  case BC_FXNLTE: case BC_FXNGTE:
+    case BC_FXNAND: case BC_FXNIOR: case BC_FXNXOR:
+    case BC_FXNSHL: case BC_FXNSHR: {
+      if (i + 7 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      BUMP(bc_rd16(bc + i + 5));
+      i += 7; break;
+    }
+    case BC_OBJECT: {  /* dst + tid + size; only dst is a slot */
+      if (i + 7 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      i += 7; break;
+    }
+    /* 9-byte: IMMEQ/IMMNE (dst, a, b, mcache), FXNLGET (dst, src,
+     * index, mcache), FXNLSETIR (src, index, val, mcache),
+     * MCALL (dst, obj, met, mcache). */
+    case BC_IMMEQ: case BC_IMMNE: case BC_FXNLGET:
+    case BC_FXNLSETIR: case BC_MCALL: {
+      if (i + 9 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      BUMP(bc_rd16(bc + i + 5));
+      i += 9; break;
+    }
+    case BC_FXNLSET: {  /* 11 bytes: dst, src, idx, val, mcache */
+      if (i + 11 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      BUMP(bc_rd16(bc + i + 5));
+      BUMP(bc_rd16(bc + i + 7));
+      i += 11; break;
+    }
+    case BC_LIST: case BC_LIST1:
+    case BC_FXNLISTN: case BC_FXNSIZE: {  /* 5 bytes: dst, x or src */
+      if (i + 5 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      i += 5; break;
+    }
+    case BC_LIST2: {  /* 7 bytes: dst, a, b */
+      if (i + 7 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      BUMP(bc_rd16(bc + i + 5));
+      i += 7; break;
+    }
+    case BC_CALL: case BC_CALLT: {  /* 5 bytes: dst, fn */
+      if (i + 5 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      i += 5; break;
+    }
+    case BC_CALLIR: case BC_CALLTIR: {  /* 3 bytes: fn */
+      if (i + 3 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      i += 3; break;
+    }
+    case BC_MCALLIR: {  /* 7 bytes: obj, met, mcache */
+      if (i + 7 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      i += 7; break;
+    }
+    case BC_MCALL8: {  /* 6 bytes: dst u8, obj u8, met u8, mcache u16 */
+      if (i + 6 > n) return;
+      BUMP(bc[i + 1]);
+      BUMP(bc[i + 2]);
+      i += 6; break;
+    }
+    case BC_ARGLIST0: i += 1; break;
+    case BC_ARGLIST1: {  /* 3 bytes: src(u16) */
+      if (i + 3 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      i += 3; break;
+    }
+    case BC_ARGLIST2: {  /* 5 bytes: a(u16), b(u16) */
+      if (i + 5 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      i += 5; break;
+    }
+    case BC_ARGLIST3: {  /* 7 bytes */
+      if (i + 7 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      BUMP(bc_rd16(bc + i + 5));
+      i += 7; break;
+    }
+    case BC_ARGLIST4: {  /* 9 bytes */
+      if (i + 9 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      BUMP(bc_rd16(bc + i + 5));
+      BUMP(bc_rd16(bc + i + 7));
+      i += 9; break;
+    }
+    case BC_ARGLIST5: {  /* 11 bytes */
+      if (i + 11 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      BUMP(bc_rd16(bc + i + 5));
+      BUMP(bc_rd16(bc + i + 7));
+      BUMP(bc_rd16(bc + i + 9));
+      i += 11; break;
+    }
+    case BC_ARGLIST: case BC_ARGLIST8: {  /* variable: opcode + size(u16) + size*u16 srcs */
+      if (i + 3 > n) return;
+      uint32_t sz = bc_rd16(bc + i + 1);
+      if (i + 3 + sz * 2u > n) return;
+      for (uint32_t k = 0; k < sz; k++) BUMP(bc_rd16(bc + i + 3 + k*2));
+      i += 3 + sz * 2u; break;
+    }
+    /* Heap-deref family.  LD4/ST4_N use 1+1 byte; LOAD/STOR use
+     * 1+u16*3; LOAD8/STOR8 use 1+u8*3. */
+    case 0x6A: case 0x6B: case 0x6C: case 0x6D:
+    case 0x6E: case 0x6F: case 0x70: case 0x71:
+    case 0x72: case 0x73: case 0x74: case 0x75:
+    case 0x76: case 0x77: case 0x78: case 0x79: {  /* LD4_0..LD4_F */
+      if (i + 2 > n) return;
+      uint8_t opr = bc[i + 1];
+      BUMP(opr & 0xF);  /* dst */
+      BUMP(opr >> 4);   /* src */
+      i += 2; break;
+    }
+    case 0x7A: case 0x7B: case 0x7C: case 0x7D:
+    case 0x7E: case 0x7F: case 0x80: case 0x81:
+    case 0x82: case 0x83: case 0x84: case 0x85:
+    case 0x86: case 0x87: case 0x88: case 0x89: {  /* ST4_0..ST4_F */
+      if (i + 2 > n) return;
+      uint8_t opr = bc[i + 1];
+      BUMP(opr & 0xF);
+      BUMP(opr >> 4);
+      i += 2; break;
+    }
+    /* STOR (0x22) wide, STOR8 (0x23) narrow */
+    case 0x22: {  /* 7 bytes: dst u16, src u16, index u16 */
+      if (i + 7 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      i += 7; break;
+    }
+    case 0x23: {  /* 4 bytes: dst u8, src u8, index u8 */
+      if (i + 4 > n) return;
+      BUMP(bc[i + 1]);
+      BUMP(bc[i + 2]);
+      i += 4; break;
+    }
+    case BC_LOAD: {  /* 7 bytes: dst u16, src u16, index u16 */
+      if (i + 7 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      i += 7; break;
+    }
+    case BC_LOAD8: {  /* 4 bytes: dst u8, src u8, index u8 */
+      if (i + 4 > n) return;
+      BUMP(bc[i + 1]);
+      BUMP(bc[i + 2]);
+      i += 4; break;
+    }
+    /* Default: unknown opcode -- bail.  Function gets no pinning. */
+    default:
+      return;
+    }
+  }
+
+#undef BUMP
+
+  /* Pick top-3 by count.  Skip slot 0 and slot 1 (P and E --
+   * the parent/args slots; PROLOGUE populates them, so pinning
+   * is wasted). */
+  uint32_t best_counts[JIT_MAX_PINNED] = {0};
+  int      best_slots[JIT_MAX_PINNED]  = {-1, -1, -1};
+  for (int s = 2; s < JIT_SCAN_MAX_SLOT; s++) {
+    uint32_t c = counts[s];
+    if (c == 0) continue;
+    for (int k = 0; k < JIT_MAX_PINNED; k++) {
+      if (c > best_counts[k]) {
+        for (int j = JIT_MAX_PINNED - 1; j > k; j--) {
+          best_counts[j] = best_counts[j-1];
+          best_slots[j]  = best_slots[j-1];
+        }
+        best_counts[k] = c;
+        best_slots[k]  = s;
+        break;
+      }
+    }
+  }
+  int n_pinned = 0;
+  for (int k = 0; k < JIT_MAX_PINNED; k++) {
+    if (best_counts[k] < 2) break;
+    b->pinned[n_pinned].slot = (int32_t)best_slots[k];
+    b->pinned[n_pinned].reg  = (uint8_t)(13 + n_pinned);
+    n_pinned++;
+  }
+  b->pinned_count = n_pinned;
+}
+
 static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
                                    int have_sbc, int record_relocs) {
   /* x86 expansion factor.  Worst case so far is the comparison
@@ -934,6 +1259,11 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
   jit_patch patches[JIT_MAX_PATCHES];
   size_t patches_n = 0;
   int fail = 0;
+
+  /* Phase 2a register allocation: pick up to JIT_MAX_PINNED slots
+   * to pin to R13..R15.  The prologue + epilogue and all
+   * slot-access primitives consult b->pinned[] thereafter. */
+  jit_select_pinned_slots(b, bc, n);
 
   if (have_sbc) jit_emit_prologue2(b);
   else          jit_emit_prologue(b);
@@ -2766,6 +3096,11 @@ void jit_emit_prologue2(jit_buf *b) {
   /* push r12              :  41 54  (REX.B + push)     */
   jit_emit_u8(b, 0x41);
   jit_emit_u8(b, 0x54);
+  if (JIT_PHASE2A_HAS_PINS(b)) {
+    emit_push_r13_15(b, 13);
+    emit_push_r13_15(b, 14);
+    emit_push_r13_15(b, 15);
+  }
   /* mov rbx, <arg0>       :  48 89 cb (Win) / fb (SysV) */
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x89);
@@ -2786,19 +3121,31 @@ void jit_emit_prologue2(jit_buf *b) {
 #else
   jit_emit_u8(b, 0xf4);
 #endif
-  /* sub rsp, 40           :  48 83 ec 28 */
+  if (JIT_PHASE2A_HAS_PINS(b)) {
+    emit_reload_pinned(b);
+  }
+  /* sub rsp, K -- 40 with no pins (2 pushes -> %16==8, +40 makes
+   * %16==0), 32 with pins (5 pushes -> %16==0, +32 keeps %16==0). */
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x83);
   jit_emit_u8(b, 0xec);
-  jit_emit_u8(b, 0x28);  /* 40 = 32 shadow + 8 align */
+  jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x20 : 0x28);
 }
 
 void jit_emit_epilogue2(jit_buf *b) {
-  /* add rsp, 40 */
+  if (JIT_PHASE2A_HAS_PINS(b)) {
+    emit_spill_pinned(b);
+  }
+  /* add rsp, K -- mirrors prologue2's sub rsp choice. */
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x83);
   jit_emit_u8(b, 0xc4);
-  jit_emit_u8(b, 0x28);
+  jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x20 : 0x28);
+  if (JIT_PHASE2A_HAS_PINS(b)) {
+    emit_pop_r13_15(b, 15);
+    emit_pop_r13_15(b, 14);
+    emit_pop_r13_15(b, 13);
+  }
   /* pop r12               :  41 5c */
   jit_emit_u8(b, 0x41);
   jit_emit_u8(b, 0x5c);
