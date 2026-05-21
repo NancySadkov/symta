@@ -781,7 +781,12 @@ BUILTIN3("list.`=`",view_set,C_ANY,o,C_INT,index,C_ANY,value)
       pp[i] = oo[i];
     }
     VIEW_START(o) = 0;
-    VIEW_BASE(o) = VIEW_STRIP_SHARED(r); //personal copy, so not shared
+    /* Bug-#15 sibling: VIEW_BASE(o)=v is a raw LGET-store hidden by
+     * the macro layer.  `o` is the user-supplied view (possibly
+     * aged through GCs); `r` is the freshly-LIST'd copy-on-write
+     * heap object.  Going through lsetm marks the page dirty so
+     * the younger gen's GC scans `o.0` and `r` survives. */
+    lsetm(o, 0, VIEW_STRIP_SHARED(r));
   }
   uint64_t uindex = (uint64_t)UNFXN(index);
   if ((uint64_t)VIEW_SIZE(o) <= uindex) {

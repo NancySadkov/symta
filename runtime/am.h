@@ -458,6 +458,11 @@ INLINE dyn amGet(dyn o, dyn key) {
 }
 
 INLINE void amSetNo(dyn o, dyn value) {
+  /* Bug-#15 sibling: AM_VOID(o)=value is a raw LGET-store hidden by
+   * the macro layer.  `amSet`/`amGidSet` use AM_ATTRACT for the same
+   * pattern; we mirror that here so a cross-gen write into an aged
+   * table registers `o` in the younger gen's magnets array. */
+  AM_ATTRACT(o, value);
   AM_VOID(o) = value;
 }
 
@@ -472,11 +477,26 @@ INLINE void amSwap(dyn o, dyn m) {
   AM_VOID(o) = AM_VOID(m);
   AM_SET_TYPE(o,AM_TYPE(m));
   AM_SET_YOUNGEST(o,AM_YOUNGEST(m));
+  /* Bug-#15 sibling: AM_SET_YOUNGEST writes the metadata, but the
+   * minor GC scans api.hg0[gen].magnets to find tables holding gen
+   * contents.  Without an arrput, a swap that moves younger content
+   * into an older table goes unscanned by the younger gen's GC.
+   * `amSet`/`amGidSet` solve this via AM_ATTRACT before the write;
+   * for swap we apply the same logic post-swap, using the freshly-
+   * installed AM_YOUNGEST as the target gen.  This addresses the
+   * "currently breaks due to how AM_ATTRACT works on direct object
+   * address" note at `bltin.c:tbl_swap`. */
+  if (AM_YOUNGEST(o) < O_AGE(o)) {
+    arrput(api.hg0[AM_YOUNGEST(o)].magnets, o);
+  }
 
   AM_BASE(m) = obase;
   AM_VOID(m) = ovoid;
   AM_SET_TYPE(m,otype);
   AM_SET_YOUNGEST(m,oyoungest);
+  if (AM_YOUNGEST(m) < O_AGE(m)) {
+    arrput(api.hg0[AM_YOUNGEST(m)].magnets, m);
+  }
 }
 
 //FIXME: maps upgraded to a generic map can be

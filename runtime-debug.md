@@ -445,22 +445,25 @@ already know about the source.
 
 ### Resolved (kept for context)
 
-- **Bug #15** -- audit of every `LGET`-as-store across the
-  runtime turned up two more REAL bugs (bracket-literal
-  parsed-cache in `parse_suf_unary`, `.=name` setter combiner
-  in `parse_suf_loop`) plus two defensive-only sites
-  (`<op>_` appends in `parse_suf_unary` / `binary_loop`,
-  which store fixtext immediates today so the missing
-  barrier is harmless until a longer operator is added).
-  Audit + per-site triggerability evidence in
-  `bugs-review.md`.  Both real bugs fixed in commit `<TBD>`
-  with the anchor + `LSET` recipe; defensive sites also
-  switched to LSET as future-proofing.  Pinned by
-  `tests/runtime/cross-gen-store.sh`: Part A stresses the
-  bracket-cache write (SEGVs reliably when reverted), Part B
-  stresses the `.=name` combiner (proven via full
-  `bash game/build.sh` under tiny gen0 which segfaults at
-  `main_data` when that single LSET is reverted).
+- **Bug #15** -- system-wide sweep for "raw store into a heap
+  container without write barrier" (bug #13's class) found
+  7 sites across `reader.c`, `am.h`, and `bltin.c`.  Two are
+  empirically real bugs (bracket-literal parsed-cache,
+  `.=name` setter combiner -- both in the reader); five are
+  defensive (current operator set is short enough that
+  appended-`_` lands in fixtext immediate; KW_bracketsL /
+  KW_curlyL are 1-char fixtexts; `view_set`'s copy-on-write
+  needs an aged view which the game compile doesn't produce;
+  `amSetNo` / `amSwap` aren't exercised by the game compile
+  but `amSwap` carries a self-warning comment in
+  `bltin.c:tbl_swap`).  All seven fixed across commits
+  `6a66ec3`, `9ed1a68`, `<TBD>` -- four reader.c sites use
+  the anchor + LSET recipe; the two am.h sites use AM_ATTRACT
+  / explicit magnets-array registration; bltin.c's view_set
+  uses lsetm directly.  Audits in `bugs-review.md` (first
+  pass, explicit-LGET form) and `bugs-review-2.md` (second
+  pass, macro-hidden forms `AM_VOID(o)=v` / `VIEW_BASE(o)=v`).
+  Both real bugs pinned by `tests/runtime/cross-gen-store.sh`.
 - **Bug #14** -- the JIT api.args corruption crash under
   `--jit` on game compile.  Fixed in commit `9f3ae76` by
   reordering `STARG` reads to happen *after* `ARGLIST` in
