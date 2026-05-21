@@ -1025,6 +1025,34 @@ dyn sbc_exec_fn(uint8_t *pin) {
     uint32_t a = RD16;
     uint32_t b = RD16;
     CHKREG(dst); CHKREG(a); CHKREG(b);
+    /* DEBUG (task #12, behind SYMTA_DBG_LIST2): catch the case
+     * where SBC_LIST2 builds the canonical bad list `[`@` 0x07]`.
+     * L[a] should be `@` fixtext (0x400004) and L[b] is the
+     * poison slot.  This pins the SBC site (pc/op) that produces
+     * the bad list. */
+    {
+      static int l2dbg = -1;
+      if (l2dbg == -1) l2dbg = getenv("SYMTA_DBG_LIST2") ? 1 : 0;
+      if (l2dbg) {
+        uint64_t va = (uint64_t)L[a], vb = (uint64_t)L[b];
+        if ((vb & 1) && (((vb>>1)&0x7FFF) >= 3) &&
+            (((vb>>1)&0x7FFF) <= 7) && (((vb>>1)&0x7FFF) != 6)) {
+          static int seen2 = 0;
+          if (!seen2) {
+            fprintf(stderr,
+                    "[LIST2] dst=%u a(%u)=%016llx b(%u)=%016llx (b tag=%llu)\n",
+                    dst, a, (unsigned long long)va, b,
+                    (unsigned long long)vb,
+                    (unsigned long long)((vb>>1)&0x7FFF));
+            fprintf(stderr,
+                    "[LIST2] sbc->filename = %s\n",
+                    sbc->filename ? sbc->filename : "?");
+            fflush(stderr); seen2 = 1;
+            if (getenv("SYMTA_FATAL_BAD_TAG")) abort();
+          }
+        }
+      }
+    }
     LIST(L[dst], 2);
     LGET(L[dst], 0) = L[a];
     LGET(L[dst], 1) = L[b];
