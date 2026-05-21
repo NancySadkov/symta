@@ -873,8 +873,25 @@ static dyn parse_term(pstate_t *p) {
   // flag rather than `if (parsed)` because for integer/void/etc.
   // a legitimate parsed value can be 0 (FXN(0) == 0).
   if (have_parsed) {
+    /* RT-13: anchor `tok` and `parsed` across LIST(pp, 1).  The
+     * alloc can trigger GC; without anchors, both C locals are
+     * left pointing at freed nursery slots.
+     *
+     * Also use LSET (with write barrier) for tok.6 = pp rather
+     * than the direct LGET-write.  Under tiny-gen0, tok can be
+     * promoted to an older generation by the time we reach this
+     * cache write, while pp is a fresh nursery allocation.  A
+     * cross-gen write without the dirty-marking write barrier
+     * leaks: when the younger gen collects, gc_older_gens won't
+     * scan tok's page, so the slot keeps pointing at pp's old
+     * (now-recycled) nursery location.  On the next gen-4
+     * collection, gc_list traces that stale slot through a
+     * corrupted gc_head and crashes (bug #13). */
+    gc_anchor_push(&tok);
+    gc_anchor_push(&parsed);
     dyn pp; LIST(pp, 1); LGET(pp, 0) = parsed;
-    LGET(tok, 6) = pp;
+    LSET(tok, 6, pp);
+    gc_anchor_pop_n(2);
   }
   return tok;
 }

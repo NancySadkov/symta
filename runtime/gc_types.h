@@ -21,6 +21,34 @@ GCDEF(gc_list)
   void *p;
   void **pp, **oo;
   size = LIST_SIZE(o);
+  /* DEBUG (behind SYMTA_DUMP_SEGV): catch sources with garbage
+   * size before gc_alloc underruns the heap, and scan the live
+   * heap for the slot that holds the stale dyn `o` so we can
+   * re-run with a page watchpoint on it.  This is how bug #13
+   * was tracked down to parse_term's parsed-cache write. */
+  if (size > 0x100000 && getenv("SYMTA_DUMP_SEGV")) {
+    fprintf(stderr,
+            "[GCLIST_BAD] o=%p size=%u (0x%x) gid=%llu\n",
+            (void*)o, size, size, (unsigned long long)O_GID(o));
+    void **heap0v = (void**)api.heap0;
+    uint64_t target = (uint64_t)(uintptr_t)o;
+    size_t found = 0;
+    for (int gi = 0; gi < api.ngens && found < 5; gi++) {
+      hg_t *g = api.hg0 + gi;
+      void **top = g->top;
+      void **base = g->base;
+      for (void **q = top; q < base && found < 5; q++) {
+        if ((uint64_t)(uintptr_t)*q != target) continue;
+        size_t k = (size_t)(q - heap0v);
+        fprintf(stderr,
+                "[GCLIST_BAD]   holder slot heap[%zu] in gen %d\n",
+                k, gi);
+        found++;
+      }
+    }
+    fflush(stderr);
+    abort();
+  }
   LIST(p, size);
   GC_REDIR(o,p);
   pp = &LGET(p,0);

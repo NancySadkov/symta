@@ -390,33 +390,47 @@ already know about the source.
   exclude-environmental-causes checklist if you see it on a
   user's machine and nowhere else.
 
-### Bug #13 (P1) -- tiny-gen0 secondary GC corruption
+### Bug #13 (FIXED) -- tiny-gen0 secondary GC corruption
 
-- **Trigger.**  `SYMTA_GEN0_SIZE=65536 ./symta.exe tests/runtime/.tiny-gen0`
-  (after the original tag-3 fix in commit `3c7ec19` is in
-  place).  Surfaces only when GC is hammered by a tiny nursery;
-  default heap sizes (above ~96 KB) don't trigger it.
-- **Surface.**  Stack lands in `expand_qlmb_r:27,20` with a
-  segfault below the heap base.  `SYMTA_DUMP_SEGV=1` reveals
-  `gc_alloc + 0x79` writing `h->size` after `hgp->top - size`
-  underflowed, called from `gc_list + 0x49` with
-  `size = 2145583155` (≈ 2.1 GB).
-- **What we know.**  Same shape as bug #12 -- a stale heap-dyn
-  C-local whose target was recycled.  The stale list dyn
-  (`0x000001fe7fe60013`, gid `33456102`) now points into the
-  middle of a CONS object, so `LIST_SIZE(o)` reads adjacent
-  data (a meta dyn) as a `{size, code}` pair, yielding the
-  absurd size.  Live-heap scan localises the slot holding the
-  stale dyn to `heap[33519473]` in generation 4 -- the
-  surroundings look like a 7-slot token's `parsed` cache write.
-  Anchoring `make_meta_wrapper`, `token_`, and `parse_term`'s
-  parsed-cache write didn't move the bug.
-- **Next experiments.**  Run the page-watchpoint with the gid
-  from above:
-  `SYMTA_WATCH_GID=33519473 SYMTA_WATCH_VALUE=0x000001fe7fe60013 ./symta.exe ...`
-  to catch the writing RIP, then resolve to a source line as
-  in bug #12.  Then audit that site for the
-  `dyn x = alloc(); ... LGET(x, i) = stale_y` pattern.
+- **Trigger.**  Was `SYMTA_GEN0_SIZE=65536 ./symta.exe ...`
+  (clean reproducer; default heap sizes never hit it).
+- **Surface.**  Was a segfault below heap base, `gc_alloc + 0x79`
+  writing the new object's header after `hgp->top - size`
+  underflowed.  Caller was `gc_list + 0x49` invoked via
+  `gc_custom`'s slot iteration, asking for `~2.1 GB` because
+  the source list's `gc_head_t` read back as adjacent dyn data
+  instead of a `{size, code}` pair.
+- **Root cause.**  Cross-gen write without barrier.  Same
+  source line as bug #12 (`parse_term`'s parsed-cache write),
+  different failure mode.  After my fix to bug #12, `tok` was
+  anchored across `LIST(pp, 1)`, so the C local stayed valid.
+  But the actual write `LGET(tok, 6) = pp` was a *direct*
+  store -- no `lsetm` write barrier.  Under tiny-gen0 `tok`
+  often promotes to gen 4 by the time the cache is written
+  (many GCs have happened by then) while `pp` is a fresh
+  nursery allocation in gen 0.  A cross-gen pointer without
+  the dirty-marking write barrier doesn't get scanned during
+  younger-gen collections, so when `pp`'s gen-0 location is
+  recycled, `tok.6` is left pointing into the recycled memory.
+  When gen-4 eventually collects, `gc_custom` traces `tok`,
+  calls `gc_list` on the stale `tok.6`, and reads a corrupted
+  `gc_head_t` -> 2.1 GB alloc -> heap underrun -> segfault.
+- **Tool that found it.**  Exactly the methodology in this
+  file.  `SYMTA_DUMP_SEGV=1` caught the absurd gc_alloc size
+  at the source.  The gc_list scan reported the holder slot
+  (heap[33519473] in gen 4).  `SYMTA_WATCH_GID=33519473
+  SYMTA_WATCH_VALUE=0x000001fe7fe60013` armed a page
+  watchpoint that fired on the exact `LGET(tok, 6) = pp`
+  instruction (RIP -> objdump -> `parse_term + 0x1e2`).
+- **Fix.**  Commit `7f4dd7b` follow-up: changed
+  `LGET(tok, 6) = pp` to `LSET(tok, 6, pp)`.  `LSET` calls
+  `lsetm` which checks `GC_OLDER(tok, pp)` and marks the
+  containing page dirty when the write crosses gen boundaries.
+- **Verified.**  `tests/runtime/tiny-gen0.sh` no longer
+  surfaces a segfault.  Other tiny-gen0 bugs (#14 under
+  `--jit`, an "undefined variable `.`" symptom under
+  `--no-jit` that's clearly downstream) still fire; those are
+  separate stale-pointer sites tracked separately.
 
 ### Bug #11 (P2) -- JIT phase 1d (inline setjmp for SBC_CTX_BTLAND)
 
