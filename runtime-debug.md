@@ -313,3 +313,92 @@ All can be combined.  None has measurable cost when not set.
   WATCH_GID/SLOT/VALUE, RIP-to-source via objdump, defensive
   guard in `reader_parse_strip` plus root-cause anchor pattern
   in `parse_term`.
+
+---
+
+## Currently open runtime bugs
+
+This list is kept in sync with the in-flight tracker tasks and
+should be the first stop when a regression surfaces.  Each entry
+records the minimal trigger, the surface symptom, and what we
+already know about the source.
+
+### Bug #14 (P0, blocking) -- JIT corrupts compiler.sbc on game build
+
+- **Trigger.**  `rm -rf game/cache game/sbc; bash game/build.sh`
+  (which invokes `../symta/symta --jit ./`) on a clean tree
+  crashes during `ui/site` macroexpansion with:
+  `no has no method ` + "`n`" + ` object=000000000000001c (tag=14)`.
+- **Surface.**  Symta stack: `qlmb_supply_cvars:204,23` reading
+  `QL.its` and getting `T_NO` instead of a list, then `.n`
+  dispatches to `no.n` which doesn't exist.
+- **Bisect.**  Introduced by commit `0b2d433`
+  ("JIT phase 1 closeout").  That single commit added JIT
+  translations for FXNLSET / OBJECT / ARGLIST{,8} / DMET /
+  TINIT{,I} / SUBTYPE / CURMET / MNAME / FADD..FDIV.
+  Selectively disabling each of FXNLSET, OBJECT, ARGLIST,
+  ARGLIST8, DMET, CURMET, MNAME (or all six together) did **not**
+  move the bug -- so the culprit is one of the remaining new
+  translations (TINIT, TINITI, SUBTYPE, FADD..FDIV) or a subtle
+  interaction with an older translation.
+- **What we know.**  The error fires only under `--jit`;
+  `--no-jit` builds the game cleanly in ~20 s.  Runtime is
+  unaffected (no game binary runs the JIT directly; only the
+  compiler does).  Workaround in `game/build.sh` -- commit
+  `1b2c8e4` switches it to `--no-jit`.
+- **Next experiments.**  Add env flags for TINIT / TINITI /
+  SUBTYPE / FADD / FSUB / FMUL / FDIV (mirror the FXNLSET
+  scaffolding) and bisect through the remaining set.  If still
+  no single-opcode hit, the bug is interactional and we need a
+  JIT trace (log every translated opcode + RIP at execution
+  time) to compare against the interpreter run on the same SBC.
+
+### Bug #13 (P1) -- tiny-gen0 secondary GC corruption
+
+- **Trigger.**  `SYMTA_GEN0_SIZE=65536 ./symta.exe tests/runtime/.tiny-gen0`
+  (after the original tag-3 fix in commit `3c7ec19` is in
+  place).  Surfaces only when GC is hammered by a tiny nursery;
+  default heap sizes (above ~96 KB) don't trigger it.
+- **Surface.**  Stack lands in `expand_qlmb_r:27,20` with a
+  segfault below the heap base.  `SYMTA_DUMP_SEGV=1` reveals
+  `gc_alloc + 0x79` writing `h->size` after `hgp->top - size`
+  underflowed, called from `gc_list + 0x49` with
+  `size = 2145583155` (≈ 2.1 GB).
+- **What we know.**  Same shape as bug #12 -- a stale heap-dyn
+  C-local whose target was recycled.  The stale list dyn
+  (`0x000001fe7fe60013`, gid `33456102`) now points into the
+  middle of a CONS object, so `LIST_SIZE(o)` reads adjacent
+  data (a meta dyn) as a `{size, code}` pair, yielding the
+  absurd size.  Live-heap scan localises the slot holding the
+  stale dyn to `heap[33519473]` in generation 4 -- the
+  surroundings look like a 7-slot token's `parsed` cache write.
+  Anchoring `make_meta_wrapper`, `token_`, and `parse_term`'s
+  parsed-cache write didn't move the bug.
+- **Next experiments.**  Run the page-watchpoint with the gid
+  from above:
+  `SYMTA_WATCH_GID=33519473 SYMTA_WATCH_VALUE=0x000001fe7fe60013 ./symta.exe ...`
+  to catch the writing RIP, then resolve to a source line as
+  in bug #12.  Then audit that site for the
+  `dyn x = alloc(); ... LGET(x, i) = stale_y` pattern.
+
+### Bug #11 (P2) -- JIT phase 1d (inline setjmp for SBC_CTX_BTLAND)
+
+- **Trigger.**  None on its own; this is a pending JIT
+  improvement, not a correctness bug.
+- **Surface.**  N/A.
+- **What we know.**  SBC_CTX_BTLAND currently always falls
+  through to the interpreter for the setjmp call, costing a
+  helper-trampoline jump per `try` block.  An inline emission
+  would let JIT'd code stay on the hot path through try / catch.
+- **Blocked by.**  Bug #14.  Don't touch the JIT translator
+  while it's known broken; fix correctness first.
+
+### Resolved (kept for context)
+
+- **Bug #12** -- the original tag-3 / 0x07 poison crash under
+  tiny gen0.  Fixed in commit `3c7ec19` via the
+  `reader_parse_strip` parsed-cache guard.  Pinned regression in
+  `tests/runtime/tiny-gen0.sh`.
+- **Bug #10** -- game's `show_fps` overlay was ignoring
+  `ui.cfg`.  Fixed in commit `2db44fb`, also added `show_perf`
+  for per-frame ms.
