@@ -1,10 +1,32 @@
 # LGET-as-store audit (bug #13 / #14 class)
 
-**Status: 4 UNSAFE sites found, all FIXED in this commit.**  Audit results
-documented below for reference; the proposed fixes have been applied and
-verified against `tests/runtime/cross-gen-store.sh`, `tiny-gen0.sh`, the
-full runtime suite (34/34), drift bootstrap (PASS 5/5), and a clean
-`bash game/build.sh` under `--jit`.
+**Status: 4 candidate UNSAFE sites found, all guarded.**
+
+After applying the audit's anchor+LSET fixes, each site was empirically
+tested by reverting only that one fix and running:
+
+  * `tests/runtime/cross-gen-store.sh` (synthetic stress under
+    `SYMTA_GEN0_SIZE=65536`), and
+  * `bash game/build.sh` under tiny gen0 when the synthetic stress
+    didn't surface a crash.
+
+Empirical verdict:
+
+| Site                          | Triggerable today | Evidence |
+| ----------------------------- | ----------------- | -------- |
+| reader.c:1031 (bracket cache) | **YES** -- real bug | cross-gen-store.sh Part A segfaults (rc=139, 5/5 runs) when reverted |
+| reader.c:1147 (`.=name`)      | **YES** -- real bug | full `bash game/build.sh` segfaults at `main_data` under SYMTA_GEN0_SIZE=65536 when reverted; cross-gen-store.sh Part B is now a synthetic pin |
+| reader.c:997 (suf-unary `_`)  | NO -- defensive    | reverted; game compile under tiny gen0 stays clean.  Operator set is all <=3 chars; appending `_` yields <=4 chars which TEXT() encodes as fixtext immediate (no heap ref, no cross-gen issue).  Fix kept as future-proofing. |
+| reader.c:1271 (binary `_`)    | NO -- defensive    | same as above; same fixtext-immediate invariant. |
+
+The two REAL triggers (1031, 1147) match bug #13's shape exactly: a
+fresh **heap** allocation (LIST / bigtext) stored into a possibly-aged
+parser-token slot.  The two defensive sites (997, 1271) only ever store
+a fixtext **immediate**, so the missing barrier was harmless today --
+but the patterns are identical and would silently break if any
+SufUnaryS / binary operator longer than 5 chars is ever added to
+`KW_LIST`.  Anchor + LSET costs a few instructions per parse-time
+event; cheap insurance.
 
 ## Summary
 

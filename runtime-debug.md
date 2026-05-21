@@ -445,17 +445,22 @@ already know about the source.
 
 ### Resolved (kept for context)
 
-- **Bug #15** -- four NEW direct-`LGET`-store sites in
-  `reader.c` that shared bug #13's shape (`parse_suf_unary`
-  parsed-cache + value-mutation, `parse_suf_loop` `=method`-
-  name combiner, `binary_loop` no-right-operand append-`_`).
-  Found by sweeping every `LGET-as-store` across the runtime
-  (audit in `bugs-review.md`).  Fixed in commit `<TBD>` with
-  the same anchor + `LSET` recipe.  Pinned class-wide by the
-  new `tests/runtime/cross-gen-store.sh` regression test
-  (150 bracket-literal tokens under tiny gen0; reverting any
-  of the four LSETs back to a raw LGET store reproduces a
-  deterministic SEGV).
+- **Bug #15** -- audit of every `LGET`-as-store across the
+  runtime turned up two more REAL bugs (bracket-literal
+  parsed-cache in `parse_suf_unary`, `.=name` setter combiner
+  in `parse_suf_loop`) plus two defensive-only sites
+  (`<op>_` appends in `parse_suf_unary` / `binary_loop`,
+  which store fixtext immediates today so the missing
+  barrier is harmless until a longer operator is added).
+  Audit + per-site triggerability evidence in
+  `bugs-review.md`.  Both real bugs fixed in commit `<TBD>`
+  with the anchor + `LSET` recipe; defensive sites also
+  switched to LSET as future-proofing.  Pinned by
+  `tests/runtime/cross-gen-store.sh`: Part A stresses the
+  bracket-cache write (SEGVs reliably when reverted), Part B
+  stresses the `.=name` combiner (proven via full
+  `bash game/build.sh` under tiny gen0 which segfaults at
+  `main_data` when that single LSET is reverted).
 - **Bug #14** -- the JIT api.args corruption crash under
   `--jit` on game compile.  Fixed in commit `9f3ae76` by
   reordering `STARG` reads to happen *after* `ARGLIST` in

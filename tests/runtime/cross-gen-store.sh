@@ -63,13 +63,14 @@ tmp=tests/runtime/.cross-gen-store
 rm -rf "$tmp"
 mkdir -p "$tmp"
 
-# Generate the trigger: many bracket-literal tokens (each going
-# through parse_term's `KW_brackets` cache-write path) followed by
-# many references back into them.  150 X-vars empirically reliably
-# crashes the bug-#13-reverted build under gen0=65536 across all
-# tested runs; below 100 the parse finishes before enough gen-0
-# collections have promoted any token across generations.
-trigger="$tmp/stress.s"
+# -- Part A -----------------------------------------------------------
+# Bracket-literal cache write (reader.c:1031 parse_suf_unary,
+# storing a fresh LIST into a possibly-promoted token's slot 6).
+# 150 X-vars empirically reliably crashes the bug-#13-reverted build
+# under gen0=65536 across all tested runs; below 100 the parse
+# finishes before enough gen-0 collections have promoted any token
+# across generations.
+triggerA="$tmp/bracket.s"
 {
   n=150
   i=0
@@ -84,31 +85,67 @@ trigger="$tmp/stress.s"
     i=$((i+1))
   done
   echo 'say "total=[Total]"'
-} > "$trigger"
+} > "$triggerA"
 
-# Tiny gen0 forces many young-gen collections during the parse,
-# so by the time later X-vars are parsed the earlier `tok`s have
-# already been promoted out of gen 0.  Without the LSET barrier
-# their parsed-cache slots silently dangle and the next gen-0/
-# gen-4 collection segfaults walking the freed nursery slot.
-out=$(SYMTA_GEN0_SIZE=65536 "$SYMTA" -f "$trigger" 2>&1)
-rc=$?
+outA=$(SYMTA_GEN0_SIZE=65536 "$SYMTA" -f "$triggerA" 2>&1)
+rcA=$?
+
+if [ "$rcA" -ne 0 ]; then
+  echo "cross-gen-store: REGRESSION (part A / bracket cache) -- rc=$rcA"
+  echo "$outA" | tail -10 | sed 's/^/   /'
+  rm -rf "$tmp"
+  exit 1
+fi
+if ! echo "$outA" | grep -q 'total=111750'; then
+  echo "cross-gen-store: REGRESSION (part A) -- expected 'total=111750'"
+  echo "$outA" | tail -10 | sed 's/^/   /'
+  rm -rf "$tmp"
+  exit 1
+fi
+
+# -- Part B -----------------------------------------------------------
+# `.=longname` setter combiner (reader.c:1144 parse_suf_loop),
+# storing a fresh bigtext (">6 chars" -- "=somename" with a name long
+# enough to spill out of fixtext) into a possibly-promoted token's
+# slot 1.  Reverting THAT LSET in isolation reliably crashes a full
+# `bash game/build.sh` under tiny gen0 at the `main_data` stage;
+# this synthetic trigger drives the same write rate so the test
+# catches it without needing the game tree.
+#
+# We deliberately produce a program whose RUNTIME would error (no
+# `=longfieldname_N` setter exists on int), but the SEGV (if the
+# barrier is missing) happens during PARSING -- before the bad
+# runtime call.  We accept any rc but reject 139 / 134 (SIGSEGV /
+# SIGABRT) and "segfault" / "stack is too big" in stderr.
+triggerB="$tmp/dotsetter.s"
+{
+  echo "Junk 0"
+  m=400
+  i=1
+  while [ "$i" -le "$m" ]; do
+    echo "Junk.=longfieldname_$i 0"
+    i=$((i+1))
+  done
+} > "$triggerB"
+
+outB=$(SYMTA_GEN0_SIZE=65536 "$SYMTA" -f "$triggerB" 2>&1)
+rcB=$?
 rm -rf "$tmp"
 
-# Expected: rc=0 and stdout ends with "total=111750" (the closed-
-# form sum of (i*10) for i in 0..149 == 10 * 149*150/2).  Anything
-# else -- segfault, error message, wrong total -- is a regression.
-if [ "$rc" -ne 0 ]; then
-  echo "cross-gen-store: REGRESSION -- runtime exited rc=$rc (segv if 139)"
-  echo "$out" | tail -10 | sed 's/^/   /'
+# Crash signatures (any of these is a regression):
+#   rc == 139         POSIX SIGSEGV
+#   rc == 134         SIGABRT (rare, but seen on some failure paths)
+#   "segfault at"     in stderr
+#   "stack is too big" in stderr  (cascading stack-overflow in error path)
+if [ "$rcB" -eq 139 ] || [ "$rcB" -eq 134 ] \
+   || echo "$outB" | grep -qE 'segfault|stack is too big'; then
+  echo "cross-gen-store: REGRESSION (part B / .=name cache) -- rc=$rcB"
+  echo "$outB" | tail -10 | sed 's/^/   /'
   exit 1
 fi
+# rc != 0 with no crash signature == runtime error from the synthetic
+# input (expected); part B's contract is "no SEGV during parse," not
+# "the program runs cleanly to completion."
 
-if ! echo "$out" | grep -q 'total=111750'; then
-  echo "cross-gen-store: REGRESSION -- expected 'total=111750' in output"
-  echo "$out" | tail -10 | sed 's/^/   /'
-  exit 1
-fi
-
-echo "cross-gen-store: parsed-cache LSET barrier holds (no segv, total=111750)."
+echo "cross-gen-store: bracket-cache + .=name setter barriers both hold."
 exit 0

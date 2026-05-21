@@ -988,9 +988,14 @@ static dyn parse_suf_unary(pstate_t *p, dyn (*down)(pstate_t*),
           memcpy(buf, s, sl);
           buf[sl] = '_';
           buf[sl+1] = 0;
-          /* Bug #13 sibling: TEXT can GC; anchor `o` across the alloc
-           * and use LSET so the cross-gen write barrier fires when
-           * `o` has been promoted out of the nursery. */
+          /* Defensive (bug #13 class): not currently a bug because
+           * every SufUnaryS operator is <=3 chars; appending `_`
+           * leaves it <=4 chars which TEXT() encodes as a fixtext
+           * immediate (no heap ref, so no cross-gen barrier needed).
+           * Empirically verified: reverting this to a raw LGET and
+           * compiling the game under SYMTA_GEN0_SIZE=65536 stays
+           * clean.  Kept LSET + anchor anyway as a safety belt for
+           * any future longer SufUnaryS operator. */
           gc_anchor_push(&o);
           dyn nv; TEXT(nv, buf);
           LSET(o, 1, nv);
@@ -1026,7 +1031,12 @@ static dyn parse_suf_unary(pstate_t *p, dyn (*down)(pstate_t*),
     as = wrapper;
     an = 1;
   }
-  /* Bug #13 sibling: LIST can GC and promote `o`; same fix recipe. */
+  /* Bug #13 sibling -- REAL TRIGGER PATH.  The bracket-literal
+   * parsed-cache slot 6 receives a fresh LIST (a heap object).  If
+   * `o` has been promoted (tiny-gen0 forces this for long parses),
+   * the cross-gen write needs the barrier or `ot_pair` gets
+   * reclaimed and `o.6` dangles.  Reverting to a raw LGET store
+   * reproduces SEGV on `tests/runtime/cross-gen-store.sh`. */
   gc_anchor_push(&o);
   dyn ot_pair; LIST(ot_pair, 1); LGET(ot_pair, 0) = tok_type(o);
   LSET(o, 6, ot_pair);
@@ -1137,7 +1147,14 @@ static dyn parse_suf_loop(pstate_t *p, dyn (*down)(pstate_t*), dyn e) {
                   int n = snprintf(buf, sizeof(buf), "=%s",
                                    kvs ? kvs : "");
                   (void)n;
-                  /* Bug #13 sibling: TEXT may GC; barrier-correct store. */
+                  /* Bug #13 sibling -- REAL TRIGGER PATH.  Empirical
+                   * evidence: reverting this to `LGET(t, 1) = nv` and
+                   * running `bash game/build.sh` under
+                   * SYMTA_GEN0_SIZE=65536 reliably segfaults at the
+                   * `main_data` stage (rc=139).  The combined
+                   * `"="+method-name` string is typically >6 chars,
+                   * so TEXT() allocates a bigtext heap object -- a
+                   * young heap ref into a possibly-older `t`. */
                   gc_anchor_push(&t);
                   dyn nv;
                   TEXT(nv, buf);
@@ -1267,8 +1284,13 @@ static dyn binary_loop(pstate_t *p, op_pred_t ops_pred,
       memcpy(buf, s, sl);
       buf[sl] = '_';
       buf[sl+1] = 0;
-      /* Bug #13 sibling: TEXT may GC; anchor + LSET so the cross-gen
-       * write into a promoted `o` is dirty-marked. */
+      /* Defensive (bug #13 class): same fixtext-immediate invariant
+       * as parse_suf_unary's append-`_` path (~line 996).  Today's
+       * binary operators are all <=3 chars so the appended `<op>_`
+       * stays <=4 chars and TEXT() returns an immediate -- no heap
+       * write, no barrier needed.  Empirically verified clean on
+       * the game compile + tiny gen0.  Kept LSET + anchor as the
+       * future-proof safety belt. */
       gc_anchor_push(&o);
       dyn nv; TEXT(nv, buf);
       LSET(o, 1, nv);
