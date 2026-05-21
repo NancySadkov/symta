@@ -942,13 +942,21 @@ static dyn parse_suf_unary(pstate_t *p, dyn (*down)(pstate_t*),
     if (pc && is_anchor_char_c(pc)) {
       valid = 1;
       if (text_eq_c(type, KW_brackets)) {
-        LGET(o, 0) = KW_bracketsL;  // type = `[`
+        /* Defensive (bug #13 class): KW_bracketsL is "[" -- a 1-char
+         * fixtext immediate so the missing barrier is harmless today.
+         * Routing through LSET costs ~one branch (lsetm's GC_OLDER
+         * check returns false on immediates) and protects against a
+         * future longer KW_* keyword silently regressing this site.
+         * No anchor needed: KW_bracketsL is a process-lifetime intern
+         * and `o` doesn't move through this assignment. */
+        LSET(o, 0, KW_bracketsL);   // type = `[`
         type = KW_bracketsL;
       }
     }
     if (!valid) {
       if (text_eq_c(type, KW_curly)) {
-        LGET(o, 0) = KW_curlyL;
+        /* Same defensive note as the KW_bracketsL store above. */
+        LSET(o, 0, KW_curlyL);
       }
       p_push_back(p, o);
       dyn r; LIST(r, 1); LGET(r, 0) = e;
