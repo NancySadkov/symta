@@ -1543,7 +1543,16 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
        *   T_INT-T_INT      -> bitwise IMMEQ/IMMNE
        *   text-vs-text     -> texts_equal direct call
        *   otherwise        -> MCACHE_CALL m_eq / m_ne
-       * Packed: [15:0]=dst, [31:16]=a, [47:32]=b, [63:48]=mcache_idx. */
+       * Packed: [15:0]=dst, [31:16]=a, [47:32]=b, [63:48]=mcache_idx.
+       *
+       * Note (step 12f attempt): a T_INT-fast-path inline was tried
+       * here but consistently slowed the game compile by 1-2 %
+       * because most IMMEQs in compile-time code compare text/text
+       * (pattern-match keywords), so the inline added a wasted tag
+       * check before falling to the helper.  Helper is already
+       * T_INT-fast internally.  Keeping the helper-only translation
+       * until a workload appears where T_INT-vs-T_INT IMMEQs
+       * dominate. */
       if (i + 9 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
