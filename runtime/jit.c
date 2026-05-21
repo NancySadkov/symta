@@ -802,21 +802,33 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       /* SBC_ST4_0 .. SBC_ST4_F (struct field store family).
        * Same encoding as LD4 but stores instead of loads:
        *   STOR(L[dst], index, L[src])
-       * Writes go through lsetm (GC write barrier) -- needs the
-       * trampoline helper. */
+       *
+       * Step 12g: emit inline x86 (jit_emit_st4) instead of the
+       * helper trampoline.  Fast path: when the value is an
+       * immediate (low bit clear), inline store with no barrier.
+       * Slow path (heap value): falls through to the existing
+       * st4 helper which handles lsetm's cross-gen barrier.
+       * SYMTA_NO_ST4_INLINE bypasses for bisecting. */
       if (i + 2 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
-      if (!jit_rt_st4_helper) { jit_last_fail_opcode = op;
-                                jit_last_fail_offset = i;
-                                fail = 1; goto done; }
       int index = op - 0x7A;
       uint8_t opr = bc[i + 1];
       uint32_t dst = (uint32_t)(opr & 0xF);
       uint32_t src = (uint32_t)(opr >> 4);
-      b->pending_helper_id = JIT_HELPER_ST4;
-      jit_emit_call_helper3(b, (void*)jit_rt_st4_helper,
-                            dst, src, (uint32_t)index);
+      if (jit_rt_heap0_addr && jit_rt_st4_helper
+          && !getenv("SYMTA_NO_ST4_INLINE")) {
+        jit_emit_st4(b, dst, src, (uint32_t)index,
+                     jit_rt_heap0_addr, (void*)jit_rt_st4_helper);
+      } else if (jit_rt_st4_helper) {
+        b->pending_helper_id = JIT_HELPER_ST4;
+        jit_emit_call_helper3(b, (void*)jit_rt_st4_helper,
+                              dst, src, (uint32_t)index);
+      } else {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
       i += 2;
       break;
     }
@@ -826,15 +838,14 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
        * SBC_STOR8 (0x23) -- opcode + dst(u8)  + src(u8)  + index(u8)  = 4 bytes.
        * Body: STOR(L[dst], index, L[src]).  Reuses jit_rt_st4_helper
        * (same shape -- helper takes index as 32-bit, ST4 just
-       * happened to be the family that exercised it first). */
+       * happened to be the family that exercised it first).
+       * Step 12g: inline via jit_emit_st4 (same fast/slow split as
+       * ST4_*).  SYMTA_NO_ST4_INLINE bypasses for bisecting. */
       int wide = (op == 0x22);
       int op_len = wide ? 7 : 4;
       if (i + op_len > n) { jit_last_fail_opcode = op;
                             jit_last_fail_offset = i;
                             fail = 1; goto done; }
-      if (!jit_rt_st4_helper) { jit_last_fail_opcode = op;
-                                jit_last_fail_offset = i;
-                                fail = 1; goto done; }
       uint32_t dst, src, index;
       if (wide) {
         dst   = (uint32_t)bc_rd16(bc + i + 1);
@@ -845,8 +856,18 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
         src   = bc[i + 2];
         index = bc[i + 3];
       }
-      b->pending_helper_id = JIT_HELPER_ST4;
-      jit_emit_call_helper3(b, (void*)jit_rt_st4_helper, dst, src, index);
+      if (jit_rt_heap0_addr && jit_rt_st4_helper
+          && !getenv("SYMTA_NO_ST4_INLINE")) {
+        jit_emit_st4(b, dst, src, index,
+                     jit_rt_heap0_addr, (void*)jit_rt_st4_helper);
+      } else if (jit_rt_st4_helper) {
+        b->pending_helper_id = JIT_HELPER_ST4;
+        jit_emit_call_helper3(b, (void*)jit_rt_st4_helper, dst, src, index);
+      } else {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
       i += op_len;
       break;
     }
@@ -2787,6 +2808,102 @@ void jit_emit_ld4(jit_buf *b, uint32_t dst, uint32_t src, uint32_t index,
    * the encoder. */
   emit_mov_rax_from_rcx_indexed8(b, (int32_t)(index * 8u));
   emit_mov_slot_from_rax(b, (int)dst);              /* L[dst] = rax      */
+}
+
+/* ============================================================
+ * Step 12g: inline SBC_ST4_* / SBC_STOR / SBC_STOR8.
+ *
+ * Body in C (lsetm):
+ *   void **slot = (void**)O_PTR(L[dst]) + index;
+ *   *slot = L[src];
+ *   if (!IMMEDIATE(L[src]) && O_AGE(L[dst]) > O_AGE(L[src])) {
+ *     <mark page dirty>;
+ *   }
+ *
+ * Fast path: if L[src] is an immediate (low bit of value clear),
+ * no barrier is ever needed -- store inline and skip the helper.
+ * If L[src] is heap, fall through to the existing jit_rt_st4
+ * helper which redoes the store and handles the barrier check.
+ * The redundant store on the slow path is cheap; the win is
+ * skipping the call frame setup on the common immediate-store
+ * case (FXN ints, fixtexts, No, etc.).
+ *
+ *   mov   rdx, [rbx + src*8]     ; rdx = L[src] (value)
+ *   test  dl, 1                   ; T_HEAP bit of value
+ *   jnz   slow                    ; heap value -> helper
+ *   mov   rax, [rbx + dst*8]     ; rax = L[dst] (base)
+ *   shr   rax, 16                 ; rax = gid_base
+ *   movabs rcx, &api_g.heap0
+ *   mov   rcx, [rcx]              ; rcx = heap0
+ *   mov   [rcx + rax*8 + index*8], rdx
+ *   jmp   done
+ * slow:
+ *   <helper call: st4(L, dst, src, index)>
+ * done:
+ * ============================================================ */
+
+/* mov rdx, [rbx + slot*8] -- reg=010 (RDX). */
+static void emit_mov_rdx_from_slot(jit_buf *b, int slot) {
+  jit_emit_u8(b, 0x48);  /* REX.W */
+  jit_emit_u8(b, 0x8b);  /* opcode: mov r64, r/m64 */
+  emit_mem_op(b, 2, slot);  /* reg=RDX (2) */
+}
+
+/* test dl, imm8 -- 3 bytes (F6 C2 ib).  ModR/M=11 reg=/0(test)
+ * r/m=010(DL).  Used to inspect the low byte of RDX (the T_HEAP
+ * bit of a value held there). */
+static void emit_test_dl_imm8(jit_buf *b, uint8_t imm) {
+  jit_emit_u8(b, 0xf6);  /* test r/m8, imm8 */
+  jit_emit_u8(b, 0xc2);  /* ModR/M: mod=11 reg=/0 r/m=010(DL) */
+  jit_emit_u8(b, imm);
+}
+
+/* mov [rcx + rax*8 + disp], rdx  (5 bytes if disp fits in s8,
+ * 8 bytes for disp32).  Mirror of emit_mov_rax_from_rcx_indexed8
+ * but in the store direction (mem <- reg).
+ *
+ *   REX.W = 0x48
+ *   opcode = 0x89  (mov r/m64, r64)
+ *   ModR/M = mod=01|10, reg=010(RDX), r/m=100(SIB indicator)
+ *   SIB = scale=11(8x), index=000(RAX), base=001(RCX) */
+static void emit_mov_to_rcx_rax_indexed8_from_rdx(jit_buf *b, int32_t disp) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x89);
+  if (disp >= -128 && disp <= 127) {
+    jit_emit_u8(b, 0x54);  /* mod=01 reg=010 r/m=100(SIB) */
+    jit_emit_u8(b, 0xc1);  /* SIB: scale=11 index=000 base=001 */
+    jit_emit_u8(b, (uint8_t)(int8_t)disp);
+  } else {
+    jit_emit_u8(b, 0x94);  /* mod=10 reg=010 r/m=100(SIB) */
+    jit_emit_u8(b, 0xc1);
+    jit_emit_u32(b, (uint32_t)disp);
+  }
+}
+
+void jit_emit_st4(jit_buf *b, uint32_t dst, uint32_t src, uint32_t index,
+                  void *heap0_addr_imm,
+                  void *st4_helper) {
+  emit_mov_rdx_from_slot(b, (int)src);              /* rdx = value */
+  emit_test_dl_imm8(b, 1);                           /* T_HEAP bit? */
+  size_t to_slow = emit_jnz_rel32(b);
+
+  /* Fast path: value is immediate, no barrier needed.  Store
+   * inline via the same heap-deref shape as LD4. */
+  emit_mov_rax_from_slot(b, (int)dst);              /* rax = base */
+  emit_shr_rax(b, 16);                               /* rax = gid_base */
+  emit_movabs_rcx_helper(b, (uint64_t)heap0_addr_imm,
+                         JIT_HELPER_AMP_HEAP0);      /* rcx = &heap0 */
+  emit_mov_rcx_from_rcx_deref(b);                    /* rcx = heap0 */
+  emit_mov_to_rcx_rax_indexed8_from_rdx(b,
+                                        (int32_t)(index * 8u));
+  size_t to_done = jit_emit_jmp(b);
+
+  /* Slow path: heap value -- helper does store + barrier. */
+  jit_patch_jmp_here(b, to_slow);
+  b->pending_helper_id = JIT_HELPER_ST4;
+  jit_emit_call_helper3(b, st4_helper, dst, src, index);
+
+  jit_patch_jmp_here(b, to_done);
 }
 
 size_t jit_here(jit_buf *b) { return b->len; }

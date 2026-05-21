@@ -234,6 +234,22 @@ void jit_emit_ret(jit_buf *b);
 void jit_emit_ld4(jit_buf *b, uint32_t dst, uint32_t src, uint32_t index,
                   void *heap0_addr_imm);
 
+/* Step 12g: inline heap-store for SBC_ST4_* / SBC_STOR / SBC_STOR8.
+ *
+ *   STOR(L[dst], index, L[src])   ;; (LSET = lsetm)
+ *
+ * Fast path (value is immediate -- no GC ref): inline store, no
+ * barrier.  Slow path (value is heap): falls through to the
+ * existing st4 helper which handles the barrier check.  Saves the
+ * helper-call overhead on the common immediate-store case
+ * (FXN ints, fixtext, No, etc.).
+ *
+ * Register clobbers: RAX, RCX, RDX (all caller-saved on Win64
+ * + SysV).  RBX (locals) preserved. */
+void jit_emit_st4(jit_buf *b, uint32_t dst, uint32_t src, uint32_t index,
+                  void *heap0_addr_imm,
+                  void *st4_helper);
+
 /* ============================================================
  * Step 2: control flow + typed-int comparison emitters.
  *
