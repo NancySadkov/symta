@@ -2903,6 +2903,29 @@ BUILTIN_VARARGS("__",sink)
   void *o = getArg(0);
   dyn name = get_method_name(api.method);
   int tag = O_TAG(o);
+  /* DEBUG: when sink fires on T_NO, dump the caller's frame locals
+   * so we can see which slot held No that shouldn't have. */
+  if (tag == T_NO && getenv("SYMTA_TRACE_NOSINK")) {
+    fprintf(stderr, "\n[NOSINK] method=%s on object=No (T_NO)\n",
+            print_object(name));
+    frame_t *frm = api.frame;
+    int depth = 0;
+    while (frm && depth < 5) {
+      fn_meta_t *m = frm->clsr ? (fn_meta_t*)O_META(frm->clsr) : NULL;
+      const char *fname = (m && m->name) ? (const char*)m->name : "<no-meta>";
+      fprintf(stderr, "[NOSINK] frame %d: fn=%s nvars=%d clsr=%p\n",
+              depth, fname, frm->nvars, (void*)frm->clsr);
+      void **slots = FRAME_LOCALS(frm);
+      for (int i = 0; i < frm->nvars && i < 32; i++) {
+        fprintf(stderr, "  L[%d] = %016llx (tag=%d)\n",
+                i, (unsigned long long)(uintptr_t)slots[i],
+                (int)O_TAG(slots[i]));
+      }
+      frm = frm->prev;
+      depth++;
+    }
+    fflush(stderr);
+  }
   char *a = tag < arrlen(types)
             ? fmt("%s has no method ", types[tag].name)
             : fmt("Bad tag %d, for method call ", tag);
