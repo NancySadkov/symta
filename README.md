@@ -89,18 +89,23 @@ Every example above is real, runnable Symta — not pseudocode.
 
 ## Quickstart
 
-A pre-built `symta.exe` ships in the repo (Windows x64). On macOS or
-Linux, build from source:
+A pre-built `symta.exe` (Windows x64) ships in the repo.  Pre-built
+binaries for **Windows and Linux** are also attached to each
+[release](https://github.com/NancySadkov/symta/releases).  On macOS,
+build from source:
 
 ```sh
-make -f Makefile.osx     # or Makefile.w64 on Windows
+make -f Makefile.linux   # Linux  (gcc, libsdl2-dev, libpng-dev)
+make -f Makefile.osx     # macOS
+make -f Makefile.w64     # Windows (w64devkit)
 ```
 
 Hello, World:
 
 ```sh
 echo 'say "Hello, World!"' > hello.s
-./symta.exe -f hello.s
+./symta -f hello.s       # Linux / macOS
+./symta.exe -f hello.s   # Windows
 ```
 
 Or compile a project to a standalone binary:
@@ -108,24 +113,43 @@ Or compile a project to a standalone binary:
 ```sh
 mkdir -p myapp/src
 echo 'say "Hello, World!"' > myapp/src/go.s
-./symta.exe myapp
-./myapp/go.exe                # -> Hello, World!
+./symta myapp            # cross-compiles the project to ./myapp/go
+./myapp/go               # -> Hello, World!
 ```
 
 Or just open the REPL:
 
 ```sh
-./symta.exe
+./symta
 ```
+
+### Native code, by default
+
+Symta ships with an **x86_64 JIT** that emits native machine code
+for ~99 % of bytecode opcodes -- typed-int arithmetic, list array
+access, immediate compare, struct loads and stores all run as
+inline x86 with no per-opcode helper-call overhead.  Hot loops
+reach C-competitive single-iteration cost; a 21 kLOC game's cold
+compile takes ~14 s.
+
+On Windows, the JIT is **default-on** and the AOT cache embedded in
+each `.sbc` makes startup near-instant.  On Linux the same SBCs
+load via the runtime translator; after a Linux bootstrap they
+carry SysV-tagged AOT code and install directly.  Add `--no-jit`
+to force the interpreter for debugging.
 
 ---
 
 ## Learning path
 
-1. **[examples/](examples/)** — 26 progressively richer programs.
-   Single-file examples (00–09, 11, 14, 17–20, 22–25) run with
-   `symta -f examples/NN-*.s`; project examples (10, 12, 13, 15,
-   16, 21) build with `symta examples/NN-name && examples/NN-name/go.exe`.
+1. **[examples/](examples/)** — 40 progressively richer programs,
+   from FizzBuzz to a voxel renderer.  The 37-40 set added in
+   2026 (`the` introspection, `typeof`, the static-check tool,
+   double-entry bank) exercises the type-system work.
+   Single-file examples (`00`–`09`, `11`, `14`, `17`–`20`,
+   `22`–`40`) run with `symta -f examples/NN-*.s`; project examples
+   (`10`, `12`, `13`, `15`, `16`, `21`, `31`) build with
+   `symta examples/NN-name && examples/NN-name/go`.
 2. **[dev/sbe.md](dev/sbe.md)** — *Learn Symta by Example*, the
    long-form tour of the language: variables, functions, lists,
    pattern matching, OOP, ECS, FFI, macros, the quirky bits, and
@@ -143,12 +167,13 @@ Or just open the REPL:
 
 | | |
 |--|--|
-| `symta.exe`        | The compiler + runtime, statically linked. |
+| `symta.exe`        | The compiler + runtime + JIT, statically linked. Windows x64; matching Linux binary attached to each release. |
 | `src/`             | Compiler, reader, macroexpander, stdlib — all in Symta. |
-| `runtime/`         | C runtime: GC, bytecode interpreter, built-ins. |
-| `examples/`        | Self-contained example programs. |
+| `runtime/`         | C runtime: generational GC, bytecode interpreter, x86_64 JIT translator (`jit.c` / `jit_sbc.c`), built-ins. |
+| `examples/`        | 40 self-contained example programs. |
 | `c/`, `ffi/`       | FFI plugins — graphics, UI, fonts, SVG, voxel renderer. |
 | `pkg/`             | Ready-made projects (hello, tests, the symta tool itself). |
+| `tests/`           | Drift bootstrap, runtime correctness, AM, static-check, static-mode, unboxed-arith — 13 test suites. |
 
 ---
 
