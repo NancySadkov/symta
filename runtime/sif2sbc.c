@@ -1064,9 +1064,32 @@ uint8_t *sif2sbc(sif_t *sif) {
     ia64_ofs = arrlen(wb);
     ia64_count = nfns;
 
-    /* Section header. */
+    /* Section header.
+     *
+     * v2 layout (step 12j, May 2026):
+     *   sec[0..3]   : 'I' 'A' '6' '4' magic
+     *   sec[4..5]   : version (= 2)
+     *   sec[6..7]   : abi_tag (1 = Win64, 2 = SysV-x64)
+     *   sec[8..11]  : nfns
+     *   sec[12..]   : per-function directory (16 bytes/entry)
+     *
+     * v1 had no abi_tag and was implicitly Win64-baked.  A Linux
+     * runtime that installed a v1 section would crash on the
+     * first call: the JIT prologue reads the locals pointer from
+     * RCX (Win64) while the C-side caller passes it in RDI
+     * (SysV), so RBX got garbage and the first slot load
+     * segfaulted.  The v2 loader rejects v1 universally and
+     * falls back to runtime JIT translation (sbc_jit_install),
+     * which emits per-platform code.  After the next bootstrap
+     * on the target platform, the SBC carries an ABI-matched
+     * v2 section and AOT install resumes. */
     EMIT8('I'); EMIT8('A'); EMIT8('6'); EMIT8('4');  /* magic */
-    EMIT16(1);                                       /* version */
+    EMIT16(2);                                       /* version */
+#ifdef _WIN32
+    EMIT16(1);                                       /* abi: Win64 */
+#else
+    EMIT16(2);                                       /* abi: SysV-x64 */
+#endif
     EMIT32(nfns);                                    /* nfns   */
 
     /* Sort fn-start offsets so we can compute each body's end
@@ -1142,7 +1165,7 @@ uint8_t *sif2sbc(sif_t *sif) {
      * back-to-back with no padding (the loader copies into a
      * fresh aligned mapping at install time, so on-disk packing
      * stays minimal).  payload_offset is from section start. */
-    uint32_t header_bytes = 10;                  /* magic+version+nfns */
+    uint32_t header_bytes = 12;                  /* magic+version+abi+nfns (v2) */
     uint32_t dir_bytes    = (uint32_t)nfns * 16;
     uint32_t cursor       = header_bytes + dir_bytes;
     for (int fi = 0; fi < nfns; fi++) {

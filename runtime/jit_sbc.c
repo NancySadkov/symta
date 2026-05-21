@@ -1198,21 +1198,55 @@ int sbc_install_ia64(struct sbc_t *sbc) {
   jit_install_helpers_once();
 
   const uint8_t *sec = sbc->ia64_table;
-  /* Validate section header. */
+  /* Validate section header.
+   *
+   * v2 layout (step 12j):
+   *   sec[0..3]   : 'I' 'A' '6' '4' magic
+   *   sec[4..5]   : version (= 2)
+   *   sec[6..7]   : abi_tag (1 = Win64, 2 = SysV-x64)
+   *   sec[8..11]  : nfns
+   *   sec[12..]   : per-function directory
+   *
+   * v1 sections (no abi_tag, implicitly Win64) are rejected
+   * universally: the caller (sbc.c) responds by running the
+   * runtime JIT translator (sbc_jit_install) which emits
+   * per-platform code.  This makes cross-platform SBCs safe:
+   * a Win64-baked SBC loaded on Linux gracefully falls back
+   * to runtime translation instead of installing foreign-ABI
+   * native code and crashing on the first call. */
   if (sec[0] != 'I' || sec[1] != 'A' || sec[2] != '6' || sec[3] != '4') {
     fprintf(stderr, "ia64-install: bad magic in %s\n", sbc->filename);
     return 0;
   }
   uint16_t ver = (uint16_t)sec[4] | ((uint16_t)sec[5] << 8);
-  if (ver != 1) {
-    fprintf(stderr, "ia64-install: unsupported section version %u in %s\n",
-            ver, sbc->filename);
+  if (ver != 2) {
+    /* v1 or unknown -- caller's expected behaviour is to fall
+     * back to runtime JIT translation.  Silent on the common
+     * "v1 SBC built before step 12j" case; loud on actual
+     * unknown future versions. */
+    if (ver != 1) {
+      fprintf(stderr, "ia64-install: unsupported section version %u in %s\n",
+              ver, sbc->filename);
+    }
     return 0;
   }
-  uint32_t sec_nfns = (uint32_t)sec[6]
-                    | ((uint32_t)sec[7]  << 8)
-                    | ((uint32_t)sec[8]  << 16)
-                    | ((uint32_t)sec[9]  << 24);
+  uint16_t abi_tag = (uint16_t)sec[6] | ((uint16_t)sec[7] << 8);
+#ifdef _WIN32
+  uint16_t expected_abi = 1;  /* Win64 */
+#else
+  uint16_t expected_abi = 2;  /* SysV-x64 */
+#endif
+  if (abi_tag != expected_abi) {
+    /* Cross-platform SBC: code was baked for a different ABI.
+     * Caller falls back to runtime JIT.  No stderr noise --
+     * this is the routine case for a Linux user running a
+     * Windows-baked release SBC. */
+    return 0;
+  }
+  uint32_t sec_nfns = (uint32_t)sec[8]
+                    | ((uint32_t)sec[9]  << 8)
+                    | ((uint32_t)sec[10] << 16)
+                    | ((uint32_t)sec[11] << 24);
   uint32_t fntbl_nfns = sbc->fntbl_sz / 3;
   if (sec_nfns != fntbl_nfns) {
     fprintf(stderr, "ia64-install: nfn mismatch (sec=%u fntbl=%u) in %s\n",
@@ -1220,7 +1254,7 @@ int sbc_install_ia64(struct sbc_t *sbc) {
     return 0;
   }
 
-  const uint8_t *dir = sec + 10;
+  const uint8_t *dir = sec + 12;
   int installed = 0;
   for (uint32_t fi = 0; fi < sec_nfns; fi++) {
     const uint8_t *e = dir + fi * 16;
