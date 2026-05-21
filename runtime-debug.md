@@ -446,6 +446,14 @@ already know about the source.
 
 ### Resolved (kept for context)
 
+- **Bug #13** -- the tiny-gen0 expand_qlmb_r segfault.  Same
+  source line as bug #12 (`parse_term`'s parsed-cache write)
+  but a different failure mode: cross-gen write without
+  barrier.  Fixed in commit `449414a` by changing
+  `LGET(tok, 6) = pp` to `LSET(tok, 6, pp)` so `lsetm` marks
+  the page dirty for `gc_older_gens`.  Found via the
+  methodology in this file: SYMTA_DUMP_SEGV -> gc_list scan ->
+  page watchpoint -> RIP -> objdump -> source line.
 - **Bug #12** -- the original tag-3 / 0x07 poison crash under
   tiny gen0.  Fixed in commit `3c7ec19` via the
   `reader_parse_strip` parsed-cache guard.  Pinned regression in
