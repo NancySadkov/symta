@@ -104,6 +104,20 @@ typedef enum {
   JIT_HELPER_FXNXOR   = 50,
   JIT_HELPER_FXNSHL   = 51,
   JIT_HELPER_FXNSHR   = 52,
+  JIT_HELPER_FXNLSET  = 53,
+  JIT_HELPER_OBJECT   = 54,
+  JIT_HELPER_ARGLIST_N  = 55,
+  JIT_HELPER_ARGLIST8_N = 56,
+  JIT_HELPER_DMET     = 57,
+  JIT_HELPER_TINITI   = 58,
+  JIT_HELPER_CURMET   = 59,
+  JIT_HELPER_FADD     = 60,
+  JIT_HELPER_FSUB     = 61,
+  JIT_HELPER_FMUL     = 62,
+  JIT_HELPER_FDIV     = 63,
+  JIT_HELPER_TINIT    = 64,
+  JIT_HELPER_SUBTYPE  = 65,
+  JIT_HELPER_MNAME    = 66,
   JIT_HELPER_MAX
 } jit_helper_id_t;
 
@@ -307,6 +321,13 @@ void jit_emit_epilogue2(jit_buf *b);
  *   arg2 = packed_imm
  * Helper signature: void(*)(int64_t *L, struct sbc_t *sbc, uint64_t). */
 void jit_emit_call_with_sbc(jit_buf *b, void *target, uint64_t packed);
+
+/* SBC-aware 4-arg helper call: same as above plus
+ *   arg3 = packed2_imm
+ * Helper signature: void(*)(int64_t*L, sbc_t*sbc, uint64_t, uint64_t).
+ * Used by opcodes whose operands overflow a single u64 (FXNLSET). */
+void jit_emit_call_with_sbc2(jit_buf *b, void *target,
+                             uint64_t packed1, uint64_t packed2);
 
 /* Forward decl so callers don't need to include runtime/sif.h. */
 struct sbc_t;
@@ -512,6 +533,73 @@ extern void (*jit_rt_fxnlistn_helper)(int64_t *L, int dst, int src, int u);
  *   [63:48]  = mcache_idx */
 extern void (*jit_rt_fxnlsetir_helper)(int64_t *L, struct sbc_t *sbc,
                                        uint64_t packed);
+
+/* SBC_FXNLSET (with-result variant): 5 operands (dst, src, index,
+ * val, mcache_idx).  5 u16 fields = 80 bits don't fit in one u64,
+ * so this uses the call_with_sbc2 trampoline -- two packed args.
+ *   packed1: [15:0]=dst, [31:16]=src, [47:32]=index, [63:48]=val
+ *   packed2: [15:0]=mcache_idx, [63:16]=0 */
+extern void (*jit_rt_fxnlset_helper)(int64_t *L, struct sbc_t *sbc,
+                                     uint64_t packed1, uint64_t packed2);
+
+/* SBC_OBJECT: opcode + dst(u16) + tid(u16) + size(u16) = 7 bytes.
+ * Allocates a typed object of `size` slots using sbc->ty[tid] as
+ * the type-id.  size==0 emits MKIMM (no heap alloc).
+ *   packed: [15:0]=dst, [31:16]=tid, [47:32]=size */
+extern void (*jit_rt_object_helper)(int64_t *L, struct sbc_t *sbc,
+                                    uint64_t packed);
+
+/* SBC_ARGLIST / SBC_ARGLIST8: variable-size arg-list setup.
+ * Two packed u64s carry size + up to 15 u8 slot indices:
+ *   packed1: [56-63]=size, [0-7]=src0, ..., [48-55]=src6
+ *   packed2: [0-7]=src7, [8-15]=src8, ..., [56-63]=src14
+ * Sizes > 15 or slot indices > 255 fail at JIT-translate time. */
+extern void (*jit_rt_arglist_n_helper)(int64_t *L, struct sbc_t *sbc,
+                                       uint64_t packed1, uint64_t packed2);
+extern void (*jit_rt_arglist8_n_helper)(int64_t *L, struct sbc_t *sbc,
+                                        uint64_t packed1, uint64_t packed2);
+
+/* SBC_SUBTYPE: add_subtype(sbc->ty[super], sbc->ty[sub]).  Wire:
+ *   opcode + super(u16) + sub(u16) = 5 bytes.
+ *   packed: [15:0]=super, [31:16]=sub. */
+extern void (*jit_rt_subtype_helper)(int64_t *L, struct sbc_t *sbc,
+                                     uint64_t packed);
+
+/* SBC_MNAME: L[dst] = get_method_name(UNFXN(L[src])).  Wire:
+ *   opcode + dst(u16) + src(u16) = 5 bytes.  Helper3 sig. */
+extern void (*jit_rt_mname_helper)(int64_t *L, int dst, int src, int u);
+
+/* SBC_TINIT: type init for named text (sbc->tx[name]).  Wire:
+ *   opcode + type(u16) + size(u16) + name(u24) = 8 bytes.
+ *   packed: [15:0]=type, [31:16]=size, [55:32]=name */
+extern void (*jit_rt_tinit_helper)(int64_t *L, struct sbc_t *sbc,
+                                   uint64_t packed);
+
+/* SBC_TINITI: type init for immediate text.  Wire:
+ *   opcode + tag(u16) + size(u16) + name(u64) = 13 bytes.
+ *   packed1: [15:0]=tag, [31:16]=size
+ *   packed2: 64-bit name (FIXTEXT). */
+extern void (*jit_rt_tiniti_helper)(int64_t *L, struct sbc_t *sbc,
+                                    uint64_t packed1, uint64_t packed2);
+
+/* SBC_CURMET: L[dst] = api.curmet (currently executing method).
+ * Wire: opcode + dst(u16) = 3 bytes.  Helper3: (L, dst, _, _). */
+extern void (*jit_rt_curmet_helper)(int64_t *L, int dst, int u1, int u2);
+
+/* SBC_FADD / SBC_FSUB / SBC_FMUL / SBC_FDIV: typed-float arith.
+ * Operands are statically known to be T_FLOAT-tagged; no tag
+ * check or MCALL fallback.  Helper3 sig: (L, dst, a, b). */
+extern void (*jit_rt_fadd_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fsub_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fmul_helper)(int64_t *L, int dst, int a, int b);
+extern void (*jit_rt_fdiv_helper)(int64_t *L, int dst, int a, int b);
+
+/* SBC_DMET: define-method runtime op.
+ *   add_method((int)sbc->ty[tyidx], sbc->mt[mtidx], L[handler])
+ * Wire: opcode + tyidx(u16) + mtidx(u24) + handler(u16) = 8 bytes.
+ *   packed: [15:0]=tyidx, [39:16]=mtidx, [55:40]=handler */
+extern void (*jit_rt_dmet_helper)(int64_t *L, struct sbc_t *sbc,
+                                  uint64_t packed);
 
 /* SBC_NEG / SBC_ABS: unary arith with T_INT fast path and MCALL
  * fallback (m_neg / m_abs).  ABS additionally has a T_FLOAT

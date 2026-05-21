@@ -419,6 +419,20 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_FXNXOR  0x46
 #define BC_FXNSHL  0x47
 #define BC_FXNSHR  0x48
+#define BC_FXNLSET 0x35    /* dst,src,index,val=u16 + mcache=u16 */
+#define BC_OBJECT  0x11    /* dst=u16 tid=u16 size=u16 */
+#define BC_ARGLIST  0x15   /* size=u16 + size*u16 src indices */
+#define BC_ARGLIST8 0x16   /* size=u8  + size*u8  src indices */
+#define BC_DMET    0x58    /* tyidx=u16 mtidx=u24 handler=u16 */
+#define BC_TINIT   0x55    /* type=u16 size=u16 name=u24 */
+#define BC_SUBTYPE 0x57    /* super=u16 sub=u16 */
+#define BC_MNAME   0x5B    /* dst=u16 src=u16 */
+#define BC_TINITI  0x56    /* tag=u16 size=u16 name=u64 */
+#define BC_CURMET  0x5A    /* dst=u16 */
+#define BC_FADD    0xAE
+#define BC_FSUB    0xAF
+#define BC_FMUL    0xB0
+#define BC_FDIV    0xB1
 #define BC_INC     0x9E    /* dst=u16 a=u16; INC(L[dst], L[a]) */
 #define BC_DEC     0x9F    /* dst=u16 a=u16; DEC(L[dst], L[a]) */
 #define BC_LOAD   0x24    /* dst=u16 src=u16 index=u16; L[dst]=O_PTR(L[src])[index] */
@@ -643,6 +657,28 @@ void (*jit_rt_fxnior_helper)(int64_t *L, int dst, int a, int b) = NULL;
 void (*jit_rt_fxnxor_helper)(int64_t *L, int dst, int a, int b) = NULL;
 void (*jit_rt_fxnshl_helper)(int64_t *L, int dst, int a, int b) = NULL;
 void (*jit_rt_fxnshr_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fxnlset_helper)(int64_t *L, struct sbc_t *sbc,
+                              uint64_t packed1, uint64_t packed2) = NULL;
+void (*jit_rt_object_helper)(int64_t *L, struct sbc_t *sbc,
+                             uint64_t packed) = NULL;
+void (*jit_rt_arglist_n_helper)(int64_t *L, struct sbc_t *sbc,
+                                uint64_t packed1, uint64_t packed2) = NULL;
+void (*jit_rt_arglist8_n_helper)(int64_t *L, struct sbc_t *sbc,
+                                 uint64_t packed1, uint64_t packed2) = NULL;
+void (*jit_rt_dmet_helper)(int64_t *L, struct sbc_t *sbc,
+                           uint64_t packed) = NULL;
+void (*jit_rt_tiniti_helper)(int64_t *L, struct sbc_t *sbc,
+                             uint64_t packed1, uint64_t packed2) = NULL;
+void (*jit_rt_curmet_helper)(int64_t *L, int dst, int u1, int u2) = NULL;
+void (*jit_rt_fadd_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fsub_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fmul_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_fdiv_helper)(int64_t *L, int dst, int a, int b) = NULL;
+void (*jit_rt_tinit_helper)(int64_t *L, struct sbc_t *sbc,
+                            uint64_t packed) = NULL;
+void (*jit_rt_subtype_helper)(int64_t *L, struct sbc_t *sbc,
+                              uint64_t packed) = NULL;
+void (*jit_rt_mname_helper)(int64_t *L, int dst, int src, int u) = NULL;
 
 /* Step 8: platform-aware default for the AOT pipeline.  Windows
  * has SEH unwind registered (step 5n) so longjmp through native
@@ -1177,6 +1213,265 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       b->pending_helper_id = JIT_HELPER_FXNLSETIR;
       jit_emit_call_with_sbc(b, (void*)jit_rt_fxnlsetir_helper, packed);
       i += 9;
+      break;
+    }
+
+    case BC_FXNLSET: {
+      /* SBC_FXNLSET: opcode + dst(u16) + src(u16) + index(u16) +
+       * val(u16) + mcache_idx(u16) = 11 bytes.  5 operands don't
+       * fit in one u64, so we use the 2-arg-packed trampoline.
+       *   packed1: [15:0]=dst [31:16]=src [47:32]=index [63:48]=val
+       *   packed2: [15:0]=mcache_idx */
+      if (i + 11 > n) { jit_last_fail_opcode = op;
+                        jit_last_fail_offset = i;
+                        fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_fxnlset_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t dst    = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t src    = (uint64_t)bc_rd16(bc + i + 3);
+      uint64_t index  = (uint64_t)bc_rd16(bc + i + 5);
+      uint64_t val    = (uint64_t)bc_rd16(bc + i + 7);
+      uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 9);
+      uint64_t packed1 = (val << 48) | (index << 32) | (src << 16) | dst;
+      uint64_t packed2 = mcidx;
+      b->pending_helper_id = JIT_HELPER_FXNLSET;
+      jit_emit_call_with_sbc2(b, (void*)jit_rt_fxnlset_helper, packed1, packed2);
+      i += 11;
+      break;
+    }
+
+    case BC_OBJECT: {
+      /* SBC_OBJECT: opcode + dst(u16) + tid(u16) + size(u16) = 7
+       * bytes.  Allocates a `size`-slot heap object with type
+       * sbc->ty[tid], or MKIMM for size==0.  Needs sbc context. */
+      if (i + 7 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_object_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t dst  = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t tid  = (uint64_t)bc_rd16(bc + i + 3);
+      uint64_t size = (uint64_t)bc_rd16(bc + i + 5);
+      uint64_t packed = (size << 32) | (tid << 16) | dst;
+      b->pending_helper_id = JIT_HELPER_OBJECT;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_object_helper, packed);
+      i += 7;
+      break;
+    }
+
+    case BC_ARGLIST: case BC_ARGLIST8: {
+      /* SBC_ARGLIST  (0x15): opcode + size(u16) + size*u16 src
+       * SBC_ARGLIST8 (0x16): opcode + size(u8)  + size*u8  src
+       *
+       * Pack at translate time into TWO u64s (via call_with_sbc2):
+       *   packed1 = (size << 56) | src0 | (src1 << 8) | ... | (src6 << 48)
+       *   packed2 = src7 | (src8 << 8) | ... | (src14 << 56)
+       * = 1 size byte + up to 15 u8 slot indices.  Slot indices
+       * > 255 fail at translate time (the slot field IS u16 in
+       * the SBC but the translated helper currently uses u8 --
+       * tight frames in practice).  For size > 15, fail and let
+       * the interpreter handle the call site. */
+      if (i + (op == BC_ARGLIST ? 3 : 2) > n) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      void *helper; jit_helper_id_t hid; size_t advance;
+      uint32_t size;
+      if (op == BC_ARGLIST) {
+        size = (uint32_t)bc_rd16(bc + i + 1);
+        advance = 1 + 2 + 2 * size;
+        helper = (void*)jit_rt_arglist_n_helper;
+        hid = JIT_HELPER_ARGLIST_N;
+      } else {
+        size = (uint32_t)bc[i + 1];
+        advance = 1 + 1 + size;
+        helper = (void*)jit_rt_arglist8_n_helper;
+        hid = JIT_HELPER_ARGLIST8_N;
+      }
+      if (size > 15 || !have_sbc || !helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      if (i + advance > n) { jit_last_fail_opcode = op;
+                             jit_last_fail_offset = i;
+                             fail = 1; goto done; }
+      uint64_t packed1 = (uint64_t)size << 56;
+      uint64_t packed2 = 0;
+      for (uint32_t j = 0; j < size; j++) {
+        uint32_t src;
+        if (op == BC_ARGLIST) {
+          src = (uint32_t)bc_rd16(bc + i + 3 + j*2);
+          if (src > 0xFF) { jit_last_fail_opcode = op;
+                            jit_last_fail_offset = i;
+                            fail = 1; goto done; }
+        } else {
+          src = (uint32_t)bc[i + 2 + j];
+        }
+        if (j < 7) {
+          packed1 |= (uint64_t)(src & 0xFF) << (j * 8);
+        } else {
+          packed2 |= (uint64_t)(src & 0xFF) << ((j - 7) * 8);
+        }
+      }
+      b->pending_helper_id = hid;
+      jit_emit_call_with_sbc2(b, helper, packed1, packed2);
+      i += advance;
+      break;
+    }
+
+    case BC_SUBTYPE: {
+      /* SBC_SUBTYPE: opcode + super(u16) + sub(u16) = 5 bytes.
+       * Calls add_subtype((int)sbc->ty[super], (int)sbc->ty[sub]). */
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_subtype_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t super = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t sub   = (uint64_t)bc_rd16(bc + i + 3);
+      uint64_t packed = (sub << 16) | super;
+      b->pending_helper_id = JIT_HELPER_SUBTYPE;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_subtype_helper, packed);
+      i += 5;
+      break;
+    }
+
+    case BC_MNAME: {
+      /* SBC_MNAME: opcode + dst(u16) + src(u16) = 5 bytes.
+       * L[dst] = get_method_name(UNFXN(L[src])). */
+      if (i + 5 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_mname_helper) { jit_last_fail_opcode = op;
+                                  jit_last_fail_offset = i;
+                                  fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t src = (uint32_t)bc_rd16(bc + i + 3);
+      b->pending_helper_id = JIT_HELPER_MNAME;
+      jit_emit_call_helper3(b, (void*)jit_rt_mname_helper, dst, src, 0);
+      i += 5;
+      break;
+    }
+
+    case BC_TINIT: {
+      /* SBC_TINIT: opcode + type(u16) + size(u16) + name(u24) =
+       * 8 bytes.  Body: set_type_size_and_name(sbc->ty[type],
+       * size, sbc->tx[name]).  All fields fit in one u64. */
+      if (i + 8 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_tinit_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t type = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t size = (uint64_t)bc_rd16(bc + i + 3);
+      uint64_t name = (uint64_t)bc_rd24(bc + i + 5);
+      uint64_t packed = (name << 32) | (size << 16) | type;
+      b->pending_helper_id = JIT_HELPER_TINIT;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_tinit_helper, packed);
+      i += 8;
+      break;
+    }
+
+    case BC_TINITI: {
+      /* SBC_TINITI: opcode + tag(u16) + size(u16) + name(u64) =
+       * 13 bytes.  Runtime calls set_type_size_and_name(
+       * sbc->ty[tag], size, name).  Two packed u64s. */
+      if (i + 13 > n) { jit_last_fail_opcode = op;
+                        jit_last_fail_offset = i;
+                        fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_tiniti_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t tag  = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t size = (uint64_t)bc_rd16(bc + i + 3);
+      uint64_t name = 0;
+      for (int k = 0; k < 8; k++) name |= (uint64_t)bc[i + 5 + k] << (k * 8);
+      uint64_t packed1 = (size << 16) | tag;
+      b->pending_helper_id = JIT_HELPER_TINITI;
+      jit_emit_call_with_sbc2(b, (void*)jit_rt_tiniti_helper, packed1, name);
+      i += 13;
+      break;
+    }
+
+    case BC_CURMET: {
+      /* SBC_CURMET: opcode + dst(u16) = 3 bytes.  L[dst] =
+       * currently executing method (api.curmet). */
+      if (i + 3 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!jit_rt_curmet_helper) { jit_last_fail_opcode = op;
+                                   jit_last_fail_offset = i;
+                                   fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      b->pending_helper_id = JIT_HELPER_CURMET;
+      jit_emit_call_helper3(b, (void*)jit_rt_curmet_helper, dst, 0, 0);
+      i += 3;
+      break;
+    }
+
+    case BC_FADD: case BC_FSUB: case BC_FMUL: case BC_FDIV: {
+      /* Typed-float arith.  Wire: opcode + dst(u16) + a(u16) +
+       * b(u16) = 7 bytes.  Operands are statically known T_FLOAT;
+       * no tag check or MCALL fallback.  Helper3 trampoline.
+       * An x86 backend should lower these to ADDSS/SUBSS/MULSS/
+       * DIVSS on xmm regs, but for now the helper unbox/rebox is
+       * fine -- typed-float is rare in measured workloads. */
+      if (i + 7 > n) { fail = 1; goto done; }
+      void *helper; jit_helper_id_t hid;
+      switch (op) {
+        case BC_FADD: helper = (void*)jit_rt_fadd_helper; hid = JIT_HELPER_FADD; break;
+        case BC_FSUB: helper = (void*)jit_rt_fsub_helper; hid = JIT_HELPER_FSUB; break;
+        case BC_FMUL: helper = (void*)jit_rt_fmul_helper; hid = JIT_HELPER_FMUL; break;
+        case BC_FDIV: helper = (void*)jit_rt_fdiv_helper; hid = JIT_HELPER_FDIV; break;
+        default: helper = NULL; hid = JIT_HELPER_NONE;
+      }
+      if (!helper) { jit_last_fail_opcode = op;
+                     jit_last_fail_offset = i;
+                     fail = 1; goto done; }
+      uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
+      uint32_t a   = (uint32_t)bc_rd16(bc + i + 3);
+      uint32_t x   = (uint32_t)bc_rd16(bc + i + 5);
+      b->pending_helper_id = hid;
+      jit_emit_call_helper3(b, helper, dst, a, x);
+      i += 7;
+      break;
+    }
+
+    case BC_DMET: {
+      /* SBC_DMET: opcode + tyidx(u16) + mtidx(u24) + handler(u16)
+       * = 8 bytes.  Runtime add_method using sbc-side type + mt
+       * tables.  Packed: [15:0]=tyidx [39:16]=mtidx [55:40]=handler. */
+      if (i + 8 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      if (!have_sbc || !jit_rt_dmet_helper) {
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+      uint64_t tyidx   = (uint64_t)bc_rd16(bc + i + 1);
+      uint64_t mtidx   = (uint64_t)bc_rd24(bc + i + 3);
+      uint64_t handler = (uint64_t)bc_rd16(bc + i + 6);
+      uint64_t packed = (handler << 40) | (mtidx << 16) | tyidx;
+      b->pending_helper_id = JIT_HELPER_DMET;
+      jit_emit_call_with_sbc(b, (void*)jit_rt_dmet_helper, packed);
+      i += 8;
       break;
     }
 
@@ -2189,6 +2484,21 @@ static void emit_mov_arg2_imm64(jit_buf *b, uint64_t imm) {
   for (int k = 0; k < 8; k++) jit_emit_u8(b, (uint8_t)(imm >> (k * 8)));
 }
 
+/* mov <arg3>, imm64 -- 10 bytes.  Used by call_with_sbc2 for the
+ * second packed word when 4 helper args are needed. */
+static void emit_mov_arg3_imm64(jit_buf *b, uint64_t imm) {
+#ifdef _WIN32
+  /* mov r9, imm64 :  49 b9 <8 bytes>  (REX.W + REX.B for r9) */
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0xb9);
+#else
+  /* mov rcx, imm64 :  48 b9 <8 bytes> */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0xb9);
+#endif
+  for (int k = 0; k < 8; k++) jit_emit_u8(b, (uint8_t)(imm >> (k * 8)));
+}
+
 /* Emit a 3-arg helper call:
  *   arg0 = L   (from rbx)
  *   arg1 = sbc (from r12)
@@ -2202,6 +2512,23 @@ void jit_emit_call_with_sbc(jit_buf *b, void *target, uint64_t packed) {
                                          before the rbx/r12 copies */
   emit_mov_arg1_from_sbc(b);          /* arg1 = sbc  */
   jit_emit_mov_arg0_from_locals(b);   /* arg0 = L    */
+  jit_emit_call_abs(b, target);
+}
+
+/* Emit a 4-arg helper call:
+ *   arg0 = L   (from rbx)
+ *   arg1 = sbc (from r12)
+ *   arg2 = packed1 (64-bit immediate)
+ *   arg3 = packed2 (64-bit immediate)
+ * The helper signature: void(*)(int64_t*L, sbc_t*sbc, uint64_t, uint64_t).
+ * Used by FXNLSET (with-result variant) -- 5 operands (dst, src,
+ * index, val, mcache_idx) overflow a single u64. */
+void jit_emit_call_with_sbc2(jit_buf *b, void *target,
+                             uint64_t packed1, uint64_t packed2) {
+  emit_mov_arg2_imm64(b, packed1);
+  emit_mov_arg3_imm64(b, packed2);
+  emit_mov_arg1_from_sbc(b);
+  jit_emit_mov_arg0_from_locals(b);
   jit_emit_call_abs(b, target);
 }
 

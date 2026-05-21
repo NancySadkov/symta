@@ -442,6 +442,157 @@ static void jit_rt_fxnshr_impl(int64_t *L, int dst, int a, int b) {
   }
 }
 
+/* SBC_FXNLSET (with-result variant).  Same dispatch as FXNLSETIR
+ * but writes the call's return value into L[dst].  5 u16 operands
+ * arrive as two packed u64s.
+ *   packed1: [15:0]=dst [31:16]=src [47:32]=index [63:48]=val
+ *   packed2: [15:0]=mcache_idx */
+static void jit_rt_fxnlset_impl(int64_t *L, struct sbc_t *sbc,
+                                uint64_t packed1, uint64_t packed2) {
+  uint32_t dst   = (uint32_t)(packed1 & 0xFFFF);
+  uint32_t src   = (uint32_t)((packed1 >> 16) & 0xFFFF);
+  uint32_t index = (uint32_t)((packed1 >> 32) & 0xFFFF);
+  uint32_t val   = (uint32_t)((packed1 >> 48) & 0xFFFF);
+  uint32_t mcidx = (uint32_t)(packed2 & 0xFFFF);
+  dyn ss = ((dyn*)L)[src];
+  dyn ii = ((dyn*)L)[index];
+  if (TAGIS(T_LIST, ss) && TAGIS(T_INT, ii)
+      && (uint64_t)ii < (uint64_t)FXN(LIST_SIZE(ss))) {
+    FXNLSET(((dyn*)L)[dst], ss, ii, ((dyn*)L)[val]);
+  } else {
+    ARGLIST3(ss, ii, ((dyn*)L)[val]);
+    api.method = m_set;
+    mcache_t *mce = &sbc->mcaches[mcidx];
+    uint32_t tid = O_TAG(ss);
+    dyn mfn;
+    if (mce->tid != tid || mce->mid != (uint32_t)m_set) {
+      mfn = get_method_for_tag(m_set, tid);
+      mce->tid = tid;
+      mce->mid = (uint32_t)m_set;
+      mce->fn  = mfn;
+    } else {
+      mfn = mce->fn;
+    }
+    CALL(((dyn*)L)[dst], mfn);
+  }
+}
+
+/* SBC_OBJECT: allocate a `size`-slot typed object with tid =
+ * sbc->ty[tid].  size==0 emits MKIMM (no heap allocation -- the
+ * dyn IS the tagged-zero immediate). */
+static void jit_rt_object_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t dst  = (uint32_t)(packed & 0xFFFF);
+  uint32_t tid  = (uint32_t)((packed >> 16) & 0xFFFF);
+  uint32_t size = (uint32_t)((packed >> 32) & 0xFFFF);
+  if (size) {
+    OBJECT(((dyn*)L)[dst], sbc->ty[tid], size);
+  } else {
+    ((dyn*)L)[dst] = (dyn)(int64_t)MKIMM((int64_t)sbc->ty[tid], 0);
+  }
+}
+
+/* SBC_ARGLIST / SBC_ARGLIST8: packed u64 layout
+ *   bits 56..63: size  (1..7)
+ *   bits  0.. 7: src0  (u8 slot index)
+ *   bits  8..15: src1
+ *   ...
+ *   bits 48..55: src6
+ * The two opcodes share an impl since the JIT translator already
+ * truncated u16 src indices to u8 (with a runtime check that
+ * they fit -- larger frames bail out at JIT-translate time). */
+/* Packed layout:
+ *   packed1: [56-63]=size (1..15), [0-7]=src0, ..., [48-55]=src6
+ *   packed2: [0-7]=src7, [8-15]=src8, ..., [56-63]=src14 */
+static void jit_rt_arglist_packed_impl(int64_t *L, struct sbc_t *sbc,
+                                        uint64_t packed1, uint64_t packed2) {
+  (void)sbc;
+  int size = (int)((packed1 >> 56) & 0xFF);
+  ARGLIST(size);
+  for (int j = 0; j < size; j++) {
+    int src;
+    if (j < 7) src = (int)((packed1 >> (j * 8)) & 0xFF);
+    else       src = (int)((packed2 >> ((j - 7) * 8)) & 0xFF);
+    STARG(j, ((dyn*)L)[src]);
+  }
+}
+
+/* SBC_SUBTYPE: add_subtype((int)sbc->ty[super], (int)sbc->ty[sub]). */
+static void jit_rt_subtype_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  (void)L;
+  uint32_t super = (uint32_t)(packed & 0xFFFF);
+  uint32_t sub   = (uint32_t)((packed >> 16) & 0xFFFF);
+  add_subtype((int)(int64_t)sbc->ty[super], (int)(int64_t)sbc->ty[sub]);
+}
+
+/* SBC_MNAME: L[dst] = get_method_name(UNFXN(L[src])). */
+static void jit_rt_mname_impl(int64_t *L, int dst, int src, int u) {
+  (void)u;
+  ((dyn*)L)[dst] = get_method_name(UNFXN(((dyn*)L)[src]));
+}
+
+/* SBC_TINIT: type init for named text.  Calls
+ * set_type_size_and_name(sbc->ty[type], size, sbc->tx[name]). */
+static void jit_rt_tinit_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  (void)L;
+  uint32_t type = (uint32_t)(packed & 0xFFFF);
+  uint32_t size = (uint32_t)((packed >> 16) & 0xFFFF);
+  uint32_t name = (uint32_t)((packed >> 32) & 0xFFFFFF);
+  set_type_size_and_name((int64_t)sbc->ty[type], size, sbc->tx[name]);
+}
+
+/* SBC_TINITI: type init for immediate text.  Calls
+ * set_type_size_and_name(sbc->ty[tag], size, name). */
+static void jit_rt_tiniti_impl(int64_t *L, struct sbc_t *sbc,
+                               uint64_t packed1, uint64_t packed2) {
+  (void)L;
+  uint32_t tag  = (uint32_t)(packed1 & 0xFFFF);
+  uint32_t size = (uint32_t)((packed1 >> 16) & 0xFFFF);
+  dyn name = (dyn)(int64_t)packed2;
+  set_type_size_and_name((int64_t)sbc->ty[tag], size, name);
+}
+
+/* SBC_CURMET: L[dst] = api.curmet (currently executing method). */
+static void jit_rt_curmet_impl(int64_t *L, int dst, int u1, int u2) {
+  (void)u1; (void)u2;
+  THIS_METHOD(((dyn*)L)[dst]);
+}
+
+/* Typed-float arith: detag, op, retag.  Mirrors sbc.c bodies. */
+static void jit_rt_fadd_impl(int64_t *L, int dst, int a, int b) {
+  float fa, fb;
+  STFLT(fa, ((dyn*)L)[a]);
+  STFLT(fb, ((dyn*)L)[b]);
+  LDFLT(((dyn*)L)[dst], fa + fb);
+}
+static void jit_rt_fsub_impl(int64_t *L, int dst, int a, int b) {
+  float fa, fb;
+  STFLT(fa, ((dyn*)L)[a]);
+  STFLT(fb, ((dyn*)L)[b]);
+  LDFLT(((dyn*)L)[dst], fa - fb);
+}
+static void jit_rt_fmul_impl(int64_t *L, int dst, int a, int b) {
+  float fa, fb;
+  STFLT(fa, ((dyn*)L)[a]);
+  STFLT(fb, ((dyn*)L)[b]);
+  LDFLT(((dyn*)L)[dst], fa * fb);
+}
+static void jit_rt_fdiv_impl(int64_t *L, int dst, int a, int b) {
+  float fa, fb;
+  STFLT(fa, ((dyn*)L)[a]);
+  STFLT(fb, ((dyn*)L)[b]);
+  LDFLT(((dyn*)L)[dst], fa / fb);
+}
+
+/* SBC_DMET: define a method on a runtime type.
+ *   add_method((int)sbc->ty[tyidx], sbc->mt[mtidx], L[handler]) */
+static void jit_rt_dmet_impl(int64_t *L, struct sbc_t *sbc, uint64_t packed) {
+  uint32_t tyidx   = (uint32_t)(packed & 0xFFFF);
+  uint32_t mtidx   = (uint32_t)((packed >> 16) & 0xFFFFFF);
+  uint32_t handler = (uint32_t)((packed >> 40) & 0xFFFF);
+  add_method((int)(int64_t)sbc->ty[tyidx], sbc->mt[mtidx],
+             (void*)((dyn*)L)[handler]);
+}
+
 /* SBC_FXNLSETIR: list-set with ignored result.  3-way dispatch:
  *   T_LIST + T_INT + in-bounds  -> direct FXNLSET (lsetm barrier)
  *   else                         -> MCACHE_CALL m_set on L[src]
@@ -820,6 +971,20 @@ static void jit_install_helpers_once(void) {
   jit_rt_fxnxor_helper   = jit_rt_fxnxor_impl;
   jit_rt_fxnshl_helper   = jit_rt_fxnshl_impl;
   jit_rt_fxnshr_helper   = jit_rt_fxnshr_impl;
+  jit_rt_fxnlset_helper  = jit_rt_fxnlset_impl;
+  jit_rt_object_helper   = jit_rt_object_impl;
+  jit_rt_arglist_n_helper = jit_rt_arglist_packed_impl;
+  jit_rt_arglist8_n_helper = jit_rt_arglist_packed_impl;
+  jit_rt_dmet_helper     = jit_rt_dmet_impl;
+  jit_rt_tiniti_helper   = jit_rt_tiniti_impl;
+  jit_rt_curmet_helper   = jit_rt_curmet_impl;
+  jit_rt_fadd_helper     = jit_rt_fadd_impl;
+  jit_rt_fsub_helper     = jit_rt_fsub_impl;
+  jit_rt_fmul_helper     = jit_rt_fmul_impl;
+  jit_rt_fdiv_helper     = jit_rt_fdiv_impl;
+  jit_rt_tinit_helper    = jit_rt_tinit_impl;
+  jit_rt_subtype_helper  = jit_rt_subtype_impl;
+  jit_rt_mname_helper    = jit_rt_mname_impl;
 }
 
 void jit_install_helpers_public(void) {
@@ -886,6 +1051,20 @@ void *jit_helper_pointer(int helper_id) {
     case JIT_HELPER_FXNXOR:   return (void*)jit_rt_fxnxor_helper;
     case JIT_HELPER_FXNSHL:   return (void*)jit_rt_fxnshl_helper;
     case JIT_HELPER_FXNSHR:   return (void*)jit_rt_fxnshr_helper;
+    case JIT_HELPER_FXNLSET:  return (void*)jit_rt_fxnlset_helper;
+    case JIT_HELPER_OBJECT:   return (void*)jit_rt_object_helper;
+    case JIT_HELPER_ARGLIST_N: return (void*)jit_rt_arglist_n_helper;
+    case JIT_HELPER_ARGLIST8_N: return (void*)jit_rt_arglist8_n_helper;
+    case JIT_HELPER_DMET:     return (void*)jit_rt_dmet_helper;
+    case JIT_HELPER_TINITI:   return (void*)jit_rt_tiniti_helper;
+    case JIT_HELPER_CURMET:   return (void*)jit_rt_curmet_helper;
+    case JIT_HELPER_FADD:     return (void*)jit_rt_fadd_helper;
+    case JIT_HELPER_FSUB:     return (void*)jit_rt_fsub_helper;
+    case JIT_HELPER_FMUL:     return (void*)jit_rt_fmul_helper;
+    case JIT_HELPER_FDIV:     return (void*)jit_rt_fdiv_helper;
+    case JIT_HELPER_TINIT:    return (void*)jit_rt_tinit_helper;
+    case JIT_HELPER_SUBTYPE:  return (void*)jit_rt_subtype_helper;
+    case JIT_HELPER_MNAME:    return (void*)jit_rt_mname_helper;
     default:                  return NULL;
   }
 }
