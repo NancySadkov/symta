@@ -273,6 +273,32 @@ void jit_emit_fxnlget(jit_buf *b, uint32_t dst, uint32_t src,
                       uint32_t index_slot, void *heap0_addr_imm,
                       void *fxnlget_helper, uint64_t fxnlget_packed);
 
+/* Step 12i: inline SBC_FXNLSET (with-result) / SBC_FXNLSETIR
+ * (ignore-result) T_LIST+T_INT+in-bounds + immediate-value fast
+ * path.
+ *
+ *   if (TAGIS(T_LIST, L[src]) && TAGIS(T_INT, L[idx]) &&
+ *       in-bounds && IMMEDIATE(L[val]))
+ *     *(O_PTR(L[src]) + UNFXN(L[idx])) = L[val];   // no barrier
+ *   else
+ *     <fxnlset / fxnlsetir helper -- MCACHE_CALL m_set>;
+ *
+ * Note: per the FXNLSET macro definition (symta.h:174), the fast
+ * path does NOT write L[dst].  Only the slow path's MCACHE_CALL
+ * sets L[dst] (with the method's return value).
+ *
+ * `with_result` selects the helper / packed-arg shape:
+ *   - 1 = SBC_FXNLSET (5 operands packed in two u64s) -> call_with_sbc2
+ *   - 0 = SBC_FXNLSETIR (4 operands packed in one u64) -> call_with_sbc
+ *
+ * Register clobbers: RAX, RCX, RDX, R8 (all caller-saved). */
+void jit_emit_fxnlset(jit_buf *b, uint32_t dst, uint32_t src,
+                      uint32_t index_slot, uint32_t val,
+                      void *heap0_addr_imm,
+                      void *fxnlset_helper,
+                      uint64_t fxnlset_packed1, uint64_t fxnlset_packed2,
+                      int with_result);
+
 /* ============================================================
  * Step 2: control flow + typed-int comparison emitters.
  *

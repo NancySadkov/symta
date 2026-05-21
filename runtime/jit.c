@@ -1256,10 +1256,14 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       /* SBC_FXNLSETIR: opcode + src(u16) + index(u16) + val(u16) +
        * mcache_idx(u16) = 9 bytes.  List-element set with ignored
        * result.  Same 3-way dispatch as FXNLGET (T_LIST+T_INT+
-       * in-bounds direct LSET; else MCACHE_CALL m_set).  All
-       * four operands fit in one packed u64, so the helper uses
-       * the call_with_sbc trampoline.  Packed: [15:0]=src,
-       * [31:16]=index, [47:32]=val, [63:48]=mcache_idx. */
+       * in-bounds direct LSET; else MCACHE_CALL m_set).
+       *   Packed: [15:0]=src, [31:16]=index, [47:32]=val,
+       *           [63:48]=mcache_idx.
+       *
+       * Step 12i: inline the T_LIST+T_INT+in-bounds+immediate-value
+       * fast path via jit_emit_fxnlset.  Falls back to the helper
+       * on any check failure (heap value, tag miss, out of bounds).
+       * SYMTA_NO_FXNLSET_INLINE env-gate for bisecting. */
       if (i + 9 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
@@ -1273,8 +1277,15 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       uint64_t val    = (uint64_t)bc_rd16(bc + i + 5);
       uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 7);
       uint64_t packed = (mcidx << 48) | (val << 32) | (index << 16) | src;
-      b->pending_helper_id = JIT_HELPER_FXNLSETIR;
-      jit_emit_call_with_sbc(b, (void*)jit_rt_fxnlsetir_helper, packed);
+      if (jit_rt_heap0_addr && !getenv("SYMTA_NO_FXNLSET_INLINE")) {
+        jit_emit_fxnlset(b, /*dst=*/0, (uint32_t)src, (uint32_t)index,
+                         (uint32_t)val, jit_rt_heap0_addr,
+                         (void*)jit_rt_fxnlsetir_helper,
+                         packed, /*packed2=*/0, /*with_result=*/0);
+      } else {
+        b->pending_helper_id = JIT_HELPER_FXNLSETIR;
+        jit_emit_call_with_sbc(b, (void*)jit_rt_fxnlsetir_helper, packed);
+      }
       i += 9;
       break;
     }
@@ -1287,7 +1298,13 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
        * val(u16) + mcache_idx(u16) = 11 bytes.  5 operands don't
        * fit in one u64, so we use the 2-arg-packed trampoline.
        *   packed1: [15:0]=dst [31:16]=src [47:32]=index [63:48]=val
-       *   packed2: [15:0]=mcache_idx */
+       *   packed2: [15:0]=mcache_idx
+       *
+       * Step 12i: same fast-path inline as FXNLSETIR, but uses the
+       * `with_result` shape so the helper bail-out routes to
+       * call_with_sbc2.  Note: the fast path ignores `dst`
+       * (matches FXNLSET macro semantics); only the slow path's
+       * MCACHE_CALL m_set writes L[dst]. */
       if (i + 11 > n) { jit_last_fail_opcode = op;
                         jit_last_fail_offset = i;
                         fail = 1; goto done; }
@@ -1303,8 +1320,15 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 9);
       uint64_t packed1 = (val << 48) | (index << 32) | (src << 16) | dst;
       uint64_t packed2 = mcidx;
-      b->pending_helper_id = JIT_HELPER_FXNLSET;
-      jit_emit_call_with_sbc2(b, (void*)jit_rt_fxnlset_helper, packed1, packed2);
+      if (jit_rt_heap0_addr && !getenv("SYMTA_NO_FXNLSET_INLINE")) {
+        jit_emit_fxnlset(b, (uint32_t)dst, (uint32_t)src, (uint32_t)index,
+                         (uint32_t)val, jit_rt_heap0_addr,
+                         (void*)jit_rt_fxnlset_helper,
+                         packed1, packed2, /*with_result=*/1);
+      } else {
+        b->pending_helper_id = JIT_HELPER_FXNLSET;
+        jit_emit_call_with_sbc2(b, (void*)jit_rt_fxnlset_helper, packed1, packed2);
+      }
       i += 11;
       break;
     }
@@ -3092,6 +3116,99 @@ void jit_emit_fxnlget(jit_buf *b, uint32_t dst, uint32_t src,
   jit_patch_jmp_here(b, to_slow_bounds);
   b->pending_helper_id = JIT_HELPER_FXNLGET;
   jit_emit_call_with_sbc(b, fxnlget_helper, fxnlget_packed);
+
+  jit_patch_jmp_here(b, to_done);
+}
+
+/* ============================================================
+ * Step 12i: inline SBC_FXNLSET / SBC_FXNLSETIR fast path.
+ *
+ * Helper logic (jit_rt_fxnlset_impl / jit_rt_fxnlsetir_impl):
+ *   if (TAGIS(T_LIST, L[src]) && TAGIS(T_INT, L[idx])
+ *       && (uint64_t)L[idx] < (uint64_t)FXN(LIST_SIZE(L[src])))
+ *     FXNLSET(L[dst], L[src], L[idx], L[val]);  // dst is ignored
+ *                                               // -- lsetm into L[src]
+ *   else
+ *     <MCACHE_CALL m_set>;
+ *
+ * `FXNLSET(dst, xs, i, v) -> LSET(xs, UNFXN(i), v) -> lsetm(xs, UNFXN(i), v)`
+ * -- the dst slot is NOT touched in the fast path (matches the
+ * macro definition in symta.h:174).  Slow path's MCACHE_CALL does
+ * write the dst slot with the method's return value.
+ *
+ * Fast path further requires the VALUE to be immediate so no GC
+ * cross-gen barrier is needed: matches ST4's immediate-bypass
+ * shape.  Heap value -> fall to helper (which redoes the store
+ * with the full barrier check).
+ *
+ * Composed from existing primitives: T_LIST + T_INT + bounds
+ * (same as FXNLGET) followed by immediate-value test + inline
+ * store (same as ST4).
+ * ============================================================ */
+
+void jit_emit_fxnlset(jit_buf *b, uint32_t dst, uint32_t src,
+                      uint32_t index_slot, uint32_t val,
+                      void *heap0_addr_imm,
+                      void *fxnlset_helper,
+                      uint64_t fxnlset_packed1, uint64_t fxnlset_packed2,
+                      int with_result) {
+  (void)dst;  /* dst is unused on the fast path -- only the slow */
+              /* path's MCACHE_CALL writes it.  Pass-through to */
+              /* the helper packed args. */
+
+  /* T_LIST check on L[src]. */
+  emit_mov_rax_from_slot(b, (int)src);
+  emit_cmp_ax_imm16(b, 0x13);
+  size_t to_slow_list = emit_jnz_rel32(b);
+
+  /* T_INT check on L[index_slot]. */
+  emit_mov_rdx_from_slot(b, (int)index_slot);
+  emit_test_dx_dx(b);
+  size_t to_slow_int = emit_jnz_rel32(b);
+
+  /* Compute heap0 + gid_src*8 base. */
+  emit_shr_rax(b, 16);                                /* rax = gid_src */
+  emit_movabs_rcx_helper(b, (uint64_t)heap0_addr_imm,
+                         JIT_HELPER_AMP_HEAP0);
+  emit_mov_rcx_from_rcx_deref(b);                     /* rcx = heap0 */
+
+  /* Bounds check. */
+  emit_mov_r8d_from_rcx_rax_indexed8(b, -8);          /* r8d = LIST_SIZE */
+  emit_shl_r8(b, 16);                                 /* r8 = FXN(size) */
+  emit_cmp_rdx_r8(b);
+  size_t to_slow_bounds = emit_jae_rel32(b);
+
+  /* Compute final slot offset: rax = gid_src + UNFXN(idx). */
+  emit_shr_rdx(b, 16);                                /* rdx = UNFXN(idx) */
+  emit_add_rax_rdx(b);                                /* rax = gid_src + idx */
+
+  /* Load value and check it's immediate.  Clobbers rdx (we're done
+   * with the index).  Heap value -> slow (helper does the barrier). */
+  emit_mov_rdx_from_slot(b, (int)val);
+  emit_test_dl_imm8(b, 1);
+  size_t to_slow_heap_value = emit_jnz_rel32(b);
+
+  /* Inline store: *(slot) = value.  Disp=0 because rax now holds
+   * the full gid_src + idx offset. */
+  emit_mov_to_rcx_rax_indexed8_from_rdx(b, 0);
+  size_t to_done = jit_emit_jmp(b);
+
+  /* Slow path: full helper call. */
+  jit_patch_jmp_here(b, to_slow_list);
+  jit_patch_jmp_here(b, to_slow_int);
+  jit_patch_jmp_here(b, to_slow_bounds);
+  jit_patch_jmp_here(b, to_slow_heap_value);
+  b->pending_helper_id = with_result ? JIT_HELPER_FXNLSET
+                                     : JIT_HELPER_FXNLSETIR;
+  /* FXNLSET (with-result) uses call_with_sbc2 (two packed u64s
+   * because 5 operands overflow a single u64); FXNLSETIR
+   * (ignore-result) uses call_with_sbc (single packed). */
+  if (with_result) {
+    jit_emit_call_with_sbc2(b, fxnlset_helper, fxnlset_packed1,
+                            fxnlset_packed2);
+  } else {
+    jit_emit_call_with_sbc(b, fxnlset_helper, fxnlset_packed1);
+  }
 
   jit_patch_jmp_here(b, to_done);
 }
