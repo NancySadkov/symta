@@ -250,6 +250,29 @@ void jit_emit_st4(jit_buf *b, uint32_t dst, uint32_t src, uint32_t index,
                   void *heap0_addr_imm,
                   void *st4_helper);
 
+/* Step 12h: inline SBC_FXNLGET T_LIST+T_INT+in-bounds fast path.
+ *
+ *   L[dst] = ((void**)O_PTR(L[src]))[UNFXN(L[index_slot])]
+ *
+ * Three checks gate the fast path: L[src] is T_LIST (low 16 bits
+ * == 0x13), L[index_slot] is T_INT (low 16 bits == 0), and the
+ * unsigned-extended index is in bounds against the list's
+ * gc_head.size.  Any check failing falls through to the existing
+ * fxnlget helper (which does the MCALL m_get dispatch).
+ *
+ * `fxnlget_packed` is the same 64-bit packed argument the helper
+ * expects:
+ *   [15:0]  = dst slot
+ *   [31:16] = src slot
+ *   [47:32] = index slot
+ *   [63:48] = mcache index
+ *
+ * Register clobbers: RAX, RCX, RDX, R8 (all caller-saved).  RBX
+ * and R12 (locals and sbc) preserved. */
+void jit_emit_fxnlget(jit_buf *b, uint32_t dst, uint32_t src,
+                      uint32_t index_slot, void *heap0_addr_imm,
+                      void *fxnlget_helper, uint64_t fxnlget_packed);
+
 /* ============================================================
  * Step 2: control flow + typed-int comparison emitters.
  *

@@ -1203,8 +1203,12 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       /* SBC_FXNLGET: opcode + dst(u16) + src(u16) + index(u16) +
        * mcache_idx(u16) = 9 bytes.  Body has a T_LIST+T_INT
        * fast path (direct LGET) and a MCACHE_CALL(m_get) slow
-       * path -- both inside the helper, no need to inline the
-       * fast path at the JIT level. */
+       * path.
+       *
+       * Step 12h: inline the T_LIST + T_INT + in-bounds fast path
+       * (jit_emit_fxnlget) instead of routing through the helper.
+       * Fall back to the helper on tag-miss or out-of-bounds.
+       * SYMTA_NO_FXNLGET_INLINE env-gate for bisecting. */
       if (i + 9 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
@@ -1218,8 +1222,14 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       uint64_t index  = (uint64_t)bc_rd16(bc + i + 5);
       uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 7);
       uint64_t packed = (mcidx << 48) | (index << 32) | (src << 16) | dst;
-      b->pending_helper_id = JIT_HELPER_FXNLGET;
-      jit_emit_call_with_sbc(b, (void*)jit_rt_fxnlget_helper, packed);
+      if (jit_rt_heap0_addr && !getenv("SYMTA_NO_FXNLGET_INLINE")) {
+        jit_emit_fxnlget(b, (uint32_t)dst, (uint32_t)src, (uint32_t)index,
+                         jit_rt_heap0_addr,
+                         (void*)jit_rt_fxnlget_helper, packed);
+      } else {
+        b->pending_helper_id = JIT_HELPER_FXNLGET;
+        jit_emit_call_with_sbc(b, (void*)jit_rt_fxnlget_helper, packed);
+      }
       i += 9;
       break;
     }
@@ -2902,6 +2912,186 @@ void jit_emit_st4(jit_buf *b, uint32_t dst, uint32_t src, uint32_t index,
   jit_patch_jmp_here(b, to_slow);
   b->pending_helper_id = JIT_HELPER_ST4;
   jit_emit_call_helper3(b, st4_helper, dst, src, index);
+
+  jit_patch_jmp_here(b, to_done);
+}
+
+/* ============================================================
+ * Step 12h: inline SBC_FXNLGET fast path.
+ *
+ * Helper logic (jit_rt_fxnlget_impl):
+ *   if (TAGIS(T_LIST, L[src]) && TAGIS(T_INT, L[index_slot])
+ *       && (uint64_t)L[index_slot] < (uint64_t)FXN(LIST_SIZE(L[src])))
+ *     L[dst] = ((void**)O_PTR(L[src]))[UNFXN(L[index_slot])];
+ *   else
+ *     <MCACHE_CALL m_get>;
+ *
+ * Tag-bit layout (FLG_BITS=1, TAG_BITS=15):
+ *   heap object's low 16 bits = (tag << 1) | T_HEAP
+ *   T_LIST encoded =            (9   << 1) | 1   = 0x13
+ *   T_INT immediate             =            0
+ *
+ * x86_64 fast-path sequence:
+ *
+ *   mov   rdx, [rbx + idx*8]              ; rdx = L[idx] (T_INT?)
+ *   test  dx, dx                          ; low 16 == 0 ?
+ *   jne   slow
+ *   mov   rax, [rbx + src*8]              ; rax = L[src] (T_LIST?)
+ *   cmp   ax, 0x13                        ; low 16 == 0x13 ?
+ *   jne   slow
+ *   shr   rax, 16                         ; rax = gid_src
+ *   movabs rcx, &api_g.heap0              ; (JIT_HELPER_AMP_HEAP0 reloc)
+ *   mov   rcx, [rcx]                      ; rcx = heap0
+ *   mov   r8d, [rcx + rax*8 - 4]          ; r8d = LIST_SIZE (32-bit;
+ *                                         ; gc_head.size is at offset
+ *                                         ; -8 of obj data; size lives
+ *                                         ; in the low 4 bytes of the
+ *                                         ; 8-byte header)
+ *   shl   r8, 16                          ; r8 = FXN(size)
+ *   cmp   rdx, r8                         ; rdx (FXN-idx) < FXN(size)?
+ *   jae   slow                            ; out of bounds
+ *   shr   rdx, 16                         ; rdx = UNFXN(idx)
+ *   add   rax, rdx                        ; rax = gid_src + idx
+ *   mov   rax, [rcx + rax*8]              ; rax = heap0[gid + idx]
+ *   mov   [rbx + dst*8], rax              ; L[dst] = rax
+ *   jmp   done
+ * slow:
+ *   <helper call: fxnlget(L, sbc, packed)>
+ * done:
+ *
+ * Clobbers: RAX, RCX, RDX, R8 (all caller-saved).  RBX (L) and
+ * R12 (sbc) preserved.
+ *
+ * gc_head layout (runtime/symta.h):  struct gc_head_t {
+ *     uint32_t size;  // size of the object (not counting this header)
+ *     uint32_t code;  // closure machine code / entity id
+ * } __attribute__((packed));  // sizeof = 8
+ *
+ * So if we have `rax = gid_src` and `rcx = heap0`, then the object
+ * data lives at  [rcx + rax*8]  (8 bytes per slot).  The header lives
+ * immediately before the data, at  [rcx + rax*8 - 8].  The `size`
+ * field is the FIRST 4 bytes of the header, i.e. at  [rcx + rax*8 - 8].
+ * So `mov r8d, [rcx + rax*8 - 8]` loads it.
+ * ============================================================ */
+
+/* cmp ax, imm16 -- 4 bytes (66 3D imm16). */
+static void emit_cmp_ax_imm16(jit_buf *b, uint16_t imm) {
+  jit_emit_u8(b, 0x66);
+  jit_emit_u8(b, 0x3d);
+  jit_emit_u8(b, (uint8_t)(imm & 0xff));
+  jit_emit_u8(b, (uint8_t)((imm >> 8) & 0xff));
+}
+
+/* test dx, dx -- 3 bytes (66 85 D2).  ModR/M=11 reg=010(DX)
+ * r/m=010(DX). */
+static void emit_test_dx_dx(jit_buf *b) {
+  jit_emit_u8(b, 0x66);
+  jit_emit_u8(b, 0x85);
+  jit_emit_u8(b, 0xd2);
+}
+
+/* mov r8d, [rcx + rax*8 + disp]  (5 bytes if disp fits in s8,
+ * 8 bytes for disp32).  Loads 32-bit unsigned at the indexed
+ * heap address into R8 (zero-extended in 64-bit mode).
+ *
+ *   REX = 0x44   (REX.R for R8 as destination reg)
+ *   opcode = 0x8B (mov r32, r/m32)
+ *   ModR/M = mod=01|10, reg=000(R8 low 3 bits), r/m=100(SIB)
+ *   SIB = scale=11(8x), index=000(RAX), base=001(RCX) */
+static void emit_mov_r8d_from_rcx_rax_indexed8(jit_buf *b, int32_t disp) {
+  jit_emit_u8(b, 0x44);                              /* REX.R */
+  jit_emit_u8(b, 0x8b);                              /* mov r32, r/m32 */
+  if (disp >= -128 && disp <= 127) {
+    jit_emit_u8(b, 0x44);                            /* mod=01 reg=000 r/m=100 */
+    jit_emit_u8(b, 0xc1);                            /* SIB scale=8 idx=rax base=rcx */
+    jit_emit_u8(b, (uint8_t)(int8_t)disp);
+  } else {
+    jit_emit_u8(b, 0x84);                            /* mod=10 reg=000 r/m=100 */
+    jit_emit_u8(b, 0xc1);
+    jit_emit_u32(b, (uint32_t)disp);
+  }
+}
+
+/* shl r8, imm8 -- 4 bytes (49 C1 E0 imm8).  REX.B for R8. */
+static void emit_shl_r8(jit_buf *b, uint8_t imm) {
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0xc1);
+  jit_emit_u8(b, 0xe0);  /* mod=11 reg=/4(shl) r/m=000(R8 via REX.B) */
+  jit_emit_u8(b, imm);
+}
+
+/* cmp rdx, r8 -- 3 bytes (4C 39 C2).  REX.W + REX.R; opcode 0x39
+ * (cmp r/m64, r64); ModR/M=11 reg=000(R8) r/m=010(RDX). */
+static void emit_cmp_rdx_r8(jit_buf *b) {
+  jit_emit_u8(b, 0x4c);
+  jit_emit_u8(b, 0x39);
+  jit_emit_u8(b, 0xc2);
+}
+
+/* jae rel32 -- 6 bytes (0F 83 disp32).  Returns the offset of the
+ * disp32 placeholder for later patching. */
+static size_t emit_jae_rel32(jit_buf *b) {
+  jit_emit_u8(b, 0x0f);
+  jit_emit_u8(b, 0x83);
+  size_t patch = b->len;
+  jit_emit_u32(b, 0);
+  return patch;
+}
+
+/* shr rdx, imm8 -- 4 bytes (48 C1 EA imm8). */
+static void emit_shr_rdx(jit_buf *b, uint8_t imm) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0xc1);
+  jit_emit_u8(b, 0xea);  /* mod=11 reg=/5(shr) r/m=010(RDX) */
+  jit_emit_u8(b, imm);
+}
+
+/* add rax, rdx -- 3 bytes (48 01 D0).  REX.W; opcode 0x01;
+ * ModR/M=11 reg=010(RDX) r/m=000(RAX). */
+static void emit_add_rax_rdx(jit_buf *b) {
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x01);
+  jit_emit_u8(b, 0xd0);
+}
+
+void jit_emit_fxnlget(jit_buf *b, uint32_t dst, uint32_t src,
+                      uint32_t index_slot, void *heap0_addr_imm,
+                      void *fxnlget_helper, uint64_t fxnlget_packed) {
+  /* T_INT check on L[index_slot]. */
+  emit_mov_rdx_from_slot(b, (int)index_slot);
+  emit_test_dx_dx(b);
+  size_t to_slow_int = emit_jnz_rel32(b);
+
+  /* T_LIST check on L[src]. */
+  emit_mov_rax_from_slot(b, (int)src);
+  emit_cmp_ax_imm16(b, 0x13);   /* (T_LIST<<1)|T_HEAP = (9<<1)|1 */
+  size_t to_slow_list = emit_jnz_rel32(b);
+
+  /* Compute heap0 + gid_src*8 base. */
+  emit_shr_rax(b, 16);                                /* rax = gid_src */
+  emit_movabs_rcx_helper(b, (uint64_t)heap0_addr_imm,
+                         JIT_HELPER_AMP_HEAP0);
+  emit_mov_rcx_from_rcx_deref(b);                     /* rcx = heap0 */
+
+  /* Bounds check.  gc_head.size at offset -8 of the object data. */
+  emit_mov_r8d_from_rcx_rax_indexed8(b, -8);          /* r8d = LIST_SIZE */
+  emit_shl_r8(b, 16);                                 /* r8 = FXN(size) */
+  emit_cmp_rdx_r8(b);                                 /* rdx (FXN-idx) vs FXN(size) */
+  size_t to_slow_bounds = emit_jae_rel32(b);          /* idx >= size -> slow */
+
+  /* Fast path: rax = heap0[gid_src + idx]. */
+  emit_shr_rdx(b, 16);                                /* rdx = UNFXN(idx) */
+  emit_add_rax_rdx(b);                                /* rax = gid_src + idx */
+  emit_mov_rax_from_rcx_indexed8(b, 0);               /* rax = [rcx + rax*8] */
+  emit_mov_slot_from_rax(b, (int)dst);                /* L[dst] = rax */
+  size_t to_done = jit_emit_jmp(b);
+
+  /* Slow path: full helper call. */
+  jit_patch_jmp_here(b, to_slow_int);
+  jit_patch_jmp_here(b, to_slow_list);
+  jit_patch_jmp_here(b, to_slow_bounds);
+  b->pending_helper_id = JIT_HELPER_FXNLGET;
+  jit_emit_call_with_sbc(b, fxnlget_helper, fxnlget_packed);
 
   jit_patch_jmp_here(b, to_done);
 }
