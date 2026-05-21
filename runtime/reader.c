@@ -988,8 +988,13 @@ static dyn parse_suf_unary(pstate_t *p, dyn (*down)(pstate_t*),
           memcpy(buf, s, sl);
           buf[sl] = '_';
           buf[sl+1] = 0;
+          /* Bug #13 sibling: TEXT can GC; anchor `o` across the alloc
+           * and use LSET so the cross-gen write barrier fires when
+           * `o` has been promoted out of the nursery. */
+          gc_anchor_push(&o);
           dyn nv; TEXT(nv, buf);
-          LGET(o, 1) = nv;
+          LSET(o, 1, nv);
+          gc_anchor_pop_n(1);
           free(buf);
         }
       }
@@ -1021,8 +1026,11 @@ static dyn parse_suf_unary(pstate_t *p, dyn (*down)(pstate_t*),
     as = wrapper;
     an = 1;
   }
+  /* Bug #13 sibling: LIST can GC and promote `o`; same fix recipe. */
+  gc_anchor_push(&o);
   dyn ot_pair; LIST(ot_pair, 1); LGET(ot_pair, 0) = tok_type(o);
-  LGET(o, 6) = ot_pair;
+  LSET(o, 6, ot_pair);
+  gc_anchor_pop_n(1);
   // [O E @as]
   dyn full; LIST(full, an + 2);
   LGET(full, 0) = o;
@@ -1129,9 +1137,12 @@ static dyn parse_suf_loop(pstate_t *p, dyn (*down)(pstate_t*), dyn e) {
                   int n = snprintf(buf, sizeof(buf), "=%s",
                                    kvs ? kvs : "");
                   (void)n;
+                  /* Bug #13 sibling: TEXT may GC; barrier-correct store. */
+                  gc_anchor_push(&t);
                   dyn nv;
                   TEXT(nv, buf);
-                  LGET(t, 1) = nv;
+                  LSET(t, 1, nv);
+                  gc_anchor_pop_n(1);
                 }
               }
             }
@@ -1256,8 +1267,12 @@ static dyn binary_loop(pstate_t *p, op_pred_t ops_pred,
       memcpy(buf, s, sl);
       buf[sl] = '_';
       buf[sl+1] = 0;
+      /* Bug #13 sibling: TEXT may GC; anchor + LSET so the cross-gen
+       * write into a promoted `o` is dirty-marked. */
+      gc_anchor_push(&o);
       dyn nv; TEXT(nv, buf);
-      LGET(o, 1) = nv;
+      LSET(o, 1, nv);
+      gc_anchor_pop_n(1);
       free(buf);
       LIST(ne, 2); LGET(ne, 0) = o; LGET(ne, 1) = e;
     }

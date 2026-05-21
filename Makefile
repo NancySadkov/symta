@@ -198,6 +198,8 @@ test-runtime: runtime
 	@bash tests/runtime/lineno-check.sh
 	@echo "[run] tiny-gen0 GC regression test"
 	@bash tests/runtime/tiny-gen0.sh
+	@echo "[run] cross-gen-store GC regression test"
+	@bash tests/runtime/cross-gen-store.sh
 
 test-compiler: runtime
 	@echo "[run] compiler-output regression tests"

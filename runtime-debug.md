@@ -445,8 +445,19 @@ already know about the source.
 
 ### Resolved (kept for context)
 
+- **Bug #15** -- four NEW direct-`LGET`-store sites in
+  `reader.c` that shared bug #13's shape (`parse_suf_unary`
+  parsed-cache + value-mutation, `parse_suf_loop` `=method`-
+  name combiner, `binary_loop` no-right-operand append-`_`).
+  Found by sweeping every `LGET-as-store` across the runtime
+  (audit in `bugs-review.md`).  Fixed in commit `<TBD>` with
+  the same anchor + `LSET` recipe.  Pinned class-wide by the
+  new `tests/runtime/cross-gen-store.sh` regression test
+  (150 bracket-literal tokens under tiny gen0; reverting any
+  of the four LSETs back to a raw LGET store reproduces a
+  deterministic SEGV).
 - **Bug #14** -- the JIT api.args corruption crash under
-  `--jit` on game compile.  Fixed in commit `<TBD>` by
+  `--jit` on game compile.  Fixed in commit `9f3ae76` by
   reordering `STARG` reads to happen *after* `ARGLIST` in
   `jit_rt_immeq_impl` / `jit_rt_immne_impl` /
   `jit_rt_fxnlset_impl` / `jit_rt_fxnlsetir_impl`.  Pre-fix
