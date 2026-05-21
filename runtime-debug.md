@@ -323,35 +323,72 @@ should be the first stop when a regression surfaces.  Each entry
 records the minimal trigger, the surface symptom, and what we
 already know about the source.
 
-### Bug #14 (P0, blocking) -- JIT corrupts compiler.sbc on game build
+### Bug #14 (P1, near-heisenbug) -- JIT mis-sets api.args during compile
 
-- **Trigger.**  `rm -rf game/cache game/sbc; bash game/build.sh`
-  (which invokes `../symta/symta --jit ./`) on a clean tree
-  crashes during `ui/site` macroexpansion with:
-  `no has no method ` + "`n`" + ` object=000000000000001c (tag=14)`.
-- **Surface.**  Symta stack: `qlmb_supply_cvars:204,23` reading
-  `QL.its` and getting `T_NO` instead of a list, then `.n`
-  dispatches to `no.n` which doesn't exist.
-- **Bisect.**  Introduced by commit `0b2d433`
-  ("JIT phase 1 closeout").  That single commit added JIT
-  translations for FXNLSET / OBJECT / ARGLIST{,8} / DMET /
-  TINIT{,I} / SUBTYPE / CURMET / MNAME / FADD..FDIV.
-  Selectively disabling each of FXNLSET, OBJECT, ARGLIST,
-  ARGLIST8, DMET, CURMET, MNAME (or all six together) did **not**
-  move the bug -- so the culprit is one of the remaining new
-  translations (TINIT, TINITI, SUBTYPE, FADD..FDIV) or a subtle
-  interaction with an older translation.
-- **What we know.**  The error fires only under `--jit`;
-  `--no-jit` builds the game cleanly in ~20 s.  Runtime is
-  unaffected (no game binary runs the JIT directly; only the
-  compiler does).  Workaround in `game/build.sh` -- commit
-  `1b2c8e4` switches it to `--no-jit`.
-- **Next experiments.**  Add env flags for TINIT / TINITI /
-  SUBTYPE / FADD / FSUB / FMUL / FDIV (mirror the FXNLSET
-  scaffolding) and bisect through the remaining set.  If still
-  no single-opcode hit, the bug is interactional and we need a
-  JIT trace (log every translated opcode + RIP at execution
-  time) to compare against the interpreter run on the same SBC.
+- **Trigger.**  Set `game/build.sh` back to `--jit` (or pass it
+  manually), then `rm -rf game/cache game/sbc; bash build.sh`.
+  Crashes during macroexpansion with a "has no method" error
+  on a `No` (tag-14) object.  The exact callee and
+  missing-method vary between binary layouts:
+  - `qlmb_supply_cvars:204` calling `.n` on `No` (current main).
+  - `ssa_mark` receiving `Name = No` (commit `f7885bd` era).
+  - other `expand_block_item_qlmb` chains in past runs.
+- **Confessed shape (per commit `f7885bd`'s message).**
+  "the caller chain `ssa_form -> fn.() -> <wrapper> -> ssa_mark`
+  **mis-set `api.args[0]` somewhere in the JIT'd `ssa_form`'s
+  body**".  The bug isn't a regression from a single recent
+  commit -- it's a pre-existing, allocation-pattern-sensitive
+  api.args-management bug in the JIT'd `ARGLIST + CALL` /
+  `MCALL` sequence.  Commit `2db44fb`'s message: "the bug is
+  allocation-pattern-sensitive and may resurface".  Whether it
+  fires depends on the symta.exe link layout (which shifts
+  heap base addresses and timing).
+- **What we know.**
+  - Reproduces only under `--jit`.  `--no-jit` builds cleanly
+    in ~20 s.  The compiled game's runtime never enters the
+    JIT, so the workaround ships correct output.
+  - **Bisect is unreliable here.**  Committed `sbc/` files
+    drift across history (commits `5659713..1ff250e` had
+    progressively larger SBCs from one bootstrap; `237c89f`
+    spiked to 424 KB; `0666c3b..a2bdcf9` reverted; `0b2d433`
+    spiked again; `970c3ad` "refresh SBCs" caught up).  A
+    "good"/"bad" answer per commit reflects whether the
+    committed SBC matches that commit's binary, not whether
+    the JIT itself works.  A clean rebuild at `970c3ad`
+    happens to pass; at `2db44fb`, `1ca8e6e`, current main
+    happen to fail -- consistent with the
+    allocation-pattern-sensitive shape.
+  - Individually disabling each new JIT translation
+    (`SYMTA_NO_FXNLSET` / `SYMTA_NO_OBJECT` / `SYMTA_NO_ARGLIST`
+    / `SYMTA_NO_DMET` / `SYMTA_NO_CURMET` / `SYMTA_NO_MNAME` /
+    `SYMTA_NO_SUBTYPE` / `SYMTA_NO_TINIT` / `SYMTA_NO_FARITH`)
+    does NOT fix the bug.  All nine together also doesn't.  So
+    the bug is in an older translation or in shared
+    helper-trampoline code (`jit_emit_call_helper3` /
+    `jit_emit_call_with_sbc{,2}`), or in `api.args` setup.
+  - Workaround in `game/build.sh` (commit `1b2c8e4`): `--no-jit`.
+- **Next experiments.**
+  - Snapshot `api.args[0..n]` at the entry of every wrapper /
+    closure-body under both `--jit` and `--no-jit`; diff the
+    traces to find the first divergent slot.
+  - Audit `jit_emit_call_helper3` / `jit_emit_call_with_sbc{,2}`
+    for a missing save/restore around the helper call.  If
+    the helper clobbers something that the post-call code
+    expects intact (e.g. a register holding the args list),
+    every subsequent CALL in the same SBC would see the wrong
+    value -- matches the
+    "later-call-receives-No" shape.
+  - Try disabling JIT for `CALL` / `MCALL` specifically (not
+    just the arg-list opcodes).  If that fixes it, the bug is
+    in the call-emit path.
+  - Reproduce on Linux to check platform-specific helper-
+    trampoline differences (SEH-aware Windows vs POSIX).
+- **Categorisation.**  Sits right on the heisenbug boundary.
+  Strictly speaking it's deterministic given a fixed binary
+  layout, but the layout itself shifts with every source
+  change, so the bug acts like an intermittent.  Apply the
+  exclude-environmental-causes checklist if you see it on a
+  user's machine and nowhere else.
 
 ### Bug #13 (P1) -- tiny-gen0 secondary GC corruption
 

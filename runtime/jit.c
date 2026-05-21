@@ -1217,6 +1217,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_FXNLSET: {
+      if (getenv("SYMTA_NO_FXNLSET")) { jit_last_fail_opcode = op;
+                                         jit_last_fail_offset = i;
+                                         fail = 1; goto done; }
       /* SBC_FXNLSET: opcode + dst(u16) + src(u16) + index(u16) +
        * val(u16) + mcache_idx(u16) = 11 bytes.  5 operands don't
        * fit in one u64, so we use the 2-arg-packed trampoline.
@@ -1244,6 +1247,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_OBJECT: {
+      if (getenv("SYMTA_NO_OBJECT")) { jit_last_fail_opcode = op;
+                                       jit_last_fail_offset = i;
+                                       fail = 1; goto done; }
       /* SBC_OBJECT: opcode + dst(u16) + tid(u16) + size(u16) = 7
        * bytes.  Allocates a `size`-slot heap object with type
        * sbc->ty[tid], or MKIMM for size==0.  Needs sbc context. */
@@ -1266,6 +1272,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_ARGLIST: case BC_ARGLIST8: {
+      if (getenv("SYMTA_NO_ARGLIST")) { jit_last_fail_opcode = op;
+                                         jit_last_fail_offset = i;
+                                         fail = 1; goto done; }
       /* SBC_ARGLIST  (0x15): opcode + size(u16) + size*u16 src
        * SBC_ARGLIST8 (0x16): opcode + size(u8)  + size*u8  src
        *
@@ -1328,6 +1337,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_SUBTYPE: {
+      if (getenv("SYMTA_NO_SUBTYPE")) { jit_last_fail_opcode = op;
+                                         jit_last_fail_offset = i;
+                                         fail = 1; goto done; }
       /* SBC_SUBTYPE: opcode + super(u16) + sub(u16) = 5 bytes.
        * Calls add_subtype((int)sbc->ty[super], (int)sbc->ty[sub]). */
       if (i + 5 > n) { jit_last_fail_opcode = op;
@@ -1348,6 +1360,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_MNAME: {
+      if (getenv("SYMTA_NO_MNAME")) { jit_last_fail_opcode = op;
+                                       jit_last_fail_offset = i;
+                                       fail = 1; goto done; }
       /* SBC_MNAME: opcode + dst(u16) + src(u16) = 5 bytes.
        * L[dst] = get_method_name(UNFXN(L[src])). */
       if (i + 5 > n) { jit_last_fail_opcode = op;
@@ -1365,6 +1380,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_TINIT: {
+      if (getenv("SYMTA_NO_TINIT")) { jit_last_fail_opcode = op;
+                                       jit_last_fail_offset = i;
+                                       fail = 1; goto done; }
       /* SBC_TINIT: opcode + type(u16) + size(u16) + name(u24) =
        * 8 bytes.  Body: set_type_size_and_name(sbc->ty[type],
        * size, sbc->tx[name]).  All fields fit in one u64. */
@@ -1387,6 +1405,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_TINITI: {
+      if (getenv("SYMTA_NO_TINIT")) { jit_last_fail_opcode = op;
+                                       jit_last_fail_offset = i;
+                                       fail = 1; goto done; }
       /* SBC_TINITI: opcode + tag(u16) + size(u16) + name(u64) =
        * 13 bytes.  Runtime calls set_type_size_and_name(
        * sbc->ty[tag], size, name).  Two packed u64s. */
@@ -1410,6 +1431,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_CURMET: {
+      if (getenv("SYMTA_NO_CURMET")) { jit_last_fail_opcode = op;
+                                         jit_last_fail_offset = i;
+                                         fail = 1; goto done; }
       /* SBC_CURMET: opcode + dst(u16) = 3 bytes.  L[dst] =
        * currently executing method (api.curmet). */
       if (i + 3 > n) { jit_last_fail_opcode = op;
@@ -1426,6 +1450,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_FADD: case BC_FSUB: case BC_FMUL: case BC_FDIV: {
+      if (getenv("SYMTA_NO_FARITH")) { jit_last_fail_opcode = op;
+                                        jit_last_fail_offset = i;
+                                        fail = 1; goto done; }
       /* Typed-float arith.  Wire: opcode + dst(u16) + a(u16) +
        * b(u16) = 7 bytes.  Operands are statically known T_FLOAT;
        * no tag check or MCALL fallback.  Helper3 trampoline.
@@ -1454,6 +1481,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_DMET: {
+      if (getenv("SYMTA_NO_DMET")) { jit_last_fail_opcode = op;
+                                       jit_last_fail_offset = i;
+                                       fail = 1; goto done; }
       /* SBC_DMET: opcode + tyidx(u16) + mtidx(u24) + handler(u16)
        * = 8 bytes.  Runtime add_method using sbc-side type + mt
        * tables.  Packed: [15:0]=tyidx [39:16]=mtidx [55:40]=handler. */
