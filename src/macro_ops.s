@@ -108,10 +108,18 @@ times Var Count Body =
       [`,` X Y] =  ret: form: times X W: times Y H Body
       Else =  ret: form: times ~X W: times ~Y H: `|` (I ~X,~Y) Body
   N @rand 'N'
+  // jit-todo Phase 3: counter I starts at 0 and increments by 1
+  // each iter, N is asserted T_INT by `when [_tag N]: fatal`.
+  // Emit `_ilt` (typed compare) instead of `_lt` so the JIT skips
+  // the per-iter tag check on the loop edge.  Kept `_inc I` (not
+  // `_iadd I 1`) -- empirically `_iadd I 1` is slower because it
+  // requires an extra `LDFXN K 1` opcode per iteration, while
+  // `_inc` is a single typed-aware opcode that the JIT inlines
+  // with one tag check (~3 cycles) + an add.
   ['|' [N Count]
        [I [0]]
        [when [_tag N] [_fatal 'times: bad loop count']]
-       (expand_loop [_lt I N] [_set I [_inc I]] Body)]
+       (expand_loop [_ilt I N] [_set I [_inc I]] Body)]
 
 expand_dup Var Count Body =
 | if Var><No: less Body.is_list:
@@ -121,12 +129,16 @@ expand_dup Var Count Body =
 | I if got Var then Var else @rand 'I'
 | N @rand 'N'
 | Ys @rand 'Ys'
+// jit-todo Phase 3: same rationale as `times` -- N is asserted T_INT
+// by `when [_tag N]: fatal`, counter I starts at 0 and increments by
+// 1, so the loop edge can use `_ilt` (typed compare).  Body's `_lset`
+// / `_inc` already inline a T_INT fast path in the JIT; no change.
 | ['|' [N Count]
        [I [0]]
        [when [_add [_tag N] [_lt N 0]]
          [_fatal 'dup: bad loop count']]
        [Ys [_listn N]]
-       [while [_lt I N]
+       [while [_ilt I N]
          ['|' [_lset Ys I Body]
               [_set I [_inc I]]]]
        Ys]
