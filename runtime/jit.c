@@ -148,29 +148,209 @@ static void emit_mem_op(jit_buf *b, uint8_t reg_field, int slot) {
   }
 }
 
-/* mov rax, [locals_reg + slot*8] */
+/* ============================================================
+ * Phase 2a register allocation primitives.
+ *
+ * The slot-access primitives below (emit_mov_rax_from_slot, etc.)
+ * all consult b->pinned[] via `jit_slot_reg(b, slot)`.  If the
+ * requested slot is mapped to a callee-saved register (R13, R14,
+ * or R15), the primitive emits a register-to-register move via
+ * the `_from_reg` / `_from_reg` helpers below instead of the
+ * memory load/store.  Helper callers (jit_emit_call_helper3 et
+ * al.) wrap their inner CALL with `emit_spill_pinned` /
+ * `emit_reload_pinned` so the L[] memory image is consistent
+ * with the in-register copies across the helper boundary.
+ *
+ * Invariant: between any two opcode emissions (and on entry to
+ * every helper call after the wrapper's spill), R<reg> holds
+ * the current value of L[slot] for each (slot, reg) in
+ * b->pinned[].
+ * ============================================================ */
+
+/* Returns the x86 register number (13..15) that the given SBC
+ * slot is pinned to, or -1 if the slot lives in memory. */
+static int jit_slot_reg(jit_buf *b, int slot) {
+  for (int i = 0; i < b->pinned_count; i++) {
+    if (b->pinned[i].slot == slot) return (int)b->pinned[i].reg;
+  }
+  return -1;
+}
+
+/* All register-to-register helpers below assume `reg` is 13, 14,
+ * or 15.  Encoding builds on REX.B / REX.R prefixes to extend
+ * the 3-bit ModR/M.reg or ModR/M.r/m field to 4 bits. */
+
+/* mov rax, R<reg>   --   4C 89 (C0 | ((reg-8)<<3))   3 bytes */
+static void emit_mov_rax_from_reg(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x4c);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, (uint8_t)(0xc0 | ((reg - 8) << 3)));
+}
+
+/* mov R<reg>, rax   --   49 89 (C0 | (reg-8))        3 bytes */
+static void emit_mov_reg_from_rax(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, (uint8_t)(0xc0 | (reg - 8)));
+}
+
+/* mov R<reg>, rdx   --   49 89 (D0 | (reg-8))        3 bytes */
+static void emit_mov_reg_from_rdx(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, (uint8_t)(0xd0 | (reg - 8)));
+}
+
+/* mov rdx, R<reg>   --   4C 89 (C2 | ((reg-8)<<3))   3 bytes */
+static void emit_mov_rdx_from_reg(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x4c);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, (uint8_t)(0xc2 | ((reg - 8) << 3)));
+}
+
+/* add rax, R<reg>   --   49 03 (C0 | (reg-8))        3 bytes */
+static void emit_add_rax_from_reg(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x03);
+  jit_emit_u8(b, (uint8_t)(0xc0 | (reg - 8)));
+}
+
+/* sub rax, R<reg>   --   49 2B (C0 | (reg-8))        3 bytes */
+static void emit_sub_rax_from_reg(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x2b);
+  jit_emit_u8(b, (uint8_t)(0xc0 | (reg - 8)));
+}
+
+/* or  rax, R<reg>   --   49 0B (C0 | (reg-8))        3 bytes */
+static void emit_or_rax_from_reg(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x0b);
+  jit_emit_u8(b, (uint8_t)(0xc0 | (reg - 8)));
+}
+
+/* cmp rax, R<reg>   --   49 3B (C0 | (reg-8))        3 bytes */
+static void emit_cmp_rax_from_reg(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x3b);
+  jit_emit_u8(b, (uint8_t)(0xc0 | (reg - 8)));
+}
+
+/* imul rax, R<reg>  --   49 0F AF (C0 | (reg-8))    4 bytes */
+static void emit_imul_rax_from_reg(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x0f);
+  jit_emit_u8(b, 0xaf);
+  jit_emit_u8(b, (uint8_t)(0xc0 | (reg - 8)));
+}
+
+/* idiv R<reg>       --   49 F7 (F8 | (reg-8))        3 bytes
+ *   ModR/M: mod=11, reg=/7 (idiv), r/m=R<reg>[0:2]. */
+static void emit_idiv_from_reg(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0xf7);
+  jit_emit_u8(b, (uint8_t)(0xf8 | (reg - 8)));
+}
+
+/* cmp R<reg>, 0     --   49 83 (F8 | (reg-8)) 00    4 bytes
+ *   ModR/M: mod=11, reg=/7 (cmp imm), r/m=R<reg>[0:2]. */
+static void emit_cmp_reg_zero(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x83);
+  jit_emit_u8(b, (uint8_t)(0xf8 | (reg - 8)));
+  jit_emit_u8(b, 0x00);
+}
+
+/* Spill every pinned register back to its L[slot] memory cell.
+ * Called immediately before a helper invocation so the helper
+ * reads the up-to-date value of every pinned slot when it
+ * dereferences L[slot] directly.
+ *
+ * 7 bytes per pinned slot (disp8 form):
+ *   REX.B + opcode 89 + ModR/M(SIB?) + disp
+ *   `mov [rbx + slot*8], R<reg>` -- since reg is R13..R15 we
+ *   need REX.R=1 and the SIB-less form for low slot indices.
+ * Larger disp32 form is 10 bytes per slot. */
+static void emit_spill_pinned(jit_buf *b) {
+  for (int i = 0; i < b->pinned_count; i++) {
+    int reg = b->pinned[i].reg;
+    int slot = b->pinned[i].slot;
+    /* mov [rbx + slot*8], R<reg>:
+     *   REX = 0x4C (W=1, R=1 for R13..R15 as the reg field)
+     *   opcode = 0x89 (mov r/m64, r64)
+     *   ModR/M: mod=01/10, reg=R<reg>[0:2], r/m=011(RBX)
+     */
+    int32_t disp = (int32_t)slot * 8;
+    jit_emit_u8(b, 0x4c);
+    jit_emit_u8(b, 0x89);
+    uint8_t reg_field = (uint8_t)((reg - 8) & 7);
+    if (disp >= -128 && disp <= 127) {
+      jit_emit_u8(b, (uint8_t)(0x40 | (reg_field << 3) | 3));  /* mod=01 r/m=011 */
+      jit_emit_u8(b, (uint8_t)(int8_t)disp);
+    } else {
+      jit_emit_u8(b, (uint8_t)(0x80 | (reg_field << 3) | 3));  /* mod=10 r/m=011 */
+      jit_emit_u32(b, (uint32_t)disp);
+    }
+  }
+}
+
+/* Mirror of emit_spill_pinned: reload each pinned register from
+ * its L[slot] memory cell.  Called immediately after a helper
+ * returns so any L[] updates the helper made (including GC moves
+ * of heap refs in pinned slots) are reflected in the registers.
+ *
+ * 7 bytes per pinned slot (disp8): same shape as spill but
+ * opcode 0x8B (mov r64, r/m64). */
+static void emit_reload_pinned(jit_buf *b) {
+  for (int i = 0; i < b->pinned_count; i++) {
+    int reg = b->pinned[i].reg;
+    int slot = b->pinned[i].slot;
+    int32_t disp = (int32_t)slot * 8;
+    jit_emit_u8(b, 0x4c);
+    jit_emit_u8(b, 0x8b);
+    uint8_t reg_field = (uint8_t)((reg - 8) & 7);
+    if (disp >= -128 && disp <= 127) {
+      jit_emit_u8(b, (uint8_t)(0x40 | (reg_field << 3) | 3));
+      jit_emit_u8(b, (uint8_t)(int8_t)disp);
+    } else {
+      jit_emit_u8(b, (uint8_t)(0x80 | (reg_field << 3) | 3));
+      jit_emit_u32(b, (uint32_t)disp);
+    }
+  }
+}
+
+/* mov rax, [locals_reg + slot*8]   (or "mov rax, R<reg>" if pinned) */
 static void emit_mov_rax_from_slot(jit_buf *b, int slot) {
+  int r = jit_slot_reg(b, slot);
+  if (r >= 0) { emit_mov_rax_from_reg(b, r); return; }
   jit_emit_u8(b, 0x48);  /* REX.W */
   jit_emit_u8(b, 0x8b);  /* opcode: mov r64, r/m64 */
   emit_mem_op(b, 0, slot);  /* reg=RAX (0) */
 }
 
-/* mov [locals_reg + slot*8], rax */
+/* mov [locals_reg + slot*8], rax   (or "mov R<reg>, rax" if pinned) */
 static void emit_mov_slot_from_rax(jit_buf *b, int slot) {
+  int r = jit_slot_reg(b, slot);
+  if (r >= 0) { emit_mov_reg_from_rax(b, r); return; }
   jit_emit_u8(b, 0x48);  /* REX.W */
   jit_emit_u8(b, 0x89);  /* opcode: mov r/m64, r64 */
   emit_mem_op(b, 0, slot);  /* reg=RAX (0) */
 }
 
-/* mov [locals_reg + slot*8], rdx (for IREM remainder) */
+/* mov [locals_reg + slot*8], rdx (for IREM remainder)
+ * (or "mov R<reg>, rdx" if pinned). */
 static void emit_mov_slot_from_rdx(jit_buf *b, int slot) {
+  int r = jit_slot_reg(b, slot);
+  if (r >= 0) { emit_mov_reg_from_rdx(b, r); return; }
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x89);
   emit_mem_op(b, 2, slot);  /* reg=RDX (2) */
 }
 
-/* add rax, [locals_reg + slot*8] */
+/* add rax, [locals_reg + slot*8]   (or "add rax, R<reg>" if pinned) */
 static void emit_add_rax_from_slot(jit_buf *b, int slot) {
+  int r = jit_slot_reg(b, slot);
+  if (r >= 0) { emit_add_rax_from_reg(b, r); return; }
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x03);  /* opcode: add r64, r/m64 */
   emit_mem_op(b, 0, slot);
@@ -179,8 +359,11 @@ static void emit_add_rax_from_slot(jit_buf *b, int slot) {
 /* or rax, [locals_reg + slot*8] -- combines tag bits across two
  * operands so a single tag check covers both.  Used for the
  * inline fast path of FXN-arith / FXN-cmp: if (aa|bb) has any
- * tag bits set, fall through to the helper. */
+ * tag bits set, fall through to the helper.
+ * (Or "or rax, R<reg>" if pinned.) */
 static void emit_or_rax_from_slot(jit_buf *b, int slot) {
+  int r = jit_slot_reg(b, slot);
+  if (r >= 0) { emit_or_rax_from_reg(b, r); return; }
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x0b);  /* opcode: or r64, r/m64 */
   emit_mem_op(b, 0, slot);
@@ -215,23 +398,31 @@ static size_t emit_jnz_rel32(jit_buf *b) {
   return patch;
 }
 
-/* sub rax, [locals_reg + slot*8] */
+/* sub rax, [locals_reg + slot*8]   (or "sub rax, R<reg>" if pinned) */
 static void emit_sub_rax_from_slot(jit_buf *b, int slot) {
+  int r = jit_slot_reg(b, slot);
+  if (r >= 0) { emit_sub_rax_from_reg(b, r); return; }
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x2b);  /* opcode: sub r64, r/m64 */
   emit_mem_op(b, 0, slot);
 }
 
-/* imul rax, [locals_reg + slot*8] (2-operand form, low 64 bits) */
+/* imul rax, [locals_reg + slot*8] (2-operand form, low 64 bits)
+ * (or "imul rax, R<reg>" if pinned). */
 static void emit_imul_rax_from_slot(jit_buf *b, int slot) {
+  int r = jit_slot_reg(b, slot);
+  if (r >= 0) { emit_imul_rax_from_reg(b, r); return; }
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x0f);
   jit_emit_u8(b, 0xaf);  /* opcode: imul r64, r/m64 */
   emit_mem_op(b, 0, slot);
 }
 
-/* idiv qword [locals_reg + slot*8] (signed, RDX:RAX / mem -> RAX, RDX) */
+/* idiv qword [locals_reg + slot*8] (signed, RDX:RAX / mem -> RAX, RDX)
+ * (or "idiv R<reg>" if pinned). */
 static void emit_idiv_from_slot(jit_buf *b, int slot) {
+  int r = jit_slot_reg(b, slot);
+  if (r >= 0) { emit_idiv_from_reg(b, r); return; }
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0xf7);
   emit_mem_op(b, 7, slot);  /* /7 = idiv */
@@ -2466,6 +2657,21 @@ void jit_emit_call_abs(jit_buf *b, void *target) {
    * for any target regardless of its distance from the JIT'd
    * code.
    *
+   * Phase 2a register allocation: spill every pinned register
+   * to its L[slot] memory cell BEFORE the call so the helper
+   * sees the latest value if it dereferences L[slot] directly,
+   * and reload AFTER the call so any helper updates to L[]
+   * (including GC moves of heap refs the helper triggered) are
+   * visible in the in-register copies.  R13..R15 are
+   * callee-saved per Win64 + SysV so the register bytes
+   * themselves survive the call; the spill/reload protects
+   * against the helper inspecting L[] through its `int64_t *L`
+   * argument.
+   *
+   * The spill/reload is a no-op when b->pinned_count == 0
+   * (the loops in emit_spill_pinned / emit_reload_pinned
+   * iterate over a zero-length array).
+   *
    * Reloc recording: when b->record_relocs is on, we log the
    * imm64's byte offset together with b->pending_helper_id so
    * the loader can patch this site without re-translating the
@@ -2475,6 +2681,7 @@ void jit_emit_call_abs(jit_buf *b, void *target) {
    * forgets to set it, we still log the offset but with
    * JIT_HELPER_NONE so the writer can flag the missing
    * mapping at build time. */
+  emit_spill_pinned(b);
   uint64_t v = (uint64_t)target;
   uint32_t imm_off = (uint32_t)(b->len + 2);  /* 2 bytes of REX+opcode prefix */
   jit_emit_u8(b, 0x48);
@@ -2487,6 +2694,7 @@ void jit_emit_call_abs(jit_buf *b, void *target) {
     jit_record_reloc(b, imm_off, b->pending_helper_id);
     b->pending_helper_id = JIT_HELPER_NONE;
   }
+  emit_reload_pinned(b);
 }
 
 /* Step 5c helpers: per-platform mov r32, imm32 emitters.
@@ -2700,6 +2908,8 @@ void jit_emit_call_helper3(jit_buf *b, void *target,
 
 /* cmp rax, [locals_reg + slot*8] -- 48 3B + ModR/M + disp */
 static void emit_cmp_rax_to_slot(jit_buf *b, int slot) {
+  int r = jit_slot_reg(b, slot);
+  if (r >= 0) { emit_cmp_rax_from_reg(b, r); return; }
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x3b);
   emit_mem_op(b, 0, slot);
@@ -2878,6 +3088,8 @@ void jit_emit_ld4(jit_buf *b, uint32_t dst, uint32_t src, uint32_t index,
 
 /* mov rdx, [rbx + slot*8] -- reg=010 (RDX). */
 static void emit_mov_rdx_from_slot(jit_buf *b, int slot) {
+  int r = jit_slot_reg(b, slot);
+  if (r >= 0) { emit_mov_rdx_from_reg(b, r); return; }
   jit_emit_u8(b, 0x48);  /* REX.W */
   jit_emit_u8(b, 0x8b);  /* opcode: mov r64, r/m64 */
   emit_mem_op(b, 2, slot);  /* reg=RDX (2) */
@@ -3226,6 +3438,8 @@ size_t jit_emit_jmp(jit_buf *b) {
  * against zero so the following jcc tests slot truthiness.
  * Encoding: 48 83 + ModR/M(/7) + disp + imm8(0). */
 static void emit_cmp_slot_zero(jit_buf *b, int slot) {
+  int r = jit_slot_reg(b, slot);
+  if (r >= 0) { emit_cmp_reg_zero(b, r); return; }
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x83);
   emit_mem_op(b, 7, slot);  /* /7 = cmp imm */

@@ -137,6 +137,33 @@ typedef struct {
   uint8_t  pad[3];
 } jit_reloc_t;
 
+/* Phase 2a register allocation: pin up to JIT_MAX_PINNED locals
+ * to callee-saved registers (R13, R14, R15 on Win64 + SysV) so
+ * the hot path of typed-int loops avoids a memory round-trip per
+ * arithmetic opcode.  RBX and R12 are already reserved for L and
+ * sbc respectively, so R13..R15 are the three free callee-saved
+ * GPRs we get for "free" -- they survive every helper call by ABI.
+ *
+ * Each entry records the SBC slot index (0..65535) and the
+ * physical x86 register number (13, 14, or 15).  The slot-access
+ * emit primitives consult this map: if the requested slot is
+ * pinned, they emit register-to-register moves instead of
+ * memory ops.
+ *
+ * Invariant: between any two opcodes (and on entry to every
+ * helper call after the wrapper's spill), `R<reg>` holds the
+ * current value of `L[slot]`.  The slot-access primitives
+ * preserve this; the helper-call wrappers spill before the call
+ * (in case the helper reads L[] directly) and reload after (in
+ * case the helper mutated L[] -- including via GC moving a heap
+ * ref). */
+#define JIT_MAX_PINNED 3
+typedef struct {
+  int32_t slot;    /* SBC slot index, or -1 if this entry is unused */
+  uint8_t reg;     /* x86 register number: 13, 14, or 15 */
+  uint8_t pad[3];
+} jit_pinned_t;
+
 typedef struct jit_buf {
   uint8_t *code;          /* base of the executable mapping */
   size_t cap;             /* total bytes mapped */
@@ -157,6 +184,14 @@ typedef struct jit_buf {
   jit_reloc_t *relocs;
   int relocs_count;
   int relocs_cap;
+
+  /* Phase 2a register allocation.  Populated by
+   * jit_select_pinned_slots before emission begins; consulted by
+   * the slot-access primitives during emission.  An entry with
+   * `slot == -1` is unused.  `pinned_count` is the number of
+   * entries in use (0..JIT_MAX_PINNED). */
+  jit_pinned_t pinned[JIT_MAX_PINNED];
+  int pinned_count;
 } jit_buf;
 
 /* Allocate an executable buffer of `cap` bytes.  Returns NULL on
