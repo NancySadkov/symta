@@ -695,7 +695,6 @@ static dyn parse_term(pstate_t *p) {
     }
     dyn head = mk_token(KW_symbol, quote_text,
                         tok_row(tok), tok_col(tok), tok_orig(tok), 0);
-    // For each inner element, decide whether to wrap it.
     dyn *items = 0;
     arrput(items, head);
     for (uint64_t i = 0; i < in; i++) {

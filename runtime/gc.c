@@ -11,6 +11,10 @@
 #include "am.h"
 #include "sif.h"   /* RT-6b: need sbc_t for mcache GC tracing */
 #include "meta_table.h"
+#ifdef WINDOWS
+/* For GetModuleHandleA in the BADSIZE debug path. */
+#include <windows.h>
+#endif
 
 static int gc_cycle = 0;
 
@@ -483,6 +487,30 @@ void gc() {
 
 void *gc_alloc(uint32_t tag, uint32_t size) {
   hg_t *hgp = api.hgp;
+
+  /* DEBUG (task #12 follow-on): under SYMTA_DUMP_SEGV, catch
+   * allocations with insane sizes BEFORE the underrun trashes the
+   * heap.  A typical bad call is `LIST(new, LIST_SIZE(corrupt))`
+   * where the source list's gc_head is garbage (the same stale-
+   * dyn pattern as the original bug, just surfacing via SIZE
+   * rather than VALUE this time). */
+  if (size > 0x100000 && getenv("SYMTA_DUMP_SEGV")) {
+#ifdef WINDOWS
+    void *ib = GetModuleHandleA(NULL);
+#else
+    void *ib = 0;
+#endif
+    fprintf(stderr,
+            "[BADSIZE] gc_alloc(tag=%u, size=%u) -- absurd size\n"
+            "[BADSIZE]   caller=%p ImageBase=%p offset=%p\n",
+            tag, size,
+            __builtin_return_address(0),
+            ib,
+            ib ? (void*)((uintptr_t)__builtin_return_address(0) -
+                          (uintptr_t)ib) : (void*)0);
+    fflush(stderr);
+    abort();
+  }
 
   void *r = hgp->top - size;
   gc_head_t *h = (gc_head_t*)r - 1;

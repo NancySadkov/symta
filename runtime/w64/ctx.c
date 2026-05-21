@@ -98,6 +98,33 @@ static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *ExceptionInfo) 
     error.id = CTXE_ACCESS;
     error.text = "access violation";
     error.mem = (void*)ExceptionInfo->ExceptionRecord->ExceptionInformation[1];
+    /* DEBUG (task #12 follow-on): when SYMTA_DUMP_SEGV is set, dump
+     * the faulting instruction's address and full GPR state.  This
+     * lets us correlate the segfault site to a C builtin and from
+     * there to the slot that held the bad dyn. */
+    if (getenv("SYMTA_DUMP_SEGV")) {
+      CONTEXT *c = ExceptionInfo->ContextRecord;
+      fprintf(stderr,
+              "[SEGV] access %s @ %p  rip=%016llx\n"
+              "[SEGV]   rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n"
+              "[SEGV]   rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n"
+              "[SEGV]    r8=%016llx  r9=%016llx r10=%016llx r11=%016llx\n"
+              "[SEGV]   r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n"
+              "[SEGV]   ImageBase=%p\n",
+              (ExceptionInfo->ExceptionRecord->ExceptionInformation[0]
+                ? "WRITE" : "READ"),
+              error.mem, (unsigned long long)c->Rip,
+              (unsigned long long)c->Rax, (unsigned long long)c->Rbx,
+              (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
+              (unsigned long long)c->Rsi, (unsigned long long)c->Rdi,
+              (unsigned long long)c->Rbp, (unsigned long long)c->Rsp,
+              (unsigned long long)c->R8,  (unsigned long long)c->R9,
+              (unsigned long long)c->R10, (unsigned long long)c->R11,
+              (unsigned long long)c->R12, (unsigned long long)c->R13,
+              (unsigned long long)c->R14, (unsigned long long)c->R15,
+              (void*)GetModuleHandleA(NULL));
+      fflush(stderr);
+    }
     break;
   case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
     error.id = CTXE_OTHER;

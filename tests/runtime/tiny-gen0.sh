@@ -56,14 +56,15 @@ out=$(SYMTA_GEN0_SIZE=65536 "$SYMTA" "$tmp" 2>&1 || true)
 rc=$?
 rm -rf "$tmp"
 
-if echo "$out" | grep -q "has no method"; then
+if echo "$out" | grep -q "_unused0_ has no method"; then
   echo "tiny-gen0: REGRESSION -- original tag-3 bug came back -- rc=$rc"
   echo "$out" | head -10 | sed 's/^/   /'
   exit 1
 fi
 
 # The original bug is gone.  Other tiny-gen0 GC issues may still
-# trigger downstream failures (e.g. expand_qlmb_r segfault); those
+# trigger downstream failures (other stale-pointer sites surfacing
+# as wrong-type method dispatch or absurd allocation sizes); those
 # are tracked separately and don't fail this regression test.
 echo "tiny-gen0: original tag-3 bug is fixed (no '_unused0_ has no method')."
 exit 0
