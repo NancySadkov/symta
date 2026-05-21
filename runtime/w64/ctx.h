@@ -34,4 +34,15 @@ void *ctx_ip(void *ctx); /* gets instruction pointer */
 void *ctx_sp(void *ctx); /* gets stack pointer */
 void ctx_set_error_handler(int (*error_handler)(ctx_error_t *info));
 
+/* DEBUG (task #12): install a write watchpoint on the 8 bytes at
+ * `addr`.  Pass target_value=0 to log every write that hits the
+ * address; pass nonzero to log+abort only when the post-write value
+ * matches target_value.  Returns 0 on failure (GetThreadContext or
+ * SetThreadContext error).  Only one watchpoint at a time; calling
+ * again clobbers the previous one. */
+#include <stdint.h>
+int ctx_set_write_watchpoint(void *addr, uint64_t target_value);
+int ctx_set_page_watchpoint(void *addr);
+void ctx_set_watch_target_value(uint64_t v);
+
 #endif /*  _CTX_H_ */

@@ -34,11 +34,11 @@ CP = cp -fp
 RM = rm -f
 
 SRCS = main.c gc.c ncm.c bltin.c tokenize.c reader.c meta_table.c ng.c \
-       sif.c fs.c sbc.c sif2sbc.c \
+       sif.c fs.c sbc.c sif2sbc.c jit.c jit_sbc.c \
        sffi/sffi.c sffi/arch_x64_sysv.c \
        linux/ctx.c linux/compat.c
 
-HDRSB = symta.h common.h ng.h prf.h dh.h ih.h th.h am.h nb.h nh.h fs.h sif.h flt16.h flt16_x86.h meta_table.h sffi/sffi.h
+HDRSB = symta.h common.h ng.h prf.h dh.h ih.h th.h am.h nb.h nh.h fs.h sif.h flt16.h flt16_x86.h meta_table.h sffi/sffi.h jit.h
 
 HDRS = $(addprefix runtime/,$(HDRSB))
 

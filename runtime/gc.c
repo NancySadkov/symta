@@ -9,9 +9,27 @@
 
 #include "common.h"
 #include "am.h"
+#include "sif.h"   /* RT-6b: need sbc_t for mcache GC tracing */
 #include "meta_table.h"
+#ifdef WINDOWS
+/* For GetModuleHandleA in the BADSIZE debug path. */
+#include <windows.h>
+#endif
 
 static int gc_cycle = 0;
+
+/* GC-roots stack for C code that holds heap dyns across potentially
+ * allocating callees.  Push with `gc_anchor_push(&local)`, pop with
+ * `gc_anchor_pop()`.  The slots are walked by gc_builtins so the GC
+ * forwards them after moves -- the C local sees the new pointer.
+ *
+ * Implementation: a stb_ds dynamic array of `dyn*`.  Both the array
+ * itself (off-heap) and the slots it points to (on the C stack) get
+ * scanned by GC each cycle. */
+static dyn **gc_anchors = 0;
+void gc_anchor_push(dyn *p) { arrput(gc_anchors, p); }
+void gc_anchor_pop(void)    { (void)arrpop(gc_anchors); }
+void gc_anchor_pop_n(int n) { while (n--) (void)arrpop(gc_anchors); }
 
 #define GC_AGE (api.hgp-1)->age
 
@@ -82,7 +100,48 @@ static void gcprint(char *fmt, ...) {
 static void gc_builtins(hg_t *src, hg_t *dst) {
   int i, j;
 
-  GC_REC(sink->fn,sink->fn);
+  /* DEBUG (task #12, behind SYMTA_SCAN_AST): walk frame locals at GC
+   * time looking for tag-3..5 / tag-7 dyns.  These are the truly-
+   * reserved tag slots; a heap dyn with one of these tags is the
+   * smoking gun.  Reports the first occurrence with frame fn and
+   * local index. */
+  static int scan_armed = -1;
+  if (scan_armed == -1) {
+    scan_armed = getenv("SYMTA_SCAN_AST") ? 1 : 0;
+  }
+  if (scan_armed) {
+    static int reported = 0;
+    if (!reported) {
+      for (frame_t *frm = api.frame; frm; frm = frm->prev) {
+        void **pv = FRAME_LOCALS(frm);
+        for (int idx = 0; idx < (int)frm->nvars; idx++) {
+          uint64_t v = (uint64_t)pv[idx];
+          if ((v & 1) && (((v >> 1) & 0x7FFF) >= 3) &&
+              (((v >> 1) & 0x7FFF) <= 7) &&
+              (((v >> 1) & 0x7FFF) != 6)) {
+            fn_meta_t *m = frm->clsr ? (fn_meta_t*)O_META(frm->clsr) : 0;
+            const char *fname = (m && m->name) ? (char*)m->name : "?";
+            fprintf(stderr,
+                    "[FRMSCAN] frame fn=%s L[%d] = %016llx (tag=%llu)\n",
+                    fname, idx, (unsigned long long)v,
+                    (unsigned long long)((v >> 1) & 0x7FFF));
+            fflush(stderr);
+            reported = 1;
+          }
+        }
+      }
+    }
+  }
+
+  /* C-side anchors: GC-traced slots that C functions holding heap
+   * dyns across allocating calls register via gc_anchor_push so
+   * their locals stay valid (the GC rewrites *p when the target
+   * moves).  Cheap when empty -- skipped without any iteration. */
+  for (int ai = 0; ai < arrlen(gc_anchors); ai++) {
+    dyn *p = gc_anchors[ai];
+    if (p) GC_REC(*p, *p);
+  }
+  GC_REC(sink, sink);  /* RT-6b: `sink` is now the dyn fn directly */
   GC_REC(api.empty_,api.empty_);
   GC_REC(main_args,main_args);
   GC_REC(api.jmp_return,api.jmp_return);
@@ -116,10 +175,31 @@ static void gc_builtins(hg_t *src, hg_t *dst) {
 
   if (src->dirty&DRT_TYPE_METHODS) {
     dst->dirty |= DRT_TYPE_METHODS;
-    for (i = 0; i < nmethods; i++) {
-      method_node_t *page = method_pages[i>>METHODS_PAGE_BITS];
-      method_node_t *m = page + (i&METHODS_PAGE_MASK);
-      GC_REC(m->fn, m->fn);
+    /* RT-6b: trace each type's packed slot table directly --
+     * method handler fns now live inline in method_slot_t.fn,
+     * not in a separate stable arena. */
+    for (i = 0; i < arrlen(types); i++) {
+      type_t *t = &types[i];
+      method_slot_t *ms = t->methods;
+      uint32_t cap = t->method_cap;
+      for (uint32_t k = 0; k < cap; k++) {
+        if (!ms[k].mid) continue;
+        GC_REC(ms[k].fn, ms[k].fn);
+      }
+    }
+    /* RT-6b: SBC mcaches carry inline fn dyns too; trace them
+     * so cached fns survive a closure relocation.  Cheap --
+     * mcaches are dense, contiguous arrays. */
+    extern sbc_t *sbcs[];
+    extern int sbcs_loaded;
+    for (int si = 0; si < sbcs_loaded; si++) {
+      sbc_t *sc = sbcs[si];
+      if (!sc || !sc->mcaches) continue;
+      uint32_t mc = sc->mcache_cnt ? sc->mcache_cnt : 1;
+      for (uint32_t k = 0; k < mc; k++) {
+        if (!sc->mcaches[k].mid) continue;
+        GC_REC(sc->mcaches[k].fn, sc->mcaches[k].fn);
+      }
     }
   }
 
@@ -127,9 +207,10 @@ static void gc_builtins(hg_t *src, hg_t *dst) {
     dst->dirty |= DRT_TYPES;
     for (i = 0; i < arrlen(types); i++) {
       type_t *t = &types[i];
-      //FIXME: no need to GC_REC t->sink->fn
-      //       since it points a place which already gets gc()'d
-      GC_REC(t->sink->fn, t->sink->fn);
+      /* RT-6b: t->sink_fn already gets traced via DRT_TYPE_METHODS
+       * for types where the user installed __ via add_method,
+       * but the default `sink` global goes here too -- trace to be safe. */
+      GC_REC(t->sink_fn, t->sink_fn);
       GC_REC(t->sname, t->sname);
     }
   }
@@ -407,6 +488,30 @@ void gc() {
 void *gc_alloc(uint32_t tag, uint32_t size) {
   hg_t *hgp = api.hgp;
 
+  /* DEBUG (task #12 follow-on): under SYMTA_DUMP_SEGV, catch
+   * allocations with insane sizes BEFORE the underrun trashes the
+   * heap.  A typical bad call is `LIST(new, LIST_SIZE(corrupt))`
+   * where the source list's gc_head is garbage (the same stale-
+   * dyn pattern as the original bug, just surfacing via SIZE
+   * rather than VALUE this time). */
+  if (size > 0x100000 && getenv("SYMTA_DUMP_SEGV")) {
+#ifdef WINDOWS
+    void *ib = GetModuleHandleA(NULL);
+#else
+    void *ib = 0;
+#endif
+    fprintf(stderr,
+            "[BADSIZE] gc_alloc(tag=%u, size=%u) -- absurd size\n"
+            "[BADSIZE]   caller=%p ImageBase=%p offset=%p\n",
+            tag, size,
+            __builtin_return_address(0),
+            ib,
+            ib ? (void*)((uintptr_t)__builtin_return_address(0) -
+                          (uintptr_t)ib) : (void*)0);
+    fflush(stderr);
+    abort();
+  }
+
   void *r = hgp->top - size;
   gc_head_t *h = (gc_head_t*)r - 1;
   if ((void**)h < hgp->ts && hgp->top < hgp->base && !api.gc_disable) {
@@ -419,6 +524,38 @@ void *gc_alloc(uint32_t tag, uint32_t size) {
   //hgp->theap[((void**)r - hgp->heap)] |= TG_OBJECT; //FIXNE: not required
   r = HEAPREF(TAGIFY(PTRENC(r), tag));
   O_AGE(r) = hgp->age;
+
+  /* RT-9 measurement: count allocations by tag (always on).  For
+   * T_LIST also bucket by size and attribute to the calling
+   * bytecode pin via an open-addressed hash map, so we can resolve
+   * top-N emitter sites to source locations on exit. */
+  if (tag < 32) alloc_stats.by_tag[tag]++;
+  if (tag == T_LIST) {
+    uint32_t b = size < 15 ? size : 15;
+    alloc_stats.list_size_bucket[b]++;
+    /* api.frame->pin is the bytecode position of the OP that called
+     * into this alloc -- i.e. the SBC_LIST opcode site.  Null for
+     * pure-C allocations during runtime init. */
+    if (api.frame) {
+      void *pin = api.frame->pin;
+      if (pin) {
+        uint32_t mask = ALLOC_ATTRIB_BUCKETS - 1;
+        uint32_t hh = ((uint32_t)((uintptr_t)pin >> 3)) & mask;
+        for (uint32_t i = 0; i < ALLOC_ATTRIB_BUCKETS; i++) {
+          void *k = alloc_stats.pin_counts[hh].pin;
+          if (!k) {
+            alloc_stats.pin_counts[hh].pin = pin;
+            alloc_stats.pin_counts[hh].count = 1;
+            break;
+          } else if (k == pin) {
+            alloc_stats.pin_counts[hh].count++;
+            break;
+          }
+          hh = (hh + 1) & mask;
+        }
+      }
+    }
+  }
   return r;
 }
 

@@ -21,11 +21,72 @@ GCDEF(gc_list)
   void *p;
   void **pp, **oo;
   size = LIST_SIZE(o);
+  /* DEBUG (behind SYMTA_DUMP_SEGV): catch sources with garbage
+   * size before gc_alloc underruns the heap, and scan the live
+   * heap for the slot that holds the stale dyn `o` so we can
+   * re-run with a page watchpoint on it.  This is how bug #13
+   * was tracked down to parse_term's parsed-cache write. */
+  if (size > 0x100000 && getenv("SYMTA_DUMP_SEGV")) {
+    fprintf(stderr,
+            "[GCLIST_BAD] o=%p size=%u (0x%x) gid=%llu\n",
+            (void*)o, size, size, (unsigned long long)O_GID(o));
+    void **heap0v = (void**)api.heap0;
+    uint64_t target = (uint64_t)(uintptr_t)o;
+    size_t found = 0;
+    for (int gi = 0; gi < api.ngens && found < 5; gi++) {
+      hg_t *g = api.hg0 + gi;
+      void **top = g->top;
+      void **base = g->base;
+      for (void **q = top; q < base && found < 5; q++) {
+        if ((uint64_t)(uintptr_t)*q != target) continue;
+        size_t k = (size_t)(q - heap0v);
+        fprintf(stderr,
+                "[GCLIST_BAD]   holder slot heap[%zu] in gen %d\n",
+                k, gi);
+        found++;
+      }
+    }
+    fflush(stderr);
+    abort();
+  }
   LIST(p, size);
   GC_REDIR(o,p);
   pp = &LGET(p,0);
   oo = &LGET(o,0);
   for (i = 0; i < size; i++) {
+    /* DEBUG (task #12, behind SYMTA_DBG_LISTSCAN): catch list slots
+     * containing a tag-3..5/7 poison dyn at GC time.  The src list
+     * holding the corruption is identified by gid + size + slot
+     * index, so it can be cross-referenced against the construction
+     * site. */
+    {
+      static int list_dbg = -1;
+      if (list_dbg == -1) list_dbg = getenv("SYMTA_DBG_LISTSCAN") ? 1 : 0;
+      if (list_dbg) {
+        uint64_t v = (uint64_t)oo[i];
+        if ((v & 1) && (((v>>1)&0x7FFF) >= 3) &&
+            (((v>>1)&0x7FFF) <= 7) && (((v>>1)&0x7FFF) != 6)) {
+          static int seen_list = 0;
+          if (!seen_list) {
+            fprintf(stderr,
+                    "[LISTSCAN] src list o=%p (gid=%llu size=%u) "
+                    "slot[%u] = %016llx (tag=%llu)\n",
+                    (void*)o, (unsigned long long)O_GID(o), size, i,
+                    (unsigned long long)v,
+                    (unsigned long long)((v>>1)&0x7FFF));
+            for (uint32_t j = 0; j < size && j < 16; j++) {
+              uint64_t vj = (uint64_t)oo[j];
+              fprintf(stderr,
+                      "[LISTSCAN]   slot[%u]=%016llx (tag=%llu)\n",
+                      j, (unsigned long long)vj,
+                      (unsigned long long)((vj>>1)&0x7FFF));
+            }
+            fflush(stderr);
+            seen_list = 1;
+          }
+        }
+      }
+    }
     GC_REC(pp[i], oo[i]);
   }
 GCEND(p)
@@ -174,6 +235,34 @@ GCDEF(gc_custom)
   void **pp, **oo;
   uint64_t tag = O_TAG(o);
   size = types[tag].size;
+  /* Defensive (task #12): tags 3, 4, 5, 7 are reserved placeholder
+   * slots in the type table (_unused0_, _unused1_, _unused2_,
+   * _data_).  Tag 6 (_tag_, T_TAG) IS a legitimate tag used by
+   * Symta's tagged-enum forms (`_tag (_data X)`), but the others
+   * should never appear on a live heap dyn.  Reaching here for
+   * one of the truly-unused tags means something wrote a raw
+   * integer with low bits matching the tag pattern into a heap
+   * slot.  Treat it as an immediate so the corruption doesn't
+   * propagate -- the stale value is harmless on its own; only
+   * gc_custom's automatic OBJECT-with-reserved-tag re-allocation
+   * snowballs it into segfaults later (the macroexpand crash
+   * pinned in tests/runtime/tiny-gen0.sh).  Set SYMTA_FATAL_BAD_TAG
+   * to abort immediately for diagnosis. */
+  if ((tag >= 3 && tag <= 5) || tag == 7) {
+    static int warned = 0;
+    if (!warned) {
+      fprintf(stderr,
+              "[GC] tag-%llu heap-dyn=%p reached gc_custom (reserved "
+              "slot %s); treating as immediate.  Set "
+              "SYMTA_FATAL_BAD_TAG=1 to abort.\n",
+              (unsigned long long)tag, (void*)o,
+              tag < arrlen(types) ? types[tag].name : "?");
+      fflush(stderr);
+      warned = 1;
+      if (getenv("SYMTA_FATAL_BAD_TAG")) abort();
+    }
+    return o;
+  }
   OBJECT(p, tag, size);
   O_CODE(p) = O_CODE(o);
   GC_REDIR(o,p);

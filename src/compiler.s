@@ -390,13 +390,34 @@ uniquify Expr = //gives each variables unique name
 
 ssa_list K Xs =
 | less Xs.n: ret: ssa mv K 'Empty'
+| when Xs.n >< 1:
+  | // RT-9: fused size-1 list literal.  Size-1 is the most
+  | // common bucket (65% of alloc traffic); the LITERAL subset
+  | // shrinks by one dispatch per [X].  Preserve the legacy
+  | // [0] optimization: bare SBC_LIST 1 leaves the slot at the
+  | // default 0 value, so no store is needed.
+  | when 0><Xs.0:
+    | ssa list K 1
+    | ret
+  | A Xs.0^ev
+  | ssa list1 K A
+  | ret
+| when Xs.n >< 2:
+  | // RT-9: fused size-2 list literal -- SBC_LIST2 K A B allocates
+  | // and stores in one opcode (vs SBC_LIST + 2x SBC_STOR).
+  | // size-2 LISTs are ~25% of all alloc traffic on a ./game compile;
+  | // this cuts their bytecode dispatch count 3:1.
+  | A Xs.0^ev
+  | B Xs.1^ev
+  | ssa list2 K A B
+  | ret
 | ssa list K Xs.n
 | H Xs.0
 | less H.is_list: when Xs.all(H):
-  | when 0><H: ret  
+  | when 0><H: ret
   | V ev H
   | for [I X] Xs.i: ssa st K I V
-  | ret  
+  | ret
 | for [I X] Xs.i: when X: ssa st K I X^ev
 
 ssa_data K Type Xs =
@@ -482,11 +503,16 @@ ssa_fixed1 K Op X =
 
 ssa_fixed2 K Op A B =
   if A.is_int and B.is_int:
-    if Op >< 'fxnadd' then ssa_atom K (fadd_ A B)
-    elif Op >< 'fxnsub' then ssa_atom K (fsub_ A B)
-    elif Op >< 'fxnmul' then ssa_atom K (fmul_ A B)
-    elif Op >< 'fxndiv' and B <> 0 then ssa_atom K (fdiv_ A B)
-    elif Op >< 'fxnrem' and B <> 0 then ssa_atom K (frem_ A B)
+    // TS-4.1: the unboxed `iadd`/`isub`/... constant-fold the
+    // same way the tag-aware `fxnadd`/... do.  Listing both
+    // names per branch lets the macro layer feed either form
+    // without compiler.s caring whether the static checker
+    // upstream proved a type.
+    if Op >< 'fxnadd' or Op >< 'iadd' then ssa_atom K (fadd_ A B)
+    elif Op >< 'fxnsub' or Op >< 'isub' then ssa_atom K (fsub_ A B)
+    elif Op >< 'fxnmul' or Op >< 'imul' then ssa_atom K (fmul_ A B)
+    elif (Op >< 'fxndiv' or Op >< 'idiv') and B <> 0 then ssa_atom K (fdiv_ A B)
+    elif (Op >< 'fxnrem' or Op >< 'irem') and B <> 0 then ssa_atom K (frem_ A B)
     elif Op >< 'fxnand' then ssa_atom K (fand_ A B)
     elif Op >< 'fxnior' then ssa_atom K (fior_ A B)
     elif Op >< 'fxnxor' then ssa_atom K (fxor_ A B)
@@ -494,10 +520,15 @@ ssa_fixed2 K Op A B =
     elif Op >< 'fxnshr' and B >> 0 and 63 >> B then ssa_atom K (fshr_ A B)
     elif Op >< 'fxneq'  then ssa_atom K (if A >< B then 1 else 0)
     elif Op >< 'fxnne'  then ssa_atom K (if A <> B then 1 else 0)
-    elif Op >< 'fxnlt'  then ssa_atom K (if A <  B then 1 else 0)
-    elif Op >< 'fxngt'  then ssa_atom K (if A >  B then 1 else 0)
-    elif Op >< 'fxnlte' then ssa_atom K (if A << B then 1 else 0)
-    elif Op >< 'fxngte' then ssa_atom K (if A >> B then 1 else 0)
+    // TS-4.2: typed-int compares fold the same way the fxn
+    // variants do.  Result is int 0/1; the float-arith variants
+    // (fadd/fsub/fmul/fdiv) don't fold here because both
+    // operands being int rules out the typed-float path
+    // emitter -- only emitted when both prove float.
+    elif Op >< 'fxnlt'  or Op >< 'ilt'  then ssa_atom K (if A <  B then 1 else 0)
+    elif Op >< 'fxngt'  or Op >< 'igt'  then ssa_atom K (if A >  B then 1 else 0)
+    elif Op >< 'fxnlte' or Op >< 'ilte' then ssa_atom K (if A << B then 1 else 0)
+    elif Op >< 'fxngte' or Op >< 'igte' then ssa_atom K (if A >> B then 1 else 0)
     else ssa Op K A^ev B^ev
   else ssa Op K A^ev B^ev
   // NOTE: one-sided identity folds (X+0 → X, etc.) were tried
@@ -572,6 +603,24 @@ hcase SsaFormCases Xs (K)
   [_mul A B] | ssa_fixed2 K fxnmul A B
   [_div A B] | ssa_fixed2 K fxndiv A B
   [_rem A B] | ssa_fixed2 K fxnrem A B
+  // TS-4.1: typed-int arithmetic.  Emitted by macro_ops's `+`/`-`/
+  // `*`/`/`/`%` macros when infer_type proves both operands int.
+  // Same constant-folding path as the fxn variants when both are
+  // literals; the runtime opcode skips the tag check otherwise.
+  [_iadd A B] | ssa_fixed2 K iadd A B
+  [_isub A B] | ssa_fixed2 K isub A B
+  [_imul A B] | ssa_fixed2 K imul A B
+  [_idiv A B] | ssa_fixed2 K idiv A B
+  [_irem A B] | ssa_fixed2 K irem A B
+  // TS-4.2: typed-int comparisons + typed-float arithmetic.
+  [_ilt A B]  | ssa_fixed2 K ilt A B
+  [_igt A B]  | ssa_fixed2 K igt A B
+  [_ilte A B] | ssa_fixed2 K ilte A B
+  [_igte A B] | ssa_fixed2 K igte A B
+  [_fadd A B] | ssa_fixed2 K fadd A B
+  [_fsub A B] | ssa_fixed2 K fsub A B
+  [_fmul A B] | ssa_fixed2 K fmul A B
+  [_fdiv A B] | ssa_fixed2 K fdiv A B
   [_eq A B] | ssa_fixed2 K fxneq A B
   [_ne A B] | ssa_fixed2 K fxnne A B
   [_lt A B] | ssa_fixed2 K fxnlt A B

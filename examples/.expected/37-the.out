@@ -1,0 +1,14 @@
+A = 5
+S = hello
+caught: 1
+X = 3
+Y = 42
+W = 7
+C = 3
+D = (a b c)
+L.is_list = 1
+M = (1 2 3)
+U = 9
+B = 42
+5
+world

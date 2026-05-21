@@ -201,37 +201,56 @@ uint32_t sbc_hook(psf_t fn, uint8_t *payload);
 #define BYTES_DATA(o) ((uint8_t*)&O_HDR(o) + 4)
 
 
-typedef struct method_node_t method_node_t;
+/* RT-6: per-type method slot.  The dispatch table used to be a
+ * fixed 512-bucket head-pointer array (`method_node_t
+ * *methods[512]` = 4096 bytes per type) with chained
+ * `method_node_t` chains for collisions.  4 KB per type, only a
+ * fraction of which was populated, and every MCALL miss touched
+ * three disjoint cache lines (type header + far-away
+ * `methods[hid]` + chain node).
+ *
+ * RT-6 swapped the bucket array for a packed open-addressed
+ * probe table sized to the actual method count per type
+ * (initial cap 8, doubled on >= 75 % load).  Empty slots are
+ * marked by `mid == 0`; the `""` (null) method id reserved at
+ * `init_types()` time guarantees no real method ever uses 0.
+ * RT-6 stored each slot as `(mid, node*)` and kept a stable
+ * `method_pages` arena so the cached node pointers held by
+ * `mcache_t` survived any per-type table resize.
+ *
+ * RT-6b folds `fn` directly into the slot.  The mcache wire
+ * format (sif.h: `mcache_t`) carries `(tid, mid, fn)` instead
+ * of a node pointer, so the stable-arena indirection is no
+ * longer load-bearing.  Dispatch hot path drops one cache-line
+ * load (was: mcache → node → fn; now: mcache.fn directly).
+ *
+ * Typical small types now hold ~16-64 slots = 256-1024 bytes;
+ * heavy types (T_OBJECT plus everything that inherits from it)
+ * top out around 256 slots = 4 KB, no worse than before.  The
+ * footprint summed across the ~30 base types drops by 4-8×. */
+typedef struct {
+  uint32_t mid;       /* 0 = empty slot */
+  uint32_t _pad;      /* alignment */
+  dyn fn;             /* RT-6b: handler closure (was method_node_t*) */
+} method_slot_t;
 
-struct method_node_t {
-  int mid; //method id
-  int tid; //type id
-  dyn fn;  //closure
-  method_node_t *next;
-};
-
-//smaller table size will help conserving memory at cost of speed
-#define METHOD_TABLE_SIZE 512
-#define METHOD_TABLE_MASK (METHOD_TABLE_SIZE-1)
-#define METHODS_PAGE_BITS 10
-#define METHODS_PAGE_SIZE (1<<METHODS_PAGE_BITS)
-#define METHODS_PAGE_MASK (METHODS_PAGE_SIZE-1)
+#define INITIAL_METHOD_CAP 8
 
 #define END_TAG (-1)
 typedef struct type_t type_t;
 struct type_t {
   intptr_t size; // number of data slots in type
-  method_node_t *sink;   // sink method: `type.__ Method Args = @Body`
+  dyn sink_fn;   // sink method handler: `type.__ Method Args = @Body`
   char *name;
   void *sname;   // name in symta's format
   int super;     // parent type
   int subtypes;  // child types
   int next;      // next subtype of this super type
   int id;
-  //this hashtable work fast enough as long as
-  //methods ids are spaced randomly enough
-  //FIXME: convert it to use perfect hashing ans smaller table sizes.
-  method_node_t *methods[METHOD_TABLE_SIZE];
+  /* RT-6: open-addressed probe table; see method_slot_t above. */
+  uint32_t method_cap;    // capacity (power of 2)
+  uint32_t method_count;  // entries used
+  method_slot_t *methods; // dynamically allocated, calloc'd
 };
 
 
@@ -314,13 +333,45 @@ extern api_t api_g; //FIXME: all routines should use local versions
 #define api (api_g)
 
 extern type_t *types;
+
+/* RT-9 measurement: per-tag allocation counters incremented by
+ * gc_alloc().  Always on (one uint64_t add per allocation, ~1-2
+ * cycles).  Printed by `rtstat`.  Used to answer "how much does
+ * CONS dominate?" empirically before committing to a specific
+ * RT-9 implementation strategy. */
+/* RT-9 caller-PC attribution: open-addressed hash from
+ * (bytecode pin) -> alloc count.  16 K entries gives < 50 %
+ * load factor for typical workloads (a `./game/` compile uses
+ * ~5 K distinct SBC_LIST sites).  Saturates silently on
+ * overflow -- the top-N emitters are what we want, and they
+ * land first. */
+typedef struct {
+  void *pin;
+  uint64_t count;
+} alloc_pin_count_t;
+#define ALLOC_ATTRIB_BUCKETS 16384
+
+typedef struct {
+  uint64_t by_tag[32];  /* indexed by O_TAG; tags top out at ~22 */
+  uint64_t list_size_bucket[16]; /* [0]=size 0, [1]=1, ..., [14]=14,
+                                    [15]=15+ (saturating bucket) */
+  alloc_pin_count_t pin_counts[ALLOC_ATTRIB_BUCKETS]; /* T_LIST only */
+  /* RT-9: element-tag distribution for size-1 LIST allocations.
+   * Indexed by O_TAG of LGET(list, 0).  Counts which tags would
+   * benefit from a `T_LIST1_<tag>` tagged-immediate encoding
+   * that puts the size-1 list entirely in the dyn payload (no
+   * heap alloc).  Captured at the size-1-store moment in
+   * SBC_LIST1 + SBC_FXNLSET (when target is a freshly-allocated
+   * size-1 LIST). */
+  uint64_t list1_elem_tag[32];
+} alloc_stats_t;
+extern alloc_stats_t alloc_stats;
+
 extern char *main_path;
 extern void *main_args;
 extern dyn single_chars[];
 extern void **method_names;
-extern method_node_t **method_pages;
-extern int nmethods;
-extern method_node_t *sink;  //default sink method
+extern dyn sink;  //default sink method handler (RT-6b: was method_node_t*)
 extern text_table_t *text_tables;
 extern module_imp_t *module_imports;
 typedef struct { char *key; void *value; } *lib_expts_t;
@@ -344,21 +395,29 @@ char *text_to_cstring(dyn text);
 
 
 dyn get_method(int method_id, dyn object);
-method_node_t *get_method_node(int method_id, int tag);
+dyn get_method_for_tag(int method_id, int tag); /* RT-6b: returns fn for mcache fill */
 NOINLINE void print_stack_trace();
 NOINLINE void fatal(char *fmt, ...);
 NOINLINE void rterr_(char *msg);
 #define rterr(...) rterr_(fmt(__VA_ARGS__))
+
+/* GC anchor API: register a stack-local dyn slot as a GC root so it
+ * stays consistent across allocating calls (the GC rewrites it when
+ * the pointed-to object is moved).  Push before the risky section,
+ * pop on each exit path. */
+void gc_anchor_push(dyn *p);
+void gc_anchor_pop(void);
+void gc_anchor_pop_n(int n);
 
 void *load_sbc(char *name);
 dyn sbc_exec_fn(uint8_t *bytecode);
 void add_lib_folder(char *folder);
 void set_type_size_and_name(int tag, int size, void *name);
 void add_subtype(int tag, int subtag);
-method_node_t *add_method(int type_id, int method_id, void *handler);
+void add_method(int type_id, int method_id, void *handler);
 #define ADD_CORE_SINK -1
-method_node_t *add_method_r(int depth, int type_id
-                           ,int method_id, void *handler);
+void add_method_r(int depth, int type_id
+                 ,int method_id, void *handler);
 int resolve_method(char *name);
 dyn get_method_name(uint32_t method_id);
 NOINLINE intptr_t intern(char *name);
@@ -367,6 +426,7 @@ void init_builtin_methods();
 void init_builtin_functions();
 void init_subtypes();
 void init_root_sink();
+void install_meta_dispatch(int tag);
 void init_builtins(int argc, char **argv);
 
 void *gc_alloc(uint32_t tag, uint32_t size);

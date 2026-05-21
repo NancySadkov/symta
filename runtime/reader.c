@@ -20,6 +20,55 @@
 #include "am.h"
 #include "reader.h"
 
+/* DEBUG (task #12): recursively scan an AST for tag-3..5/7 dyns and
+ * print the first occurrence with a labelled trail.  Behind
+ * SYMTA_SCAN_AST -- normally compiled out by const-folding the env
+ * read at TU init, but the recursive walk is too expensive for the
+ * production hot path. */
+static int badtag_scan_armed = 0;
+static int badtag_scan_seen  = 0;
+static int badtag_check_dyn(dyn o, const char *trail) {
+  uint64_t t = O_TAG(o);
+  if (((uint64_t)o & 1) && ((t >= 3 && t <= 5) || t == 7)) {
+    if (!badtag_scan_seen) {
+      fprintf(stderr, "[ASTSCAN] FIRST bad dyn = %016llx (tag=%llu) at %s\n",
+              (unsigned long long)(uintptr_t)o,
+              (unsigned long long)t, trail);
+      fflush(stderr);
+      badtag_scan_seen = 1;
+    }
+    return 1;
+  }
+  return 0;
+}
+static void badtag_scan_rec(dyn o, const char *trail, int depth) {
+  if (depth > 200) return;
+  if (badtag_check_dyn(o, trail)) return;
+  if ((uint64_t)o & 1) {
+    uint64_t t = O_TAG(o);
+    if (t == T_LIST) {
+      uint64_t n = LIST_SIZE(o);
+      for (uint64_t i = 0; i < n; i++) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s[%llu]", trail, (unsigned long long)i);
+        badtag_scan_rec(LGET(o, i), buf, depth+1);
+      }
+    } else if (t == T_TOK) {
+      const char *names[7] = {"type","val","pchar","row","col","orig","parsed"};
+      for (int i = 0; i < 7; i++) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s.%s", trail, names[i]);
+        badtag_scan_rec(LGET(o, i), buf, depth+1);
+      }
+    }
+  }
+}
+void badtag_scan(dyn o, const char *label) {
+  if (!badtag_scan_armed) return;
+  if (badtag_scan_seen) return;
+  badtag_scan_rec(o, label, 0);
+}
+
 // ====================================================================
 // Token introspection.
 // ====================================================================
@@ -88,6 +137,7 @@ static void kw_init(void) {
   KW_LIST
 #undef X
   kw_initted = 1;
+  if (getenv("SYMTA_SCAN_AST")) badtag_scan_armed = 1;
 }
 
 // Membership tests via switch -- compact and avoids hash overhead.
@@ -300,6 +350,7 @@ static dyn make_bar(dyn row, dyn col, dyn orig) {
 }
 
 dyn reader_add_bars(dyn xs) {
+  badtag_scan(xs, "add_bars:in");
   GC_DISABLE();
   kw_init();
   uint64_t n = LIST_SIZE(xs);
@@ -328,6 +379,7 @@ dyn reader_add_bars(dyn xs) {
   for (int i = 0; i < outn; i++) LGET(r, i) = out[i];
   arrfree(out);
   GC_ENABLE();
+  badtag_scan(r, "add_bars:out");
   return r;
 }
 
@@ -363,6 +415,12 @@ static int find_meta_tag(void) {
   for (int i = 0; i < arrlen(types); i++) {
     if (types[i].name && !strcmp(types[i].name, "meta")) {
       meta_tag_g = i;
+      /* OP-4: install the C-side direct-dispatch sink for
+       * meta.__ now that the type tag exists.  Replaces the
+       * Symta-side meta.__ defn (which paid 3 MCALLs per
+       * forwarded method call) with a single inline unwrap +
+       * re-dispatch.  Idempotent. */
+      install_meta_dispatch(i);
       return i;
     }
   }
@@ -380,9 +438,24 @@ static dyn make_meta_wrapper(dyn obj, dyn src) {
 }
 
 dyn reader_parse_strip(dyn x) {
+  badtag_scan(x, "parse_strip:in");
   if (is_tok(x)) {
     dyn parsed = tok_parsed(x);
-    if (parsed) return reader_parse_strip(LGET(parsed, 0));
+    /* RT-12: the parsed cache is always a list -- mk_token /
+     * parse_term store either `LIST(pp,1); pp[0]=value` or larger.
+     * A size-0 list here means the dyn went stale across a GC
+     * (the C local that fed `LGET(pp,0)=parsed` got moved before
+     * the write; the new pp[0] therefore held a stale dyn whose
+     * gc_head_t got zeroed in the freed-gen-pass, and gc_list
+     * later forwarded it to a fresh 0-element list).  Reading
+     * `LGET(parsed,0)` past the end of a 0-list grabs whatever
+     * the next allocation wrote there -- the source of the
+     * tag-3..5/7 poison observed under tiny gen0.  Defensive
+     * guard: if parsed is empty, fall back to tok_value, same as
+     * the no-parsed-cache branch. */
+    if (parsed && is_list(parsed) && LIST_SIZE(parsed) == 1) {
+      return reader_parse_strip(LGET(parsed, 0));
+    }
     return tok_value(x);
   }
   if (!is_list(x)) return x;
@@ -622,7 +695,6 @@ static dyn parse_term(pstate_t *p) {
     }
     dyn head = mk_token(KW_symbol, quote_text,
                         tok_row(tok), tok_col(tok), tok_orig(tok), 0);
-    // For each inner element, decide whether to wrap it.
     dyn *items = 0;
     arrput(items, head);
     for (uint64_t i = 0; i < in; i++) {
@@ -801,8 +873,25 @@ static dyn parse_term(pstate_t *p) {
   // flag rather than `if (parsed)` because for integer/void/etc.
   // a legitimate parsed value can be 0 (FXN(0) == 0).
   if (have_parsed) {
+    /* RT-13: anchor `tok` and `parsed` across LIST(pp, 1).  The
+     * alloc can trigger GC; without anchors, both C locals are
+     * left pointing at freed nursery slots.
+     *
+     * Also use LSET (with write barrier) for tok.6 = pp rather
+     * than the direct LGET-write.  Under tiny-gen0, tok can be
+     * promoted to an older generation by the time we reach this
+     * cache write, while pp is a fresh nursery allocation.  A
+     * cross-gen write without the dirty-marking write barrier
+     * leaks: when the younger gen collects, gc_older_gens won't
+     * scan tok's page, so the slot keeps pointing at pp's old
+     * (now-recycled) nursery location.  On the next gen-4
+     * collection, gc_list traces that stale slot through a
+     * corrupted gc_head and crashes (bug #13). */
+    gc_anchor_push(&tok);
+    gc_anchor_push(&parsed);
     dyn pp; LIST(pp, 1); LGET(pp, 0) = parsed;
-    LGET(tok, 6) = pp;
+    LSET(tok, 6, pp);
+    gc_anchor_pop_n(2);
   }
   return tok;
 }
@@ -853,13 +942,21 @@ static dyn parse_suf_unary(pstate_t *p, dyn (*down)(pstate_t*),
     if (pc && is_anchor_char_c(pc)) {
       valid = 1;
       if (text_eq_c(type, KW_brackets)) {
-        LGET(o, 0) = KW_bracketsL;  // type = `[`
+        /* Defensive (bug #13 class): KW_bracketsL is "[" -- a 1-char
+         * fixtext immediate so the missing barrier is harmless today.
+         * Routing through LSET costs ~one branch (lsetm's GC_OLDER
+         * check returns false on immediates) and protects against a
+         * future longer KW_* keyword silently regressing this site.
+         * No anchor needed: KW_bracketsL is a process-lifetime intern
+         * and `o` doesn't move through this assignment. */
+        LSET(o, 0, KW_bracketsL);   // type = `[`
         type = KW_bracketsL;
       }
     }
     if (!valid) {
       if (text_eq_c(type, KW_curly)) {
-        LGET(o, 0) = KW_curlyL;
+        /* Same defensive note as the KW_bracketsL store above. */
+        LSET(o, 0, KW_curlyL);
       }
       p_push_back(p, o);
       dyn r; LIST(r, 1); LGET(r, 0) = e;
@@ -899,8 +996,18 @@ static dyn parse_suf_unary(pstate_t *p, dyn (*down)(pstate_t*),
           memcpy(buf, s, sl);
           buf[sl] = '_';
           buf[sl+1] = 0;
+          /* Defensive (bug #13 class): not currently a bug because
+           * every SufUnaryS operator is <=3 chars; appending `_`
+           * leaves it <=4 chars which TEXT() encodes as a fixtext
+           * immediate (no heap ref, so no cross-gen barrier needed).
+           * Empirically verified: reverting this to a raw LGET and
+           * compiling the game under SYMTA_GEN0_SIZE=65536 stays
+           * clean.  Kept LSET + anchor anyway as a safety belt for
+           * any future longer SufUnaryS operator. */
+          gc_anchor_push(&o);
           dyn nv; TEXT(nv, buf);
-          LGET(o, 1) = nv;
+          LSET(o, 1, nv);
+          gc_anchor_pop_n(1);
           free(buf);
         }
       }
@@ -932,8 +1039,16 @@ static dyn parse_suf_unary(pstate_t *p, dyn (*down)(pstate_t*),
     as = wrapper;
     an = 1;
   }
+  /* Bug #13 sibling -- REAL TRIGGER PATH.  The bracket-literal
+   * parsed-cache slot 6 receives a fresh LIST (a heap object).  If
+   * `o` has been promoted (tiny-gen0 forces this for long parses),
+   * the cross-gen write needs the barrier or `ot_pair` gets
+   * reclaimed and `o.6` dangles.  Reverting to a raw LGET store
+   * reproduces SEGV on `tests/runtime/cross-gen-store.sh`. */
+  gc_anchor_push(&o);
   dyn ot_pair; LIST(ot_pair, 1); LGET(ot_pair, 0) = tok_type(o);
-  LGET(o, 6) = ot_pair;
+  LSET(o, 6, ot_pair);
+  gc_anchor_pop_n(1);
   // [O E @as]
   dyn full; LIST(full, an + 2);
   LGET(full, 0) = o;
@@ -1040,9 +1155,19 @@ static dyn parse_suf_loop(pstate_t *p, dyn (*down)(pstate_t*), dyn e) {
                   int n = snprintf(buf, sizeof(buf), "=%s",
                                    kvs ? kvs : "");
                   (void)n;
+                  /* Bug #13 sibling -- REAL TRIGGER PATH.  Empirical
+                   * evidence: reverting this to `LGET(t, 1) = nv` and
+                   * running `bash game/build.sh` under
+                   * SYMTA_GEN0_SIZE=65536 reliably segfaults at the
+                   * `main_data` stage (rc=139).  The combined
+                   * `"="+method-name` string is typically >6 chars,
+                   * so TEXT() allocates a bigtext heap object -- a
+                   * young heap ref into a possibly-older `t`. */
+                  gc_anchor_push(&t);
                   dyn nv;
                   TEXT(nv, buf);
-                  LGET(t, 1) = nv;
+                  LSET(t, 1, nv);
+                  gc_anchor_pop_n(1);
                 }
               }
             }
@@ -1167,8 +1292,17 @@ static dyn binary_loop(pstate_t *p, op_pred_t ops_pred,
       memcpy(buf, s, sl);
       buf[sl] = '_';
       buf[sl+1] = 0;
+      /* Defensive (bug #13 class): same fixtext-immediate invariant
+       * as parse_suf_unary's append-`_` path (~line 996).  Today's
+       * binary operators are all <=3 chars so the appended `<op>_`
+       * stays <=4 chars and TEXT() returns an immediate -- no heap
+       * write, no barrier needed.  Empirically verified clean on
+       * the game compile + tiny gen0.  Kept LSET + anchor as the
+       * future-proof safety belt. */
+      gc_anchor_push(&o);
       dyn nv; TEXT(nv, buf);
-      LGET(o, 1) = nv;
+      LSET(o, 1, nv);
+      gc_anchor_pop_n(1);
       free(buf);
       LIST(ne, 2); LGET(ne, 0) = o; LGET(ne, 1) = e;
     }
@@ -1974,10 +2108,12 @@ static dyn parse_tokens_inner(dyn input) {
 // Kept reachable as `parse_tokens_c_` builtin only so test harnesses
 // can probe it; the production text.parse still uses Symta.
 dyn reader_parse_tokens(dyn input) {
+  badtag_scan(input, "parse_tokens:in");
   GC_DISABLE();
   kw_init();
   dyn r = parse_tokens_inner(input);
   GC_ENABLE();
+  badtag_scan(r, "parse_tokens:out");
   return r;
 }
 

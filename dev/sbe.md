@@ -1010,7 +1010,191 @@ types.
 
 ---
 
-# Part IX — Macros and Quasiquotation
+# Part IX — The type system
+
+Symta is dynamically typed by default, but the type system can
+be *progressively* engaged on the parts of a program that
+benefit from it.  The same surface vocabulary covers four
+things — assertion, ascription, construction, and conversion —
+and the static checker catches whatever it can prove at compile
+time, falling back to a runtime check for everything else.
+
+The shape of the surface is **typename-is-a-function**.  A
+type name like `int`, `text`, or your own `account` is just a
+function you can call.  The action depends on how you call it.
+
+### Assertion: `_the T X` and `X^T`
+
+"This value is already a `T`; if it isn't, raise an error."
+No conversion is attempted.
+
+```symta
+A 5^int                          // A = 5
+B "hello"^text                   // B = "hello"
+F (=> 42)                        // a thunk that returns dyn
+caught btrap: => F()^text        // runtime check fails -> bterror
+```
+
+`^T` is the postfix form of `_the T`.  Both lower to the same
+runtime tag check.  Use whichever reads better at the call site.
+
+### Ascription on declarations and parameters
+
+The really useful place for `^T` is on the *boundary* of a
+function or a binding — once a value is asserted to be a `T`,
+the compiler knows it's a `T` from then on.
+
+```symta
+// Typed parameters: runtime check at entry, static type in body
+deposit Acc^account Amt^money =
+  // Inside here, Acc and Amt are KNOWN to be their types.
+  // Acc.bal reads the `bal` field of an account; the compiler
+  // verified Acc is an account when the function was entered.
+  NewBal add Acc.bal Amt
+  account Acc.id Acc.name NewBal
+
+// Typed local binding
+Balance 0^int                    // pinned -- can only be reassigned to int
+Balance = 42                     // OK
+// Balance = "broke"             // COMPILE ERROR: type mismatch on reassign
+```
+
+### Construction: `T X`
+
+"Make a `T` out of `X`."  Calls `X.T` (the per-type conversion
+method) then asserts the result is a `T`.
+
+```symta
+int 3.5                          // 3       -- 3.5.int truncates
+int "42"                         // 42      -- parsed
+float 7                          // 7.0
+text 42                          // "42"
+```
+
+If the conversion fails, the runtime check trips.  No silent
+"NaN" or "undefined" result.
+
+### Pure conversion: `as_T X`
+
+"Run the conversion, skip the check."  Faster, no safety net.
+
+```symta
+as_int 3.5                       // 3
+as_list "abc"                    // (a b c)  -- text -> char-list
+```
+
+Use when you've already proven the input shape and want to
+skip the redundant check on the hot path.
+
+### Trust me: `_unsafe T X`
+
+"I promise this is a `T`; don't check, just label it."  C-style
+trust cast.  Undefined behaviour if you lie.  Use only when the
+strict checker is provably wrong about a path it can't see
+through.
+
+```symta
+U _unsafe int 9                  // skip both static and runtime
+```
+
+### Declaring your own types
+
+`type` is just like `cls` from the previous part, but the
+result also participates in the type system:
+
+```symta
+type money Cents Curr: cents!Cents currency!Curr
+type account Id Name Bal: id!Id name!Name bal!Bal
+
+M money 12500 \USD               // M is a money
+A account 1 "Alice" M            // A is an account whose bal is M
+
+A.bal.cents                      // 12500     normal field access
+A^account                        // verified -- still A
+```
+
+`is_money X`, `is_account X` get auto-generated.  `_the money X`
+and `X^money` work on user types exactly like primitives.
+
+### The strict checker
+
+The compiler tries to prove type mismatches before any runtime
+check has to fire.  Anything it can prove statically becomes a
+*compile error*, not a runtime trap.
+
+```symta
+_the int "abc"                   // COMPILE ERROR -- text != int
+_the float 3                     // COMPILE ERROR -- int != float
+```
+
+Anything it can't prove falls through to the runtime check
+(`_the` and `^T` both emit one).  `_unsafe` opts out of both.
+
+What the checker proves today:
+
+| Form                          | Example                                            |
+|-------------------------------|----------------------------------------------------|
+| Literal mismatch              | `_the int "x"` → text                              |
+| Var-flow propagation          | `X int 5; _the text X` → int                       |
+| Typed parameter               | `f X^int = _the text X` → int                      |
+| Reassignment of typed var     | `X _the int 5; X = "hi"` → text vs int             |
+| `if`-branch unification       | `_the int (if c then 5 else "x")` → mixed          |
+| Function-return inference     | `f X = _the int X+1`; `_the text (f 3)` → int      |
+| Case-arm narrowing            | `case L T?: body` types L as T over body           |
+| Splat-tail narrowing          | `case L [X@Xs]: body` types Xs as list             |
+| Typed element pattern         | `case L [X^int @Xs]: body` types X as int          |
+| Fixed-length list pattern     | `case L [A B C]: body` types L as list             |
+| Case-result unification       | All arms agree on T → case-expr has type T         |
+| Method-return inference       | `X.int`, `X.text`, `X.list` known by name          |
+| Arithmetic + comparisons      | `int+int=int`, `int<int=int`, etc.                 |
+
+`dyn` is the escape hatch: anything the checker can't determine
+is `dyn`, and `dyn` unifies with everything (the gradual typing
+contract).  Falling back to runtime is always available.
+
+### Worked example: a typed bank-account library
+
+`examples/40-bank.s` (in this repo) puts the pieces together:
+
+```symta
+type money Cents Curr: cents!Cents currency!Curr
+type account Id Name Bal: id!Id name!Name bal!Bal
+
+add A^money B^money =
+  less A.currency >< B.currency:
+    bad "currency mismatch: [A.currency] vs [B.currency]"
+  money A.cents+B.cents A.currency
+
+deposit Acc^account Amt^money =
+  NewBal add Acc.bal Amt
+  account Acc.id Acc.name NewBal
+
+withdraw Acc^account Amt^money =
+  when money_lt Acc.bal Amt:
+    bad "insufficient: [Acc.bal.cents] < [Amt.cents]"
+  NewBal sub Acc.bal Amt
+  account Acc.id Acc.name NewBal
+
+Alice account 1 "Alice" (money 50000 \USD)
+Bob   account 2 "Bob"   (money 30000 \USD)
+
+Alice = deposit Alice (money 12500 \USD)
+```
+
+The type system enforces the invariants you actually want:
+
+* `Acc^account` is a runtime tag check at entry — call
+  `deposit "savings"` and it traps before touching the balance.
+* Currency-mix gets caught (`add Alice.bal EUR_amt` -> `bad`).
+* `_the int "fifty cents"` somewhere in the source is a
+  *compile error*; the digit-typo doesn't survive to runtime.
+
+The full demo + boundary catches + audit log is one screen,
+runnable as `symta -f examples/40-bank.s`.
+
+---
+
+# Part X — Macros and Quasiquotation
 
 Symta is a Lisp.  Every program is data, and every data shape
 that names something can be transformed by a macro.  Macros are
@@ -1077,7 +1261,7 @@ program.
 
 ---
 
-# Part X — Modules and Building
+# Part XI — Modules and Building
 
 Every `.s` file is a module.  Imports look like:
 
@@ -1116,7 +1300,7 @@ imports and emits one statically-linked executable.
 
 ---
 
-# Part XI — Error Handling
+# Part XII — Error Handling
 
 `bad` raises a runtime error with a message:
 
@@ -1150,7 +1334,7 @@ own slot; no exception breaks the iteration.
 
 ---
 
-# Part XII — Foreign Function Interface
+# Part XIII — Foreign Function Interface
 
 Symta calls into native code without an external build step.
 Declare the C signature in the source:
@@ -1176,7 +1360,7 @@ in the UI toolkit; `use gfx` brings in the graphics layer.
 
 ---
 
-# Part XIII — Getting help
+# Part XIV — Getting help
 
 Symta has a self-documenting REPL.  At the prompt:
 

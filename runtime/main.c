@@ -15,6 +15,7 @@
 #include "ng.h"
 #include "sif.h"
 #include "fs.h"
+#include "jit.h"
 
 
 
@@ -31,7 +32,9 @@ void *main_args;
 static char *version = "1.1";
 
 
-method_node_t *sink;
+dyn sink;  /* RT-6b: default sink fn (was method_node_t*) */
+
+alloc_stats_t alloc_stats;  /* RT-9 measurement; see common.h */
 
 lib_expts_t lib_expts;
 
@@ -59,10 +62,6 @@ type_t *types;
 
 collector_t *collectors;
 
-
-
-method_node_t **method_pages;
-int nmethods;
 
 
 void **method_names;
@@ -98,35 +97,80 @@ dyn get_method_name(uint32_t method_id) {
   return method_names[method_id];
 }
 
-#define GET_METH_STEP \
-  if (!m) return t->sink->fn; \
-  if (m->mid == method_id) return m->fn; \
-  m = m->next;
+/* RT-6/RT-6b: probe-based dispatch with inline fn.
+ * See method_slot_t in common.h. */
+
 dyn get_method(int method_id, dyn object) {
-  type_t *t = types+O_TAG(object);
-  method_node_t *m = t->methods[method_id&METHOD_TABLE_MASK];
-  GET_METH_STEP;
-  GET_METH_STEP;
-  while (1) { //almost never gets here, if type_t->methods is big eough
-    GET_METH_STEP
+  type_t *t = types + O_TAG(object);
+  uint32_t mask = t->method_cap - 1;
+  uint32_t i = (uint32_t)method_id & mask;
+  method_slot_t *ms = t->methods;
+  for (;;) {
+    uint32_t slot_mid = ms[i].mid;
+    if (!slot_mid) return t->sink_fn;
+    if (slot_mid == (uint32_t)method_id) return ms[i].fn;
+    i = (i + 1) & mask;
   }
-  return t->sink->fn;
 }
 
-
-#define GET_METH_NODE_STEP \
-  if (!m) return t->sink; \
-  if (m->mid == method_id) return m; \
-  m = m->next;
-method_node_t *get_method_node(int method_id, int tag) {
-  type_t *t = types+tag;
-  method_node_t *m = t->methods[method_id&METHOD_TABLE_MASK];
-  GET_METH_NODE_STEP;
-  GET_METH_NODE_STEP;
-  while (1) { //almost never gets here, if type_t->methods is big eough
-    GET_METH_NODE_STEP
+/* RT-6b: same probe by raw tag (no dyn object handy).  Used by
+ * MCACHE_CALL on miss to fill `(tid, mid, fn)` into the cache. */
+dyn get_method_for_tag(int method_id, int tag) {
+  type_t *t = types + tag;
+  uint32_t mask = t->method_cap - 1;
+  uint32_t i = (uint32_t)method_id & mask;
+  method_slot_t *ms = t->methods;
+  for (;;) {
+    uint32_t slot_mid = ms[i].mid;
+    if (!slot_mid) return t->sink_fn;
+    if (slot_mid == (uint32_t)method_id) return ms[i].fn;
+    i = (i + 1) & mask;
   }
-  return t->sink;
+}
+
+/* Returns the slot pointer for `mid` in t's table, or NULL if absent. */
+static method_slot_t *find_method_slot(type_t *t, int mid) {
+  uint32_t mask = t->method_cap - 1;
+  uint32_t i = (uint32_t)mid & mask;
+  method_slot_t *ms = t->methods;
+  for (;;) {
+    uint32_t slot_mid = ms[i].mid;
+    if (!slot_mid) return 0;
+    if (slot_mid == (uint32_t)mid) return &ms[i];
+    i = (i + 1) & mask;
+  }
+}
+
+/* Find the slot to insert `mid` into.  Returns either the existing
+ * matching slot or the first empty one found by linear probing.
+ * Caller is responsible for resizing before calling so load < 1. */
+static method_slot_t *find_insert_slot(type_t *t, int mid) {
+  uint32_t mask = t->method_cap - 1;
+  uint32_t i = (uint32_t)mid & mask;
+  method_slot_t *ms = t->methods;
+  for (;;) {
+    uint32_t slot_mid = ms[i].mid;
+    if (!slot_mid || slot_mid == (uint32_t)mid) return &ms[i];
+    i = (i + 1) & mask;
+  }
+}
+
+static void resize_method_table(type_t *t) {
+  uint32_t old_cap = t->method_cap;
+  method_slot_t *old_slots = t->methods;
+  uint32_t new_cap = old_cap * 2;
+  method_slot_t *new_slots = (method_slot_t*)calloc(new_cap,
+                                                    sizeof(method_slot_t));
+  uint32_t new_mask = new_cap - 1;
+  for (uint32_t i = 0; i < old_cap; i++) {
+    if (!old_slots[i].mid) continue;
+    uint32_t j = (uint32_t)old_slots[i].mid & new_mask;
+    while (new_slots[j].mid) j = (j + 1) & new_mask;
+    new_slots[j] = old_slots[i];
+  }
+  free(old_slots);
+  t->method_cap = new_cap;
+  t->methods = new_slots;
 }
 
 //O_TAG(object)
@@ -151,52 +195,53 @@ intptr_t intern(char *name) {
   t->super = END_TAG;
   t->subtypes = END_TAG;
   t->next = END_TAG;
-  memset(t->methods, 0, sizeof(method_node_t*)*METHOD_TABLE_SIZE);
+
+  /* RT-6: start with a small open-addressed table.  Grows on
+   * load >= 75 % via resize_method_table. */
+  t->method_cap = INITIAL_METHOD_CAP;
+  t->method_count = 0;
+  t->methods = (method_slot_t*)calloc(INITIAL_METHOD_CAP,
+                                      sizeof(method_slot_t));
 
   shput(typelut,t->name,index);
   arrput(collectors,gc_custom);
 
   if (!sink) init_root_sink();
-  t->sink = sink; //default sink method
+  t->sink_fn = sink; //default sink method
 
   api.hgp->dirty |= DRT_TYPES;
 
   return index;
 }
 
-static void init_method(method_node_t **dst, int tid, int mid, void *handler) {
-  method_node_t *page;
-  int page_ofs = nmethods & METHODS_PAGE_MASK;
-  if (page_ofs) {
-    page = method_pages[nmethods>>METHODS_PAGE_BITS];
-  } else {
-    page = malloc(METHODS_PAGE_SIZE*sizeof(method_node_t));
-    arrput(method_pages,page);
+/* RT-6b: insert (mid, fn) into t's slot table.  Resizes first if
+ * the load factor would exceed 75 %.  If a slot for `mid` already
+ * exists, just overwrites its `fn` (used both for the bootstrap-
+ * SBC-overrides-C-handler case and for the user-redefinition
+ * whitelist path). */
+static void insert_method(type_t *t, int mid, dyn fn) {
+  if (t->method_count + 1 >= (t->method_cap * 3) / 4) {
+    resize_method_table(t);
   }
-  method_node_t *m = page + page_ofs;
-  m->mid = mid;
-  m->tid = tid;
-  m->fn = handler;
-  m->next = *dst;
-  *dst = m;
+  method_slot_t *s = find_insert_slot(t, mid);
+  if (!s->mid) {
+    s->mid = (uint32_t)mid;
+    t->method_count++;
+  }
+  s->fn = fn;
   api.hgp->dirty |= DRT_TYPE_METHODS;
-  ++nmethods;
-}
-
-static method_node_t *list_has_method(method_node_t *m, int mid) {
-  for ( ; m; m = m->next) if (m->mid == mid) return m;
-  return 0;
 }
 
 static void inherit_methods(type_t *parent, type_t *child) {
-  int i;
-  method_node_t *m, *n;
-  method_node_t **pms = parent->methods, **cms = child->methods;
-
-  for (i = 0; i < METHOD_TABLE_SIZE; i++)
-    for (n = pms[i]; n; n = n->next)
-      if (!list_has_method(cms[i], n->mid))
-        init_method(cms+i, child->id, n->mid, n->fn);
+  uint32_t cap = parent->method_cap;
+  method_slot_t *pms = parent->methods;
+  for (uint32_t i = 0; i < cap; i++) {
+    if (!pms[i].mid) continue;
+    int mid = (int)pms[i].mid;
+    /* Skip if the child already defines its own version of mid. */
+    if (find_method_slot(child, mid)) continue;
+    insert_method(child, mid, pms[i].fn);
+  }
 }
 
 void add_subtype(int tag, int subtag) {
@@ -210,36 +255,37 @@ void add_subtype(int tag, int subtag) {
   inherit_methods(&types[tag], &types[subtag]);
 }
 
-method_node_t *add_method_r(int depth, int type_id
-                           ,int method_id, void *handler) {
-  int hid; //hashed id
-  method_node_t *n, *m, **ms;
+void add_method_r(int depth, int type_id
+                 ,int method_id, void *handler) {
   type_t *s, *t = &types[type_id];
 
-  hid = method_id&METHOD_TABLE_MASK;
-  ms = t->methods;
-
   if (depth == ADD_CORE_SINK) {
-    init_method(ms+hid, type_id, method_id, handler);
-    return ms[hid];
+    insert_method(t, method_id, handler);
+    return;
   }
 
-  n = list_has_method(ms[hid], method_id);
-  if (n) {
+  method_slot_t *n_slot = find_method_slot(t, method_id);
+  dyn n_fn = n_slot ? n_slot->fn : 0;
+  if (n_slot) {
+    /* Walk the super chain to detect inherited-and-still-matches. */
     for (int si = t->super; si != END_TAG; si = s->super) {
       s = &types[si];
-      m = list_has_method(s->methods[hid], method_id);
-      if (m && m->fn == n->fn) goto inherited;
+      method_slot_t *m_slot = find_method_slot(s, method_id);
+      if (m_slot && m_slot->fn == n_fn) goto inherited;
       if (!s->super) break;
     }
-    if (depth) return 0; //subtype already has this method
-    /* `_.><` / `_.<>` get registered both via the C-side init
-     * (fast direct-dispatch handlers) and via the bootstrap SBC's
-     * Symta-side definitions of the same methods.  Allow the
-     * silent override so the latest registration wins.  Any OTHER
-     * method redefinition is still an error -- usually a real
-     * bug. */
-    if (method_id == api.m_equal || method_id == api.m_ne_) {
+    if (depth) return; //subtype already has this method
+    /* `_.><` / `_.<>` / `_.<<` / `_.>` / `_.>>` (OP-1, OP-3) and
+     * `__` (OP-4: meta.__ direct-dispatch sink) get registered
+     * both via the C-side init (fast direct-dispatch handlers)
+     * and via the bootstrap SBC's Symta-side definitions of the
+     * same methods.  Allow the silent override so the latest
+     * registration wins.  Any OTHER method redefinition is still
+     * an error -- usually a real bug. */
+    if (method_id == api.m_equal || method_id == api.m_ne_
+     || method_id == m_lte || method_id == m_gt || method_id == m_gte
+     || method_id == api.m_underscore
+     || method_id == api.m_call) {
       goto replace;
     }
     rterr("add_method: redefining %s.%s"
@@ -248,23 +294,24 @@ method_node_t *add_method_r(int depth, int type_id
   }
 
 replace:
-  init_method(ms+hid, type_id, method_id, handler);
+  {
+    insert_method(t, method_id, handler);
 
-  for (int si = t->subtypes; si != END_TAG; si = s->next) {
-    s = &types[si];
-    add_method_r(depth+1, s->id, method_id, handler);
-  }
+    for (int si = t->subtypes; si != END_TAG; si = s->next) {
+      s = &types[si];
+      add_method_r(depth+1, s->id, method_id, handler);
+    }
 
-  if (method_id == api.m_underscore) {
-    t->sink = ms[hid];
-    api.hgp->dirty |= DRT_TYPES;
+    if (method_id == api.m_underscore) {
+      t->sink_fn = handler;
+      api.hgp->dirty |= DRT_TYPES;
+    }
   }
-  return ms[hid];
 }
 
 
-method_node_t *add_method(int type_id, int method_id, void *handler) {
-  return add_method_r(0, type_id, method_id, handler);
+void add_method(int type_id, int method_id, void *handler) {
+  add_method_r(0, type_id, method_id, handler);
 }
 
 void set_type_size_and_name(int tag, int size, void *name) {
@@ -623,6 +670,7 @@ void init_types() {
   api.m_hash = resolve_method("hash");
   api.m_equal = resolve_method("><");
   api.m_ne_ = resolve_method("<>");
+  api.m_call = resolve_method("()");  /* RT-9 whitelist */
 
   intern("int");
   intern("float");
@@ -804,10 +852,51 @@ void make_executable(void *ptr, int size) {
 
 
 
+/* Step 8: parse runtime-level CLI flags before they reach
+ * init_args.  Currently recognised:
+ *
+ *   --no-jit   force AOT off (overrides _WIN32 default and any
+ *              prior env-var SET; useful when a JIT bug is
+ *              suspected and the interpreter path needs to be
+ *              re-isolated).
+ *   --jit      force AOT on  (useful on Linux to test the
+ *              pipeline despite the POSIX-unwind gap; expect
+ *              crashes on longjmp-bearing programs).
+ *
+ * Recognised flags are removed from argv in-place so user code
+ * (visible via `args` in Symta) doesn't see them.  Flags appear
+ * anywhere in argv -- before or after the project path -- to
+ * keep the calling convention forgiving. */
+static void parse_jit_flags(int *argc_io, char **argv) {
+  int rd = 1, wr = 1;
+  int n = *argc_io;
+  while (rd < n) {
+    if (!strcmp(argv[rd], "--no-jit")) {
+      jit_aot_enabled = 0;
+      rd++;
+    } else if (!strcmp(argv[rd], "--jit")) {
+      jit_aot_enabled = 1;
+      rd++;
+    } else {
+      if (wr != rd) argv[wr] = argv[rd];
+      wr++; rd++;
+    }
+  }
+  *argc_io = wr;
+
+  /* Env-var overrides for scripting / build systems.  Both
+   * SYMTA_NO_JIT and SYMTA_JIT take precedence over CLI flags
+   * (the more explicit a knob, the higher it wins). */
+  if (getenv("SYMTA_NO_JIT")) jit_aot_enabled = 0;
+  if (getenv("SYMTA_JIT"))    jit_aot_enabled = 1;
+}
+
 int main(int argc, char **argv) {
   int i;
   void *R;
   char *tmp;
+
+  parse_jit_flags(&argc, argv);
 
 #ifdef __linux__
   /* Match Windows' merged-output interleaving exactly so the test
@@ -899,6 +988,59 @@ int main(int argc, char **argv) {
     init_api(gen0_pages);
   }
   //init_api(2560*PAGE_SIZE);
+
+  /* DEBUG (task #12): install a write watchpoint via DR0 if the
+   * user provided a target.  Two modes:
+   *   SYMTA_WATCH_ADDR=<hex>  -- raw address (full address bytes)
+   *   SYMTA_WATCH_GID=<dec>   -- gid in heap0; slot = api.heap0[gid]
+   *   SYMTA_WATCH_SLOT=<dec>  -- additional slot offset (default 0)
+   *   SYMTA_WATCH_VALUE=<hex> -- log+abort on this value (default 0
+   *                              = log every write)
+   *
+   * Used to nail down the SBC opcode or C builtin that writes the
+   * 0x07 poison dyn into a list slot. */
+#ifdef WINDOWS
+  {
+    char *ws = getenv("SYMTA_WATCH_ADDR");
+    char *gs = getenv("SYMTA_WATCH_GID");
+    char *vs = getenv("SYMTA_WATCH_VALUE");
+    char *ss = getenv("SYMTA_WATCH_SLOT");
+    void *addr = 0;
+    uint64_t target = vs ? strtoull(vs, 0, 0) : 0;
+    int slot = ss ? (int)strtol(ss, 0, 0) : 0;
+    if (ws && *ws) {
+      addr = (void*)(uintptr_t)strtoull(ws, 0, 0);
+    } else if (gs && *gs) {
+      uint64_t gid = strtoull(gs, 0, 0);
+      addr = (void*)((uintptr_t)api.heap0 + (gid + slot) * 8);
+    }
+    if (addr) {
+      /* Prefer page-level protection (works without admin); fall
+       * back to DR0 if SYMTA_WATCH_HW=1 is set. */
+      int ok;
+      ctx_set_watch_target_value(target);
+      if (getenv("SYMTA_WATCH_HW")) {
+        ok = ctx_set_write_watchpoint(addr, target);
+        fprintf(stderr, "[WATCH] HW DR0 armed ok=%d\n", ok);
+      } else {
+        ok = ctx_set_page_watchpoint(addr);
+        fprintf(stderr, "[WATCH] page protect armed ok=%d\n", ok);
+      }
+      fprintf(stderr,
+              "[WATCH] addr=%p target=%016llx slot_offset=%d\n"
+              "[WATCH]   api.heap0=%p api.heap1=%p\n"
+              "[WATCH]   addr - heap0 = 0x%llx bytes (%llu slots)\n"
+              "[WATCH]   exe ImageBase = %p  (subtract rip from this+slide "
+              "to get preferred file address)\n",
+              addr, (unsigned long long)target, slot,
+              (void*)api.heap0, (void*)api.heap1,
+              (unsigned long long)((uintptr_t)addr - (uintptr_t)api.heap0),
+              (unsigned long long)(((uintptr_t)addr - (uintptr_t)api.heap0) / 8),
+              (void*)GetModuleHandleA(NULL));
+      fflush(stderr);
+    }
+  }
+#endif
 
   api.sb = (void**)&tmp;
 

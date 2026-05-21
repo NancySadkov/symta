@@ -158,7 +158,14 @@ plugins: $(PLUGINS)
 # `make examples` is quick. The single-file examples are exercised
 # by the runtime test sweep instead.
 
-EXAMPLE_DIRS := $(wildcard examples/*/)
+# `$(wildcard examples/*/)` is meant to glob only directories (the
+# trailing slash), but on Windows make / w64devkit it also matches
+# single-file `examples/*.s` entries, so `make examples` then tries
+# to `cd` into e.g. `examples/00-hello.s` and dies.  Filter the
+# match list down to actual directories via `wildcard <each>/.`,
+# which only resolves for real dirs (the implicit `.` entry exists
+# in a dir but not in a file).
+EXAMPLE_DIRS := $(sort $(dir $(wildcard examples/*/.)))
 
 examples: runtime plugins
 	@for d in $(EXAMPLE_DIRS); do \
@@ -189,6 +196,10 @@ test-runtime: runtime
 	@bash tests/runtime/run.sh
 	@echo "[run] line-number regression tests"
 	@bash tests/runtime/lineno-check.sh
+	@echo "[run] tiny-gen0 GC regression test"
+	@bash tests/runtime/tiny-gen0.sh
+	@echo "[run] cross-gen-store GC regression test"
+	@bash tests/runtime/cross-gen-store.sh
 
 test-compiler: runtime
 	@echo "[run] compiler-output regression tests"

@@ -1,8 +1,10 @@
 //#define SBC_REMAP
 #include "sif.h"
 #include "ng.h"
+#include "jit.h"
 
 #include <ctype.h>
+#include <stdlib.h>
 
 
 static instr_t *curins;
@@ -383,6 +385,29 @@ uint8_t *sif2sbc(sif_t *sif) {
         EMIT16(size);
       }
       break;}
+    case SBC_LIST2: {
+      /* RT-9: fused size-2 list allocation.  SIF form:
+       *   list2 <dst> <a> <b>
+       * Compiler emits this when ssa_list sees Xs.n == 2 and
+       * both elements are simple (non-aggregate) values that
+       * map straight to register refs. */
+      int dst = refidx(as[1]);
+      int a   = refidx(as[2]);
+      int b   = refidx(as[3]);
+      EMIT8(SBC_LIST2);
+      EMIT16(dst);
+      EMIT16(a);
+      EMIT16(b);
+      break;}
+    case SBC_LIST1: {
+      /* RT-9: fused size-1 list allocation.  SIF form:
+       *   list1 <dst> <x> */
+      int dst = refidx(as[1]);
+      int x   = refidx(as[2]);
+      EMIT8(SBC_LIST1);
+      EMIT16(dst);
+      EMIT16(x);
+      break;}
     case SBC_MOVE: {
       if (!strcmp(as[2],"Empty")) {
         int dst = refidx(as[1]);
@@ -659,6 +684,19 @@ uint8_t *sif2sbc(sif_t *sif) {
     case SBC_FXNSHR:
     case SBC_SAME:
     case SBC_VARY:
+    case SBC_IADD:   /* TS-4.1: same wire shape (dst, a, b) as FXN ops */
+    case SBC_ISUB:
+    case SBC_IMUL:
+    case SBC_IDIV:
+    case SBC_IREM:
+    case SBC_ILT:    /* TS-4.2 */
+    case SBC_IGT:
+    case SBC_ILTE:
+    case SBC_IGTE:
+    case SBC_FADD:
+    case SBC_FSUB:
+    case SBC_FMUL:
+    case SBC_FDIV:
     {
       if (!strcmp(as[1],"dummy")) break;
       EMIT8(ins->opcode);
@@ -1002,17 +1040,166 @@ uint8_t *sif2sbc(sif_t *sif) {
     EMIT24(val_ofs);
   }
 
+  /* NATIVE/IA64 section (step 6b).
+   *
+   * For each function whose bytecode the JIT translator accepts,
+   * we emit machine code + a small reloc table directly into the
+   * SBC.  Loader-side install (step 6c) copies each blob into a
+   * fresh executable mapping, patches each reloc against the
+   * runtime's helper-pointer table, registers SEH unwind, and
+   * rewrites the corresponding hooks_heap entry.  Functions the
+   * JIT bails on get a zeroed directory entry (payload_offset=0)
+   * so dispatch falls through to interpreter via sbc_exec_fn.
+   *
+   * Gated on SYMTA_AOT_IA64=1; default builds emit an empty
+   * directory so drift / sweep stay 1-round byte-stable. */
+  int ia64_ofs = 0;
+  int ia64_count = 0;
+  /* Step 8: AOT writer activates when jit_aot_enabled is on
+   * (set by --jit / --no-jit / platform default in main.c) OR
+   * the fine-grained SYMTA_AOT_IA64 override is set.  Either
+   * path produces a populated section. */
+  if (jit_aot_enabled || getenv("SYMTA_AOT_IA64")) {
+    int nfns = shlen(label2fn);
+    ia64_ofs = arrlen(wb);
+    ia64_count = nfns;
+
+    /* Section header. */
+    EMIT8('I'); EMIT8('A'); EMIT8('6'); EMIT8('4');  /* magic */
+    EMIT16(1);                                       /* version */
+    EMIT32(nfns);                                    /* nfns   */
+
+    /* Sort fn-start offsets so we can compute each body's end
+     * via the next entry (or code_sz for the last).  Match
+     * sbc_jit_install's strategy. */
+    uint32_t *fn_starts = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(nfns + 1));
+    for (int fi = 0; fi < nfns; fi++) {
+      fn_starts[fi] = (uint32_t)shget(l2o, label2fn[fi].key);
+    }
+    fn_starts[nfns] = (uint32_t)code_sz;
+    /* qsort copy for end-lookup. */
+    uint32_t *sorted = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(nfns + 1));
+    for (int k2 = 0; k2 <= nfns; k2++) sorted[k2] = fn_starts[k2];
+    /* Simple insertion sort; nfns is small (hundreds at most). */
+    for (int p = 1; p <= nfns; p++) {
+      uint32_t v = sorted[p];
+      int q = p;
+      while (q > 0 && sorted[q-1] > v) { sorted[q] = sorted[q-1]; q--; }
+      sorted[q] = v;
+    }
+
+    /* Pre-pass: translate every function, collect outcomes so we
+     * know the total payload size before writing the directory.
+     * The directory entries reference payload-relative offsets,
+     * so we need to know all blob sizes first. */
+    typedef struct {
+      int      success;
+      uint32_t code_size;
+      uint16_t reloc_count;
+      uint16_t nvars;
+      uint8_t *code_bytes;        /* not owned; lives inside jit_buf */
+      jit_reloc_t *relocs;        /* not owned; lives inside jit_buf */
+      jit_buf *jb;                /* freed after writing payload */
+    } fn_blob_t;
+    fn_blob_t *blobs = (fn_blob_t*)calloc((size_t)nfns, sizeof(fn_blob_t));
+
+    /* Ensure helpers are at their full-dispatch addresses BEFORE
+     * translating -- the translator bails on NULL helper pointers,
+     * and the loader assumes recorded relocs refer to the same
+     * helpers it itself patches into the code. */
+    jit_install_helpers_public();
+
+    int aot_jit_ok = 0;
+    for (int fi = 0; fi < nfns; fi++) {
+      uint32_t start = fn_starts[fi];
+      /* Find this start's slot in sorted -> next is the end. */
+      int s = 0;
+      while (s < nfns && sorted[s] != start) s++;
+      uint32_t end = sorted[s + 1];
+      if (end <= start + 5) continue;
+      if (code[start] != SBC_SUBR) continue;
+
+      uint16_t nvars = (uint16_t)((uint16_t)code[start + 3]
+                                | ((uint16_t)code[start + 4] << 8));
+      const uint8_t *body = code + start + 5;
+      size_t body_len = (size_t)end - start - 5;
+
+      jit_buf *jb = jit_translate_with_sbc_record(body, body_len);
+      if (!jb) continue;
+
+      blobs[fi].success     = 1;
+      blobs[fi].code_size   = (uint32_t)jb->len;
+      blobs[fi].reloc_count = (uint16_t)jb->relocs_count;
+      blobs[fi].nvars       = nvars;
+      blobs[fi].code_bytes  = jb->code;
+      blobs[fi].relocs      = jb->relocs;
+      blobs[fi].jb          = jb;
+      aot_jit_ok++;
+    }
+
+    /* Compute payload offsets.  The payload area starts right
+     * after the header + directory.  Each blob is [code][relocs]
+     * back-to-back with no padding (the loader copies into a
+     * fresh aligned mapping at install time, so on-disk packing
+     * stays minimal).  payload_offset is from section start. */
+    uint32_t header_bytes = 10;                  /* magic+version+nfns */
+    uint32_t dir_bytes    = (uint32_t)nfns * 16;
+    uint32_t cursor       = header_bytes + dir_bytes;
+    for (int fi = 0; fi < nfns; fi++) {
+      if (blobs[fi].success) {
+        EMIT32(cursor);                       /* payload_offset */
+        EMIT32(blobs[fi].code_size);          /* code_size      */
+        EMIT16(blobs[fi].reloc_count);        /* reloc_count    */
+        EMIT16(0);                            /* unwind_size (loader rebuilds) */
+        EMIT16(blobs[fi].nvars);              /* nvars          */
+        EMIT16(0);                            /* flags          */
+        cursor += blobs[fi].code_size +
+                  (uint32_t)blobs[fi].reloc_count * 8;
+      } else {
+        /* No native code; loader will fall back to interpreter. */
+        EMIT32(0); EMIT32(0); EMIT16(0); EMIT16(0); EMIT16(0); EMIT16(0);
+      }
+    }
+
+    /* Emit payload: code bytes then reloc table per fn. */
+    for (int fi = 0; fi < nfns; fi++) {
+      if (!blobs[fi].success) continue;
+      for (uint32_t bi = 0; bi < blobs[fi].code_size; bi++) {
+        EMIT8(blobs[fi].code_bytes[bi]);
+      }
+      for (uint32_t ri = 0; ri < blobs[fi].reloc_count; ri++) {
+        jit_reloc_t *r = &blobs[fi].relocs[ri];
+        EMIT32(r->offset);
+        EMIT8(r->helper_id);
+        EMIT8(r->pad[0]); EMIT8(r->pad[1]); EMIT8(r->pad[2]);
+      }
+      jit_buf_free(blobs[fi].jb);
+    }
+    free(blobs);
+    free(sorted);
+    free(fn_starts);
+
+    if (getenv("SYMTA_AOT_VERBOSE")) {
+      fprintf(stderr, "ia64-aot: %d/%d functions translated\n",
+              aot_jit_ok, nfns);
+    }
+  }
+
   tbls = wb;
   wb = 0;
 
   /* tot_sz counts the (count, offset) pairs in the trailing tot:
-   * 7 lookup tables + nrs + linenos + RT-7 mcache + HELP-3 docs.
-   * The RT-7 mcache entry's offset field doubles as a format flag
-   * for stage 2 -- see the EMIT24 pair near the bottom of this
-   * function.  The HELP-3 docs entry (count, offset) points to
-   * a flat array of (sym_ofs:24, val_ofs:24) pairs, both offsets
-   * referring into the data section. */
-  int tot_sz = 7 + 3 + 1;
+   * 7 lookup tables + nrs + linenos + RT-7 mcache + HELP-3 docs
+   * + IA64 native section.  The RT-7 mcache entry's offset field
+   * doubles as a format flag for stage 2 -- see the EMIT24 pair
+   * near the bottom of this function.  The HELP-3 docs entry
+   * (count, offset) points to a flat array of (sym_ofs:24,
+   * val_ofs:24) pairs, both offsets referring into the data
+   * section.  The IA64 entry (count = function count, offset =
+   * section start inside tbls) is present in all SBCs emitted by
+   * this writer revision; when SYMTA_AOT_IA64 is unset the count
+   * is 0 and the loader treats the SBC as bytecode-only. */
+  int tot_sz = 7 + 3 + 1 + 1;
 
   /* Format identification: 4-byte magic + 2-byte revision.
    * `sbc_new` checks both before touching anything else.  See
@@ -1054,6 +1241,11 @@ uint8_t *sif2sbc(sif_t *sif) {
   /* HELP-3: docstring section -- count + offset into tbls. */
   EMIT24(doc_sz);
   EMIT24(doc_ofs);
+  /* IA64 native section -- count = function count, offset =
+   * section start inside tbls.  Count of 0 means "no native
+   * payload"; loader will fall through to interpreter dispatch. */
+  EMIT24(ia64_count);
+  EMIT24(ia64_ofs);
 
 
   hdr = wb;

@@ -34,13 +34,14 @@ OBJA =
 
 all: $(TARGET)
 
-lib/:
-	mkdir lib
+lib/dummy:
+	mkdir -p lib
+	echo "dummy" >lib/dummy
 
 lib/%.o: src/%.c
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c -o $@ $<
 
-$(TARGET): lib/ $(OBJS) $(OBJA)
+$(TARGET): lib/dummy $(OBJS) $(OBJA)
 	$(LD) -v -fpic -shared -o $@ $(OBJS) $(OBJA) $(LDFLAGS)
 
 .PHONY: install uninstall clean

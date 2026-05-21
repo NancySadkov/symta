@@ -5,6 +5,27 @@
 #include "ng.h"
 #include "fs.h"
 #include "sffi/sffi.h"
+#include "jit.h"
+
+/* RT-1: threaded dispatch (computed gotos) is on by default for
+ * compilers that support GCC's address-of-label extension --
+ * gcc, clang, MinGW.  The earlier measurement that flagged it as
+ * ~8 % slower was tainted by Windows EcoQoS background throttling
+ * and agent-CPU competition (both addressed in bench/bench.md's
+ * workaround pattern); a clean rebench is owed before judging it
+ * again, but the literature unanimously favours threaded dispatch
+ * and "default on" matches every other JITless interpreter we
+ * compare against.
+ *
+ * MSVC and any other compiler without computed-goto support
+ * falls through to the portable switch dispatch.  Build with
+ * `-DSBC_NO_THREADED_DISPATCH` to force the switch even on
+ * GCC / Clang.  See sbc_exec_fn below for the dispatch macros. */
+#if !defined(SBC_NO_THREADED_DISPATCH) && !defined(SBC_THREADED_DISPATCH)
+  #if defined(__GNUC__) || defined(__clang__)
+    #define SBC_THREADED_DISPATCH 1
+  #endif
+#endif
 
 #define MCACHE_DIV 4
 
@@ -105,6 +126,20 @@ sbc_t *sbc_new(uint8_t *pin, int64_t size, char *path) {
   } else {
     sbc->doc_sz = 0;
     sbc->doc_table = 0;
+  }
+  /* NATIVE/IA64 section (tot[11]).  Optional -- present only on
+   * SBCs emitted by an AOT-capable writer.  Count is the number
+   * of functions described in the section (matches fntbl_sz/3
+   * when populated).  Offset points to the section header inside
+   * tbls.  The section header begins with magic "IA64" (4 bytes)
+   * + version (2 bytes); sbc_prepare validates these on adopt. */
+  if (tot_sz >= 12) {
+    sbc->ia64_sz = (uint32_t)RD24;
+    uint32_t ia64_ofs = (uint32_t)RD24;
+    sbc->ia64_table = sbc->ia64_sz ? (sbc->tbls + ia64_ofs) : 0;
+  } else {
+    sbc->ia64_sz = 0;
+    sbc->ia64_table = 0;
   }
 
   sbc->filename = strdup(path);
@@ -379,6 +414,38 @@ void sbc_prepare(sbc_t *sbc) {
     exit(-1);
   }
 
+  /* Step 5d: optional JIT translatability audit.  Gated on the
+   * env var so a default `make test-drift` run doesn't print
+   * extra noise.  Use `SYMTA_JIT_AUDIT=1 ./symta.exe ...` to see
+   * per-loaded-SBC stats on stderr. */
+  if (getenv("SYMTA_JIT_AUDIT")) {
+    fprintf(stderr, "jit-audit: %s -- ", sbc->filename);
+    sbc_jit_audit(sbc);
+  }
+
+  /* Step 5k: install JIT'd hooks if SYMTA_JIT_RUN is set.
+   * Separate flag from SYMTA_JIT_AUDIT so the audit can be run
+   * (measurement only) without exposing dispatch to JIT'd code.
+   * Setting both runs audit first, then install. */
+  if (getenv("SYMTA_JIT_RUN")) {
+    sbc_jit_install(sbc);
+  }
+
+  /* Step 6c / 8: install pre-baked native code from the IA64
+   * section if both the SBC carries one AND the runtime AOT
+   * gate is open.  The gate is the unified `jit_aot_enabled`
+   * (default-on on Windows, off elsewhere, overridable via
+   * --no-jit / --jit / SYMTA_NO_JIT / SYMTA_JIT) OR the
+   * fine-grained SYMTA_AOT_RUN env-var.
+   * Runs AFTER sbc_jit_install so the AOT pre-baked path wins
+   * when both are set (rare; mostly useful as a "I trust the
+   * AOT writer's output more than runtime translation"
+   * override). */
+  if (sbc->ia64_table && sbc->ia64_sz &&
+      (jit_aot_enabled || getenv("SYMTA_AOT_RUN"))) {
+    sbc_install_ia64(sbc);
+  }
+
   sbc->ready = 1;
 }
 
@@ -433,20 +500,20 @@ int64_t mcache_hits = 0;
 #ifdef SBC_MCACHE
 
 //#define MCACHE_CALL(k,o,_mid) MCALL(k,o,_mid)
-/* The cache hit check has to validate the cached node belongs
+/* The cache hit check has to validate the cached entry belongs
  * to the same `(method_id, type_id)` pair as the current call.
  * Pre-RT-7 SBCs run with `mcache_cnt == 0` -> a single fallback
  * mcache slot that every cache site collides on, so a stale
  * cached entry from a different `m` could otherwise satisfy a
  * tid-only check and dispatch the wrong method.  For RT-7-
- * compiled SBCs each site has its own slot, so `node->mid == m`
+ * compiled SBCs each site has its own slot, so `mce->mid == m`
  * is always true on a hit -- the extra comparison costs ~1
  * cycle per call and the branch predicts cleanly.
  *
- * The third macro parameter is named `_mid` (not `mid`) to
- * avoid colliding with `method_node_t.mid`: a macro parameter
- * named `mid` would text-substitute into `node->mid` and break
- * the build. */
+ * RT-6b: the cache now carries `(tid, mid, fn)` inline (16 B,
+ * one cache line) instead of a `method_node_t*` indirection.
+ * Hit path is one load of fn; miss path probes the per-type
+ * slot table via get_method_for_tag and writes the triple. */
 #define MCACHE_CALL(k,o,_mid) do {            \
     int m = _mid;                            \
     api.method = m;                         \
@@ -454,13 +521,17 @@ int64_t mcache_hits = 0;
     uint32_t _mid_idx = (uint32_t)RD16;     \
     mcache_t *mce = &sbc->mcaches[_mid_idx];\
     uint32_t tid = O_TAG(o);                \
-    method_node_t *node = mce->node;        \
-    if (!node || node->tid != tid || node->mid != m) { \
-      node = get_method_node(m,tid);        \
-      mce->node = node;                     \
+    dyn mfn;                                \
+    if (mce->tid != tid || mce->mid != (uint32_t)m) { \
+      mfn = get_method_for_tag(m,tid);      \
+      mce->tid = tid;                       \
+      mce->mid = (uint32_t)m;               \
+      mce->fn = mfn;                        \
       MCACHE_MISS                           \
-    } else {MCACHE_HIT}                     \
-    dyn mfn = node->fn;                     \
+    } else {                                \
+      mfn = mce->fn;                        \
+      MCACHE_HIT                            \
+    }                                       \
     CALL(k,mfn);                            \
   } while (0)
 #else
@@ -646,6 +717,8 @@ dyn sbc_exec_fn(uint8_t *pin) {
     [SBC_FXNSHR] = &&L_SBC_FXNSHR,
     [SBC_SAME] = &&L_SBC_SAME,
     [SBC_VARY] = &&L_SBC_VARY,
+    [SBC_LIST2] = &&L_SBC_LIST2,
+    [SBC_LIST1] = &&L_SBC_LIST1,
     [SBC_TINIT] = &&L_SBC_TINIT,
     [SBC_TINITI] = &&L_SBC_TINITI,
     [SBC_SUBTYPE] = &&L_SBC_SUBTYPE,
@@ -681,6 +754,28 @@ dyn sbc_exec_fn(uint8_t *pin) {
     [SBC_NSTS2] = &&L_SBC_NSTS2,
     [SBC_NSTS4] = &&L_SBC_NSTS4,
     [SBC_CTX] = &&L_SBC_CTX,
+    /* TS-4.1/4.2: typed unboxed-arithmetic opcodes are placed at
+     * the END of the dispatch table so their goto-label addresses
+     * cluster on their own cache lines.  The interleaved layout
+     * (originally grouped next to SBC_FXNSHR) made the typed-int
+     * hot path share a 64-byte line with the FXN fallbacks; the
+     * generic-mexed code that runs untyped arithmetic was then
+     * paying L1d misses against the typed code.  The same
+     * separation principle applies to the OP() handler bodies
+     * further down -- see end of switch. */
+    [SBC_IADD] = &&L_SBC_IADD,
+    [SBC_ISUB] = &&L_SBC_ISUB,
+    [SBC_IMUL] = &&L_SBC_IMUL,
+    [SBC_IDIV] = &&L_SBC_IDIV,
+    [SBC_IREM] = &&L_SBC_IREM,
+    [SBC_ILT]  = &&L_SBC_ILT,
+    [SBC_IGT]  = &&L_SBC_IGT,
+    [SBC_ILTE] = &&L_SBC_ILTE,
+    [SBC_IGTE] = &&L_SBC_IGTE,
+    [SBC_FADD] = &&L_SBC_FADD,
+    [SBC_FSUB] = &&L_SBC_FSUB,
+    [SBC_FMUL] = &&L_SBC_FMUL,
+    [SBC_FDIV] = &&L_SBC_FDIV,
   };
   goto *dt[*pin++];
 #else
@@ -917,6 +1012,66 @@ dyn sbc_exec_fn(uint8_t *pin) {
     uint32_t size = RD16;
     CHKREG(dst);
     LIST(L[dst],size);
+    BREAK;}
+  OP(SBC_LIST2) {
+    /* RT-9: fused size-2 list allocation.  Replaces the 3-opcode
+     * sequence SBC_LIST 2 + SBC_ST4_0 + SBC_ST4_1 used to emit
+     * `[A B]` literals.  Args: dst u16, a u16, b u16 (8 B total
+     * vs 4 + 2 + 2 = 8 B for the old sequence -- code size
+     * unchanged, but dispatch count drops 3:1, and for the
+     * 130 M size-2 LISTs in a ./game compile that's ~260 M
+     * fewer opcode dispatches). */
+    uint32_t dst = RD16;
+    uint32_t a = RD16;
+    uint32_t b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    /* DEBUG (task #12, behind SYMTA_DBG_LIST2): catch the case
+     * where SBC_LIST2 builds the canonical bad list `[`@` 0x07]`.
+     * L[a] should be `@` fixtext (0x400004) and L[b] is the
+     * poison slot.  This pins the SBC site (pc/op) that produces
+     * the bad list. */
+    {
+      static int l2dbg = -1;
+      if (l2dbg == -1) l2dbg = getenv("SYMTA_DBG_LIST2") ? 1 : 0;
+      if (l2dbg) {
+        uint64_t va = (uint64_t)L[a], vb = (uint64_t)L[b];
+        if ((vb & 1) && (((vb>>1)&0x7FFF) >= 3) &&
+            (((vb>>1)&0x7FFF) <= 7) && (((vb>>1)&0x7FFF) != 6)) {
+          static int seen2 = 0;
+          if (!seen2) {
+            fprintf(stderr,
+                    "[LIST2] dst=%u a(%u)=%016llx b(%u)=%016llx (b tag=%llu)\n",
+                    dst, a, (unsigned long long)va, b,
+                    (unsigned long long)vb,
+                    (unsigned long long)((vb>>1)&0x7FFF));
+            fprintf(stderr,
+                    "[LIST2] sbc->filename = %s\n",
+                    sbc->filename ? sbc->filename : "?");
+            fflush(stderr); seen2 = 1;
+            if (getenv("SYMTA_FATAL_BAD_TAG")) abort();
+          }
+        }
+      }
+    }
+    LIST(L[dst], 2);
+    LGET(L[dst], 0) = L[a];
+    LGET(L[dst], 1) = L[b];
+    BREAK;}
+  OP(SBC_LIST1) {
+    /* RT-9: fused size-1 list allocation.  Replaces SBC_LIST 1 +
+     * SBC_ST4_0 for `[X]` literals.  Args: dst u16, x u16. */
+    uint32_t dst = RD16;
+    uint32_t x = RD16;
+    CHKREG(dst); CHKREG(x);
+    LIST(L[dst], 1);
+    LGET(L[dst], 0) = L[x];
+    /* RT-9 measurement: count what element type ends up in
+     * size-1 LISTs.  Tells us which `T_LIST1_<tag>` tagged-
+     * immediate variants would be worth implementing. */
+    {
+      uint64_t etag = O_TAG(L[x]);
+      if (etag < 32) alloc_stats.list1_elem_tag[etag]++;
+    }
     BREAK;}
   OP(SBC_MOVEEMT) {
     int dst = RD16;
@@ -1396,6 +1551,17 @@ dyn sbc_exec_fn(uint8_t *pin) {
     if (TAGIS(T_INT, L[a])) {
       IMMEQ(L[dst],L[a],L[b]);
       MCACHE_SKIP;
+    } else if ((TAGIS(T_TEXT, L[a]) || TAGIS(T_FIXTEXT, L[a]))
+            && (TAGIS(T_TEXT, L[b]) || TAGIS(T_FIXTEXT, L[b]))) {
+      /* OP-5c: text-vs-text fast path.  `case X [\foo @Rest]:`
+       * patterns reduce to a head-vs-literal-keyword IMMEQ.
+       * For FIXTEXT operands the existing `><` macro peephole
+       * emits SBC_SAME (identity); for BIGTEXT (or mixed) the
+       * fallback used to go through MCACHE_CALL m_eq.  Call
+       * `texts_equal` directly here -- skips the mcache lookup
+       * and the per-call frame setup. */
+      L[dst] = FXN(texts_equal(L[a], L[b]));
+      MCACHE_SKIP;
     } else {
       ARGLIST2(L[a],L[b]);
       MCACHE_CALL(L[dst],L[a],m_eq);
@@ -1406,6 +1572,11 @@ dyn sbc_exec_fn(uint8_t *pin) {
     CHKREG(dst); CHKREG(a); CHKREG(b);
     if (TAGIS(T_INT, L[a])) {
       IMMNE(L[dst],L[a],L[b]);
+      MCACHE_SKIP;
+    } else if ((TAGIS(T_TEXT, L[a]) || TAGIS(T_FIXTEXT, L[a]))
+            && (TAGIS(T_TEXT, L[b]) || TAGIS(T_FIXTEXT, L[b]))) {
+      /* OP-5c: text-vs-text fast path for `<>` / inequality. */
+      L[dst] = FXN(!texts_equal(L[a], L[b]));
       MCACHE_SKIP;
     } else {
       ARGLIST2(L[a],L[b]);
@@ -1811,6 +1982,109 @@ dyn sbc_exec_fn(uint8_t *pin) {
     } else {
       fprintf(stderr, "SBC_CTX: bad type=%d\n", type);
     }
+    BREAK;}
+  /* ============================================================
+   * TS-4 typed unboxed-arithmetic handlers.  Placed at the END
+   * of the switch so the generated machine code for these hot
+   * paths gets its OWN i-cache footprint -- the untyped FXN
+   * fallbacks above don't pull these in on every line fill, and
+   * a workload that's heavy on typed arithmetic doesn't keep
+   * evicting the FXN code.  Same for the goto-label dispatch
+   * table earlier in the file.
+   *
+   * All handlers share the same wire shape as SBC_FXNADD
+   * (op + 3*16-bit regs), so an x86 backend can lower them to
+   * native single-instruction sequences with the FXN bit-tag
+   * conventions:
+   *
+   *   IADD/ISUB/IMUL          -> ADD / SUB / IMUL (no tag check)
+   *   IDIV/IREM               -> IDIV (trap-on-zero via SEH)
+   *   ILT/IGT/ILTE/IGTE       -> CMP + SETcc
+   *   FADD/FSUB/FMUL/FDIV     -> ADDSS / SUBSS / MULSS / DIVSS
+   * ============================================================ */
+  OP(SBC_IADD) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNADD(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_ISUB) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNSUB(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IMUL) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNMUL(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IDIV) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    /* No explicit zero check -- the Windows SEH handler in
+     * w64/ctx.c catches EXCEPTION_INT_DIVIDE_BY_ZERO and routes
+     * it through Symta's `bad`-handling path the same way
+     * FXNDIV's bare `a/b` does. */
+    FXNDIV(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IREM) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNREM(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_ILT) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNLT(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IGT) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNGT(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_ILTE) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNLTE(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_IGTE) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    FXNGTE(L[dst], L[a], L[b]);
+    BREAK;}
+  OP(SBC_FADD) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    LDFLT(L[dst], fa + fb);
+    BREAK;}
+  OP(SBC_FSUB) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    LDFLT(L[dst], fa - fb);
+    BREAK;}
+  OP(SBC_FMUL) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    LDFLT(L[dst], fa * fb);
+    BREAK;}
+  OP(SBC_FDIV) {
+    int dst = RD16; int a = RD16; int b = RD16;
+    CHKREG(dst); CHKREG(a); CHKREG(b);
+    float fa, fb;
+    STFLT(fa, L[a]);
+    STFLT(fb, L[b]);
+    /* Match SBC_FXNDIV's float-fallback: avoid IEEE inf/nan
+     * by substituting FLT_MIN when the divisor is exactly 0. */
+    if (fb == 0.0f) fb = FLT_MIN;
+    LDFLT(L[dst], fa / fb);
     BREAK;}
   /* SBC_LSRC was the CORE-1 v1 per-line opcode.  CORE-1 v2
    * (commit 0b9e2c4) moved line/col into a sorted side table

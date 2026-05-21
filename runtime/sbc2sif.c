@@ -160,6 +160,17 @@ void sbc_dasm_sub(dasm_t *dasm) {
     arrput(as, afmt(0,"L[%d]",RD16));
     arrput(as, afmt(0,"%d",RD16));
     break;}
+  case SBC_LIST2: {
+    /* RT-9: fused size-2 list literal */
+    arrput(as, afmt(0,"L[%d]",RD16));
+    arrput(as, afmt(0,"L[%d]",RD16));
+    arrput(as, afmt(0,"L[%d]",RD16));
+    break;}
+  case SBC_LIST1: {
+    /* RT-9: fused size-1 list literal */
+    arrput(as, afmt(0,"L[%d]",RD16));
+    arrput(as, afmt(0,"L[%d]",RD16));
+    break;}
   case SBC_MOVEEMT: {
     as[0] = afmt(0,"mv");
     arrput(as, afmt(0,"L[%d]",RD16));
@@ -415,6 +426,19 @@ void sbc_dasm_sub(dasm_t *dasm) {
   case SBC_FXNXOR:
   case SBC_FXNSHL:
   case SBC_FXNSHR:
+  case SBC_IADD:   /* TS-4.1 */
+  case SBC_ISUB:
+  case SBC_IMUL:
+  case SBC_IDIV:
+  case SBC_IREM:
+  case SBC_ILT:    /* TS-4.2 */
+  case SBC_IGT:
+  case SBC_ILTE:
+  case SBC_IGTE:
+  case SBC_FADD:
+  case SBC_FSUB:
+  case SBC_FMUL:
+  case SBC_FDIV:
     arrput(as, afmt(0,"L[%d]",RD16));
     arrput(as, afmt(0,"L[%d]",RD16));
     arrput(as, afmt(0,"L[%d]",RD16));
@@ -697,6 +721,17 @@ sif_t *sbc2sif(char *filename) {
       arrput(as, afmt(0,"L[%d]",RD16));
       arrput(as, afmt(0,"%d",RD16));
       break;}
+    case SBC_LIST2: {
+      /* RT-9 */
+      arrput(as, afmt(0,"L[%d]",RD16));
+      arrput(as, afmt(0,"L[%d]",RD16));
+      arrput(as, afmt(0,"L[%d]",RD16));
+      break;}
+    case SBC_LIST1: {
+      /* RT-9 */
+      arrput(as, afmt(0,"L[%d]",RD16));
+      arrput(as, afmt(0,"L[%d]",RD16));
+      break;}
     case SBC_MOVEEMT: {
       as[0] = afmt(0,"mv");
       arrput(as, afmt(0,"L[%d]",RD16));
@@ -952,6 +987,19 @@ sif_t *sbc2sif(char *filename) {
     case SBC_FXNXOR:
     case SBC_FXNSHL:
     case SBC_FXNSHR:
+    case SBC_IADD:   /* TS-4.1 */
+    case SBC_ISUB:
+    case SBC_IMUL:
+    case SBC_IDIV:
+    case SBC_IREM:
+    case SBC_ILT:    /* TS-4.2 */
+    case SBC_IGT:
+    case SBC_ILTE:
+    case SBC_IGTE:
+    case SBC_FADD:
+    case SBC_FSUB:
+    case SBC_FMUL:
+    case SBC_FDIV:
       arrput(as, afmt(0,"L[%d]",RD16));
       arrput(as, afmt(0,"L[%d]",RD16));
       arrput(as, afmt(0,"L[%d]",RD16));

@@ -1,0 +1,25 @@
+A = 5
+B = 1.5
+C = hi
+G = 42
+H caught: 1
+U = 9
+J = 5
+N = 100
+K = 5
+P = 5
+R = hi
+V = 5.0
+FRes = 5
+5+3 = 8
+1.5*2.0 = 3.0
+10<<3 = 0
+FRes2 = 7
+IfRes = 10
+WhenRes = yes
+Z = 10
+W = hello
+countX 0/1/2 = 0 / 1 / 2
+classify 5 = 5
+classify 1.5 = 1.5
+classify 'hi' = hi

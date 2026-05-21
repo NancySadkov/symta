@@ -133,6 +133,8 @@ void sif_loader_init() {
   shput(asmsbc,"arglist"   ,SBC_ARGLIST);
   shput(asmsbc,"starg"     ,SBC_STARG);
   shput(asmsbc,"list"      ,SBC_LIST);
+  shput(asmsbc,"list1"     ,SBC_LIST1);
+  shput(asmsbc,"list2"     ,SBC_LIST2);
   shput(asmsbc,"mv"        ,SBC_MOVE);
   shput(asmsbc,"st"        ,SBC_STOR);
   shput(asmsbc,"ld"        ,SBC_LOAD);
@@ -144,6 +146,21 @@ void sif_loader_init() {
   shput(asmsbc,"fxnmul"    ,SBC_FXNMUL);
   shput(asmsbc,"fxndiv"    ,SBC_FXNDIV);
   shput(asmsbc,"fxnrem"    ,SBC_FXNREM);
+  // TS-4.1: unboxed int arithmetic.  No tag check, no fallback.
+  shput(asmsbc,"iadd"      ,SBC_IADD);
+  shput(asmsbc,"isub"      ,SBC_ISUB);
+  shput(asmsbc,"imul"      ,SBC_IMUL);
+  shput(asmsbc,"idiv"      ,SBC_IDIV);
+  shput(asmsbc,"irem"      ,SBC_IREM);
+  // TS-4.2: unboxed int compare + unboxed float arith.
+  shput(asmsbc,"ilt"       ,SBC_ILT);
+  shput(asmsbc,"igt"       ,SBC_IGT);
+  shput(asmsbc,"ilte"      ,SBC_ILTE);
+  shput(asmsbc,"igte"      ,SBC_IGTE);
+  shput(asmsbc,"fadd"      ,SBC_FADD);
+  shput(asmsbc,"fsub"      ,SBC_FSUB);
+  shput(asmsbc,"fmul"      ,SBC_FMUL);
+  shput(asmsbc,"fdiv"      ,SBC_FDIV);
   shput(asmsbc,"fxneq"     ,SBC_IMMEQ);
   shput(asmsbc,"fxnne"     ,SBC_IMMNE);
   shput(asmsbc,"fxnlt"     ,SBC_FXNLT);

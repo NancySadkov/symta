@@ -286,6 +286,43 @@ static NOINLINE void bad_call(char *method_name, char *msg) {
 
 #define BAD_CALL(method_name, ...) bad_call(method_name,fmt(__VA_ARGS__))
 
+/* CORE-1 / RT-9: resolve a saved bytecode pin to (sbc, row, col).
+ * Returns the owning sbc_t* (or NULL if not in any loaded SBC's
+ * code section) and writes row/col via out-params.  Used by both
+ * print_stack_trace (frame->pin -> caller source line) and the
+ * RT-9 alloc-attribution dump (alloc-site pin -> source line). */
+static sbc_t *resolve_pin(void *pin, int *row_out, int *col_out) {
+  extern int sbcs_loaded;
+  extern sbc_t *sbcs[];
+  if (!pin) return 0;
+  sbc_t *owner = 0;
+  for (int s = 0; s < sbcs_loaded; s++) {
+    sbc_t *sc = sbcs[s];
+    if (pin >= (void*)sc->code && pin < (void*)(sc->code + sc->code_sz)) {
+      owner = sc;
+      break;
+    }
+  }
+  if (!owner || !owner->lineno_table || !owner->lineno_sz) return owner;
+  uint32_t target = (uint32_t)((uint8_t*)pin - owner->code);
+  uint8_t *t = owner->lineno_table;
+  int lo = 0, hi = owner->lineno_sz;
+  int best = -1;
+  /* Each entry: u32 pc, u32 row, u16 col, u16 pad = 12B. */
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    uint32_t pc = *(uint32_t*)(t + mid*12);
+    if (pc <= target) { best = mid; lo = mid + 1; }
+    else hi = mid;
+  }
+  if (best >= 0) {
+    uint8_t *e = t + best*12;
+    *row_out = (int)(*(uint32_t*)(e + 4));
+    *col_out = (int)(*(uint16_t*)(e + 8));
+  }
+  return owner;
+}
+
 static int inside_stack_trace = 0;
 void print_stack_trace() {
   /* `fn` was originally meant to be the per-frame function pointer
@@ -330,36 +367,7 @@ void print_stack_trace() {
        * on the hot path. */
       row = meta->row;
       col = meta->col;
-      if (frm->pin) {
-        extern int sbcs_loaded;
-        extern sbc_t *sbcs[];
-        sbc_t *owner = 0;
-        for (int s = 0; s < sbcs_loaded; s++) {
-          sbc_t *sc = sbcs[s];
-          if (frm->pin >= sc->code && frm->pin < sc->code + sc->code_sz) {
-            owner = sc;
-            break;
-          }
-        }
-        if (owner && owner->lineno_table && owner->lineno_sz) {
-          uint32_t target = (uint32_t)(frm->pin - owner->code);
-          uint8_t *t = owner->lineno_table;
-          int lo = 0, hi = owner->lineno_sz;
-          int best = -1;
-          /* Each entry: u32 pc, u32 row, u16 col, u16 pad = 12B. */
-          while (lo < hi) {
-            int mid = (lo + hi) >> 1;
-            uint32_t pc = *(uint32_t*)(t + mid*12);
-            if (pc <= target) { best = mid; lo = mid + 1; }
-            else hi = mid;
-          }
-          if (best >= 0) {
-            uint8_t *e = t + best*12;
-            row = (int)(*(uint32_t*)(e + 4));
-            col = (int)(*(uint16_t*)(e + 8));
-          }
-        }
-      }
+      resolve_pin(frm->pin, &row, &col);
     }
     fprintf(stderr, "  %016llx:%s:%d,%d,%s\n",
             (unsigned long long)fn, name, row, col, origin);
@@ -393,6 +401,30 @@ BUILTIN2("_.`><`",any_eq,C_ANY,a,C_ANY,b)
 RETURNS(FXN(a == b))
 BUILTIN2("_.`<>`",any_ne,C_ANY,a,C_ANY,b)
 RETURNS(FXN(a != b))
+
+/* OP-3: `_.<<` / `_.>` / `_.>>` -- raw-dyn ordering comparators
+ * on T_OBJECT, mirroring OP-1's identity comparators above.  The
+ * Symta-side defs in core_.s used to read
+ *
+ *   _.`<<` B = not B < Me
+ *   _.`>`  B = B < Me
+ *   _.`>>` B = not Me < B
+ *
+ * which is one MCALL into `<` plus a `not` opcode on top.  These
+ * builtins skip both, doing the bit-level compare directly.
+ *
+ * Caveat: dyn-bit ordering is only meaningful when both operands
+ * have the same tag; cross-type comparisons (T_NO < T_LIST) are
+ * nonsensical.  In practice these are rarely called with
+ * mismatched heap types, and every common type (int / float /
+ * list / text) has its own type-specific override that wins via
+ * METHOD_FN dispatch before we get here. */
+BUILTIN2("_.`<<`",any_lte,C_ANY,a,C_ANY,b)
+RETURNS(FXN((uintptr_t)a <= (uintptr_t)b))
+BUILTIN2("_.`>`", any_gt, C_ANY,a,C_ANY,b)
+RETURNS(FXN((uintptr_t)a >  (uintptr_t)b))
+BUILTIN2("_.`>>`",any_gte,C_ANY,a,C_ANY,b)
+RETURNS(FXN((uintptr_t)a >= (uintptr_t)b))
 BUILTIN1("no.hash",no_hash,C_ANY,a)
 RETURNS(FXN(0x12345678))
 
@@ -749,7 +781,12 @@ BUILTIN3("list.`=`",view_set,C_ANY,o,C_INT,index,C_ANY,value)
       pp[i] = oo[i];
     }
     VIEW_START(o) = 0;
-    VIEW_BASE(o) = VIEW_STRIP_SHARED(r); //personal copy, so not shared
+    /* Bug-#15 sibling: VIEW_BASE(o)=v is a raw LGET-store hidden by
+     * the macro layer.  `o` is the user-supplied view (possibly
+     * aged through GCs); `r` is the freshly-LIST'd copy-on-write
+     * heap object.  Going through lsetm marks the page dirty so
+     * the younger gen's GC scans `o.0` and `r` survives. */
+    lsetm(o, 0, VIEW_STRIP_SHARED(r));
   }
   uint64_t uindex = (uint64_t)UNFXN(index);
   if ((uint64_t)VIEW_SIZE(o) <= uindex) {
@@ -1049,6 +1086,46 @@ BUILTIN2("list.apply_method",list_apply_method,C_ANY,as,C_ANY,m)
   api.method = UNFXN(m);
   dyn fn = get_method(UNFXN(m),LGET(as,0));
   CALL(R,fn);
+RETURNS(R)
+
+/* RT-9: C-side `list.l` for T_VIEW.  The Symta-side dispatch
+ * `list.l = | N $n | Ys dup N | times I N: Ys.I = pop Me | Ys`
+ * was the #2 emitter of T_LIST allocations on the ./game
+ * compile (36 M+ calls).  The dup-macro generates _listn +
+ * .clear + while loop, each call allocates LIST(N) AND incurs
+ * the dispatch + clear + iteration overhead.  The C variant
+ * allocates once and memcpy's the underlying slots.  Same
+ * allocation count, much lower per-call overhead. */
+BUILTIN1("list.l", view_l, C_ANY, o)
+  uint32_t n = VIEW_SIZE(o);
+  uint32_t start = VIEW_START(o);
+  dyn base = VIEW_STRIP_SHARED(VIEW_BASE(o));
+  GC_DISABLE();
+  LIST(R, n);
+  dyn *src = &LGET(base, start);
+  dyn *dst = &LGET(R, 0);
+  for (uint32_t i = 0; i < n; i++) dst[i] = src[i];
+  GC_ENABLE();
+RETURNS(R)
+
+/* RT-9: C-side replacement for the Symta-side `fn.\`()\` @As =
+ * As.apply(Me)`.  The Symta-side defn was the top emitter of
+ * size-1 LIST allocations on the ./game compile -- every
+ * single-arg closure call (`f(x)`) allocated a size-1 LIST for
+ * the @As collection just to immediately unpack it back in
+ * As.apply.  This C-side variant skips the @As collection
+ * entirely: it shifts api.args left by one slot to drop the
+ * receiver, decrements the size, and CALLs the closure
+ * directly.  No new LIST is allocated. */
+BUILTIN_VARARGS("fn.`()`", fn_call)
+  dyn me = getArg(0);  /* receiver = the closure */
+  uint32_t n = LIST_SIZE(api.args);
+  /* Shift api.args[1..n-1] -> api.args[0..n-2], shrink size. */
+  for (uint32_t i = 1; i < n; i++) {
+    lsetm(api.args, i - 1, LGET(api.args, i));
+  }
+  O_SIZE(api.args) = n - 1;
+  CALL(R, me);
 RETURNS(R)
 
 
@@ -1593,23 +1670,20 @@ BUILTIN2("tok.=parsed",tok_sparsed,C_ANY,o,C_ANY,v)
 RETURNS(0);
 
 
-//FIXME: can be speed-up, if all type's methods are linked
 BUILTIN1("methods_",methods_,C_ANY,o)
   GC_DISABLE();
-  int i;
-  method_node_t *m, **ms;
-  int t = (int)O_TAG(o);
   R = Empty;
-  ms = types[t].methods;
-  for (i = 0; i < METHOD_TABLE_SIZE; i++) {
-    for (m = ms[i]; m; m = m->next) {
-      void *name, *c, *pair;
-      LIST(pair, 2);
-      LGET(pair,0) = method_names[m->mid];
-      LGET(pair,1) = m->fn;
-      CONS(c, pair, R);
-      R = c;
-    }
+  type_t *t = &types[(int)O_TAG(o)];
+  /* RT-6/6b: walk the packed slot table -- empty slots have mid==0. */
+  for (uint32_t i = 0; i < t->method_cap; i++) {
+    uint32_t mid = t->methods[i].mid;
+    if (!mid) continue;
+    void *c, *pair;
+    LIST(pair, 2);
+    LGET(pair,0) = method_names[mid];
+    LGET(pair,1) = t->methods[i].fn;
+    CONS(c, pair, R);
+    R = c;
   }
   GC_ENABLE();
 RETURNS(R)
@@ -1640,6 +1714,35 @@ RETURNS(FXN(IMMEDIATE(o)))
 
 BUILTIN1("typename",typename,C_ANY,o)
 RETURNS(types[O_TAG(o)].sname);
+
+/* TS-2.1: Walk the runtime type-tag super chain (set up by
+ * add_subtype in main.c) and return a Symta list of text names,
+ * starting from the receiver's own tag, then its parent, then
+ * grandparent, up to the root.  Uses `types[tag].name` (the C
+ * string) rather than `sname` because many internal types
+ * (T_OBJECT, T_HARD_LIST, T_GENERIC_TEXT, ...) don't have an
+ * sname set but DO have a `name`.  The caller-facing
+ * `subtype_of X T` in core_.s walks this list. */
+BUILTIN1("parents_of_",parents_of_,C_ANY,o)
+  int tag = O_TAG(o);
+  int chain[32];
+  int n = 0;
+  while (tag != END_TAG && n < 32) {
+    chain[n++] = tag;
+    tag = types[tag].super;
+  }
+  GC_DISABLE();
+  R = Empty;
+  /* Build list with head = X's own type-name, tail = ancestors */
+  for (int i = n - 1; i >= 0; i--) {
+    dyn name_text;
+    TEXT(name_text, types[chain[i]].name);
+    void *c;
+    CONS(c, name_text, R);
+    R = c;
+  }
+  GC_ENABLE();
+RETURNS(R)
 
 
 #define PU3(name,s,m,x,y,z) \
@@ -1762,15 +1865,113 @@ static uint64_t show_runtime_info() {
   fprintf(stderr, "heap used: %ld+%ld\n", (long)used0, (long)used1);
   fprintf(stderr, "heap size: %ld\n", (long)(HEAP_SIZE*2));
   fprintf(stderr, "types: %ld\n", arrlen(types));
-  fprintf(stderr, "methods: %d\n", nmethods);
+  /* RT-6b: nmethods retired with the method_pages arena; sum
+   * the per-type slot-table counts instead. */
+  uint64_t total_methods = 0;
+  for (int ti = 0; ti < arrlen(types); ti++) total_methods += types[ti].method_count;
+  fprintf(stderr, "methods: %lu\n", (unsigned long)total_methods);
   fprintf(stderr, "gid_get_ calls: %d\n", prf.gid_get_);
   fprintf(stderr, "gid_set_ calls: %d\n", prf.gid_set_);
+  fprintf(stderr, "\n");
+}
+
+/* RT-9 measurement: per-tag allocation counts.  Separate from
+ * rtstat to keep workload-dependent output out of the 24-runtime
+ * golden -- this one is for benchmark-time data capture. */
+static void show_alloc_stats() {
+  fprintf(stderr, "-------------\n");
+  fprintf(stderr, "allocations by tag:\n");
+  for (uint32_t t = 0; t < 32; t++) {
+    if (!alloc_stats.by_tag[t]) continue;
+    char *name = (t < (uint32_t)arrlen(types) && types[t].name) ? types[t].name : "?";
+    fprintf(stderr, "  %-12s %lu\n", name, (unsigned long)alloc_stats.by_tag[t]);
+  }
+  fprintf(stderr, "list size distribution:\n");
+  for (uint32_t b = 0; b < 16; b++) {
+    if (!alloc_stats.list_size_bucket[b]) continue;
+    if (b < 15)
+      fprintf(stderr, "  size %-3u  %lu\n", b, (unsigned long)alloc_stats.list_size_bucket[b]);
+    else
+      fprintf(stderr, "  size 15+  %lu\n", (unsigned long)alloc_stats.list_size_bucket[b]);
+  }
+  /* RT-9: element-type distribution for size-1 LIST allocations
+   * caught at the SBC_LIST1 store moment (LITERAL `[X]` subset). */
+  uint64_t total_l1 = 0;
+  for (uint32_t t = 0; t < 32; t++) total_l1 += alloc_stats.list1_elem_tag[t];
+  if (total_l1) {
+    fprintf(stderr, "size-1 LIST element types (LITERAL [X] subset, %lu samples):\n",
+            (unsigned long)total_l1);
+    for (uint32_t t = 0; t < 32; t++) {
+      if (!alloc_stats.list1_elem_tag[t]) continue;
+      char *name = (t < (uint32_t)arrlen(types) && types[t].name) ? types[t].name : "?";
+      double pct = (100.0 * (double)alloc_stats.list1_elem_tag[t] / (double)total_l1);
+      fprintf(stderr, "  %-12s %10lu  %5.1f%%\n", name,
+              (unsigned long)alloc_stats.list1_elem_tag[t], pct);
+    }
+  }
+
+  /* RT-9: top-N caller-pin attribution for T_LIST.  Walk the
+   * open-addressed hash, copy populated entries to a flat array,
+   * sort by count descending, print top 20 with resolved source. */
+  uint32_t live = 0;
+  alloc_pin_count_t *flat = 0;
+  for (uint32_t i = 0; i < ALLOC_ATTRIB_BUCKETS; i++) {
+    if (alloc_stats.pin_counts[i].pin) live++;
+  }
+  if (live) {
+    flat = (alloc_pin_count_t*)malloc(live * sizeof(alloc_pin_count_t));
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < ALLOC_ATTRIB_BUCKETS; i++) {
+      if (alloc_stats.pin_counts[i].pin) {
+        flat[k++] = alloc_stats.pin_counts[i];
+      }
+    }
+    /* Simple in-place insertion sort by count desc -- only the
+     * top-20 ordering matters; full sort is fine for tens of
+     * thousands of entries (one-shot at exit). */
+    for (uint32_t i = 1; i < live; i++) {
+      alloc_pin_count_t cur = flat[i];
+      int32_t j = (int32_t)i - 1;
+      while (j >= 0 && flat[j].count < cur.count) {
+        flat[j+1] = flat[j];
+        j--;
+      }
+      flat[j+1] = cur;
+    }
+    fprintf(stderr, "top-20 T_LIST alloc sites (by caller pin):\n");
+    uint64_t total = alloc_stats.by_tag[T_LIST];
+    uint32_t n = live < 20 ? live : 20;
+    for (uint32_t i = 0; i < n; i++) {
+      int row = -1, col = -1;
+      sbc_t *sc = resolve_pin(flat[i].pin, &row, &col);
+      char *origin = sc ? sc->filename : "???";
+      double pct = total ? (100.0 * (double)flat[i].count / (double)total) : 0.0;
+      fprintf(stderr, "  %10lu  %5.1f%%  %s:%d,%d\n",
+              (unsigned long)flat[i].count, pct, origin, row, col);
+    }
+    uint64_t covered = 0;
+    for (uint32_t i = 0; i < live; i++) covered += flat[i].count;
+    fprintf(stderr, "(%u distinct sites covered %lu of %lu allocs)\n",
+            live, (unsigned long)covered, (unsigned long)total);
+    free(flat);
+  }
   fprintf(stderr, "\n");
 }
 
 BUILTIN0("rtstat",rtstat)
   show_runtime_info();
 RETURNS(0)
+
+BUILTIN0("alloc_stats_",alloc_stats_)
+  show_alloc_stats();
+RETURNS(0)
+
+/* RT-9 measurement: if SYMTA_ALLOC_STATS is set in the env, dump
+ * per-tag allocation counts on process exit.  Lets a cold ./game
+ * compile capture the numbers without modifying the workload. */
+static void alloc_stats_atexit(void) {
+  show_alloc_stats();
+}
 
 /* Force a minor GC.  The collector chooses the generation based
  * on the usual triggers (gen0 fill, magnet/dirty signals); we just
@@ -2642,18 +2843,97 @@ BUILTIN3("ffi_memcmp",ffi_memcmp,C_ANY,ptr_a,C_ANY,ptr_b,C_INT,size)
   R = FXN(memcmp((void*)ptr_a, (void*)ptr_b, UNFXN(size)));
 RETURNS(R)
 
-/*
-// here is how a method can be reapplied to other type:
-type meta.~ O M: object_!O meta_!M
-_.meta_ = No
-meta.__ Method Args =
-| Args.0 =  $object_
-| Args.apply_method(Method)
-*/
+/* OP-4: meta.__ direct-dispatch fast path.
+ *
+ * The reader (runtime/reader.c `make_meta_wrapper`) wraps every
+ * parse-stripped list in a `type meta` instance carrying the
+ * source-position info.  The old Symta-side definition was:
+ *
+ *   type meta.~ O M: object_!O meta_!M
+ *   _.meta_ = No
+ *   meta.__ Method Args =
+ *   | Args.0 = $object_
+ *   | Args.apply_method(Method)
+ *
+ * Forwarding cost 3 MCALLs per call: entry to `__`, body's
+ * MCALL into `apply_method`, then the actual MCALL on the
+ * unwrapped receiver.  The compiler + macroexpander pay this on
+ * every method access on every meta-wrapped AST node -- which is
+ * most nodes -- so it dominates cold-compile profiles.
+ *
+ * The C builtin below collapses unwrap + re-dispatch into one:
+ *
+ *   api.args[0] is the meta wrapper (the receiver); slot 0 of
+ *   the wrapper is `object_`.  Overwrite api.args[0] with the
+ *   unwrapped object, get_method(api.method, unwrapped), CALL.
+ *
+ * Calling convention -- per MCACHE_CALL's sink path (sbc.c) --
+ * is:
+ *   getArg(0) = receiver = the meta wrapper.
+ *   api.args  = the original call's args list (length >= 1).
+ *   api.method = the missed method id (raw int, not FXN-wrapped).
+ *
+ * The Symta-side `meta.__` defn was removed from src/core_.s.
+ * Installation happens lazily from reader.c::find_meta_tag (the
+ * first parse_strip after `type meta` was registered) because
+ * the meta type tag doesn't exist at init_builtins time.
+ * add_method's redefinition guard whitelists `m_underscore` so
+ * pre-OP-4 bootstrap SBCs that still carry the Symta-side defn
+ * are silently overridden by this C handler.
+ */
+BUILTIN_VARARGS("meta.`__`", meta_apply)
+  dyn me = getArg(0);
+  dyn unwrapped = LGET(me, 0); /* meta.object_ */
+  lsetm(api.args, 0, unwrapped);
+  dyn fn = get_method(api.method, unwrapped);
+  CALL(R, fn);
+RETURNS(R)
+
+/* One-shot install of meta.__ on the `meta` type tag.  Called
+ * by reader.c::find_meta_tag the first time the tag is located.
+ * Idempotent: subsequent calls no-op. */
+static int meta_dispatch_installed_g = 0;
+void install_meta_dispatch(int tag) {
+  if (meta_dispatch_installed_g) return;
+  GC_DISABLE();
+  setup_b_meta_apply();
+  void *met;
+  BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_meta_apply)->hook);
+  add_method(tag, api.m_underscore, met);
+  meta_dispatch_installed_g = 1;
+  GC_ENABLE();
+}
+
 BUILTIN_VARARGS("__",sink)
   void *o = getArg(0);
   dyn name = get_method_name(api.method);
   int tag = O_TAG(o);
+  /* DEBUG (task #14, behind SYMTA_TRACE_NOSINK): dump 5 levels of
+   * api.frame chain when sink is called with a T_NO object, so the
+   * caller chain that mis-set the receiver can be identified.  Each
+   * frame's name (O_META(clsr)), nvars, closure ptr, and all slot
+   * values are printed.  Zero-cost when env var is unset. */
+  if (tag == T_NO && getenv("SYMTA_TRACE_NOSINK")) {
+    fprintf(stderr, "\n[NOSINK] method=%s on object=No (T_NO)\n",
+            print_object(name));
+    frame_t *frm = api.frame;
+    int depth = 0;
+    while (frm && depth < 6) {
+      fn_meta_t *m = frm->clsr ? (fn_meta_t*)O_META(frm->clsr) : NULL;
+      const char *fname = (m && m->name) ? (const char*)m->name : "<no-meta>";
+      fprintf(stderr, "[NOSINK] frame %d: fn=%s nvars=%d clsr=%p\n",
+              depth, fname, frm->nvars, (void*)frm->clsr);
+      void **slots = FRAME_LOCALS(frm);
+      for (int i = 0; i < frm->nvars && i < 32; i++) {
+        fprintf(stderr, "  L[%d] = %016llx (tag=%d)\n",
+                i, (unsigned long long)(uintptr_t)slots[i],
+                (int)O_TAG(slots[i]));
+      }
+      frm = frm->prev;
+      depth++;
+    }
+    fflush(stderr);
+  }
   char *a = tag < arrlen(types)
             ? fmt("%s has no method ", types[tag].name)
             : fmt("Bad tag %d, for method call ", tag);
@@ -2684,10 +2964,12 @@ static struct {
   B(inspect)
   B(halt)
   B(typename)
+  B(parents_of_)
   B(methods_)
   B(dbg)
   B(say_)
   B(rtstat)
+  B(alloc_stats_)
   B(gc)
   B(gc_set_gen0_pages)
   B(gc_gen0_used)
@@ -2914,6 +3196,19 @@ void init_builtin_methods() {
   METHOD_FN1("=orig", T_TOK, b_tok_sorig);
   METHOD_FN1("=parsed", T_TOK, b_tok_sparsed);
 
+  /* RT-9: register the C-side fn.() handler for T_CLOSURE.
+   * Replaces the Symta-side `fn.\`()\` @As = As.apply(Me)` whose
+   * @As collection was the top emitter of size-1 LIST allocs. */
+  METHOD_FN1("()", T_CLOSURE, b_fn_call);
+
+  /* RT-9: C-side list.l for T_VIEW (replaces Symta-side
+   * `list.l = ... Ys dup N | times I N: Ys.I = pop Me | Ys`).
+   * T_CONS keeps the Symta-side because cons chains can be
+   * IMPROPER (tail is a non-cons value that needs flattening),
+   * and the dispatch-based pop in Symta handles that correctly. */
+  METHOD_FN1("l", T_VIEW, b_view_l);
+
+
   m_add = resolve_method("+");
   m_sub = resolve_method("-");
   m_mul = resolve_method("*");
@@ -2966,7 +3261,11 @@ void init_root_sink() {
   setup_b_sink();
   dyn sink_fn;
   BUILTIN_CLOSURE(sink_fn, meta_b_sink->hook);
-  sink = add_method_r(ADD_CORE_SINK, T_INT, api.m_underscore, sink_fn);
+  /* RT-6b: `sink` is now the dyn fn itself, not a node pointer.
+   * Set the global BEFORE add_method_r so the caller (`intern()`)
+   * picks up the live value when it writes `t->sink_fn = sink`. */
+  sink = sink_fn;
+  add_method_r(ADD_CORE_SINK, T_INT, api.m_underscore, sink_fn);
 }
 
 
@@ -3056,7 +3355,12 @@ void init_builtin_functions() {
 void init_builtins(int argc, char **argv) {
   int i;
   void *tmp;
-  
+
+  /* RT-9 measurement: opt-in alloc-stats-on-exit via env var.
+   * Registered here (before any GC_ENABLE) so even early-exit
+   * paths get the dump. */
+  if (getenv("SYMTA_ALLOC_STATS")) atexit(alloc_stats_atexit);
+
   GC_DISABLE();
 
   api.alloc(T_CLOSURE,0);
@@ -3090,21 +3394,32 @@ void init_builtins(int argc, char **argv) {
   init_subtypes();
 
   /* `_.><` / `_.<>` -- raw-dyn identity comparators on T_OBJECT.
-   * Registered AFTER init_subtypes so add_method propagates them
-   * to every subtype that doesn't already have a type-specific
-   * override (int / text / float / fn / no have their own via
-   * METHOD_FN).  Bootstrap core_.sbc may still carry Symta-side
-   * defs of these methods; add_method allows redefinition for
-   * the two specific method ids (m_equal / m_ne) so the latest
-   * registration wins. */
+   * `_.<<` / `_.>` / `_.>>` -- raw-dyn ordering comparators
+   * (OP-3).  All registered AFTER init_subtypes so add_method
+   * propagates them to every subtype that doesn't already have a
+   * type-specific override (int / float have all six; list has
+   * the four orderings Symta-side; text has equality C-side and
+   * a Symta-side `<` that propagates via the order chain).
+   * Bootstrap core_.sbc may still carry Symta-side defs of these
+   * methods; add_method allows redefinition for the five specific
+   * method ids so the latest registration wins. */
   {
     setup_b_any_eq();
     setup_b_any_ne();
+    setup_b_any_lte();
+    setup_b_any_gt();
+    setup_b_any_gte();
     void *met;
     BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_any_eq)->hook);
     add_method(T_OBJECT, api.m_equal, met);
     BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_any_ne)->hook);
     add_method(T_OBJECT, api.m_ne_, met);
+    BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_any_lte)->hook);
+    add_method(T_OBJECT, m_lte, met);
+    BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_any_gt)->hook);
+    add_method(T_OBJECT, m_gt, met);
+    BUILTIN_CLOSURE(met, ((fn_meta_t*)meta_b_any_gte)->hook);
+    add_method(T_OBJECT, m_gte, met);
   }
 
   init_args(argc, argv);

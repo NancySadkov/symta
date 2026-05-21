@@ -203,18 +203,54 @@ enum {
                           side table so no LSRC bytes are ever
                           emitted; the SIF-side `SBC_LSRC` is
                           now a virtual opcode (see below). */
-/*A1*/ SBC_UNUSEDA1,
-/*A2*/ SBC_UNUSEDA2,
-/*A3*/ SBC_UNUSEDA3,
-/*A4*/ SBC_UNUSEDA4,
-/*A5*/ SBC_UNUSEDA5,
-/*A6*/ SBC_UNUSEDA6,
-/*A7*/ SBC_UNUSEDA7,
+/*A1*/ SBC_LIST2,        /* RT-9: fused size-2 list allocation.
+                          Single opcode replaces SBC_LIST 2 +
+                          SBC_ST4_0 + SBC_ST4_1.  Cuts dispatch
+                          count for [A B] literals from 3 to 1
+                          (size-2 LISTs are 24.6% of all alloc
+                          traffic; ~130 M per ./game compile). */
+/*A2*/ SBC_LIST1,        /* RT-9: fused size-1 list allocation.
+                          Single opcode replaces SBC_LIST 1 +
+                          SBC_ST4_0 for [X] literals.  Size-1
+                          LISTs are 65.5% of alloc traffic
+                          (348 M per ./game compile); SBC_LIST1
+                          only optimises the LITERAL subset
+                          (runtime `_listn 1` from `dup N` still
+                          goes through SBC_FXNLISTN). */
+/*A3*/ SBC_IADD,         /* TS-4.1: unboxed int add; both ops known-int
+                          * at compile time, no tag check, no MCALL
+                          * fallback.  Compiler emits this when the
+                          * static checker proves both operands have
+                          * type "int".  Same wire shape as SBC_FXNADD
+                          * (op + 3*16-bit regs). */
+/*A4*/ SBC_ISUB,
+/*A5*/ SBC_IMUL,
+/*A6*/ SBC_IDIV,
+/*A7*/ SBC_IREM,
 
 /*A8*/ SBC_SAME, //1 if handles equal
 /*A9*/ SBC_VARY, //0 if handles equal
 
-/*AA*/ SBC_END,
+/* TS-4.2: unboxed-int comparison opcodes.  Same wire shape as the
+ * arith family; no tag check or MCALL fallback.  Result is 0 or 1
+ * (already FXN-tagged).  A future x86 backend lowers these to a
+ * literal CMP + SETcc sequence.  Placed AFTER SAME/VARY so those
+ * keep their committed wire-byte values (A8/A9) and existing
+ * sbc/ files load with the new runtime without renumbering. */
+/*AA*/ SBC_ILT,
+/*AB*/ SBC_IGT,
+/*AC*/ SBC_ILTE,
+/*AD*/ SBC_IGTE,
+/* TS-4.2: unboxed-float arithmetic.  Operands are known to be
+ * float-tagged (struct-tagged 64-bit IEEE754).  Same wire shape;
+ * runtime uses STFLT/LDFLT for unbox/rebox.  An x86 backend
+ * lowers these to ADDSS / SUBSS / MULSS / DIVSS on xmm regs. */
+/*AE*/ SBC_FADD,
+/*AF*/ SBC_FSUB,
+/*B0*/ SBC_FMUL,
+/*B1*/ SBC_FDIV,
+
+/*B2*/ SBC_END,
 
 
   SBC_BS,
@@ -279,9 +315,22 @@ typedef struct sif_t { //Parsed Symta Instructions File
  * code on call-heavy modules); cache writes go to a clean
  * D-side region that the L1 prefetcher and the bytecode dispatch
  * loop don't fight over. */
+/* RT-6b: mcache wire format -- carries (tid, mid, fn) directly
+ * instead of a pointer into the (now retired) stable method-node
+ * arena.  16 bytes per slot, fits in a single cache line for any
+ * normal mcache layout.  The dispatch hot path becomes:
+ *   tid_match = (mce->tid == O_TAG(o));
+ *   mid_match = (mce->mid == m);
+ *   if (hit) CALL(mce->fn) else fill via get_method_for_tag.
+ * Pre-RT-6b SBCs that depended on the 8-byte node-pointer
+ * mcache slot still re-execute correctly because mcache_cnt
+ * (RT-7 wire-format field) only describes how many slots to
+ * allocate -- the slot size is a runtime-internal detail. */
 typedef struct {
-  method_node_t *node; //this can be replaced with an int index to method page
-} __attribute__((packed)) mcache_t;
+  uint32_t tid;
+  uint32_t mid;
+  dyn fn;
+} mcache_t;
 
 #define SBC_MCACHE
 
@@ -322,6 +371,37 @@ typedef struct sbc_t {
    * a `char *` directly without copying. */
   uint8_t *doc_table;
   uint32_t doc_sz;
+  /* NATIVE/IA64 section.  Optional; present when tot_sz >= 12
+   * and the writer emitted machine code alongside the bytecode.
+   * Layout inside the blob:
+   *   [0..3]   magic "IA64"  (0x34364149u, little-endian)
+   *   [4..5]   version (currently 1)
+   *   [6..9]   nfns (function count; matches fntbl_sz/3)
+   *   [10..]   per-fn directory, 16 bytes/entry:
+   *      u32  payload_offset    (0 = no native code for this fn,
+   *                              else offset from section start
+   *                              to this fn's code bytes)
+   *      u32  code_size         (machine-code byte count)
+   *      u16  reloc_count       (number of helper-pointer relocs
+   *                              embedded right after the code)
+   *      u16  unwind_size       (UNWIND_INFO+RUNTIME_FUNCTION
+   *                              blob bytes after code+relocs;
+   *                              0 on POSIX targets)
+   *      u16  nvars             (duplicated from SBC_SUBR header,
+   *                              so the adapter doesn't reparse)
+   *      u16  flags             (reserved; 0)
+   *   [...]    payload bytes -- per-fn blobs at the offsets
+   *            recorded in the directory.  Each blob is laid out
+   *            as [code][relocs][unwind] back-to-back, with code
+   *            16-byte aligned to keep call/jmp targets clean.
+   * Loader: when present on a matching host, sbc_prepare maps
+   * each blob into executable memory, applies the relocs against
+   * the runtime's helper-pointer table, registers unwind, and
+   * rewrites the corresponding hooks_heap entry to dispatch
+   * straight to native code.  Functions whose payload_offset is
+   * 0 fall back to interpreter via sbc_exec_fn. */
+  uint8_t *ia64_table;
+  uint32_t ia64_sz;       /* function count (mirrors tot[11].count) */
   tot_entry_t rtot[7]; //relocated tot
   dyn *tx;
   dyn *ty;
