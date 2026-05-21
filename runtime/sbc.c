@@ -440,10 +440,22 @@ void sbc_prepare(sbc_t *sbc) {
    * Runs AFTER sbc_jit_install so the AOT pre-baked path wins
    * when both are set (rare; mostly useful as a "I trust the
    * AOT writer's output more than runtime translation"
-   * override). */
+   * override).
+   *
+   * Step 12j: if AOT install fails (foreign ABI -- the routine
+   * Linux-loading-Windows-SBC case -- or wrong version, or
+   * absent section) and the user asked for JIT, fall back to
+   * runtime translation so `--jit` keeps working on platforms
+   * that don't yet have an ABI-matched AOT bake.  The
+   * fall-back skips when SYMTA_JIT_RUN was set (sbc_jit_install
+   * ran above already) to avoid double-translation. */
+  int aot_installed = 0;
   if (sbc->ia64_table && sbc->ia64_sz &&
       (jit_aot_enabled || getenv("SYMTA_AOT_RUN"))) {
-    sbc_install_ia64(sbc);
+    aot_installed = sbc_install_ia64(sbc);
+  }
+  if (jit_aot_enabled && !aot_installed && !getenv("SYMTA_JIT_RUN")) {
+    sbc_jit_install(sbc);
   }
 
   sbc->ready = 1;
