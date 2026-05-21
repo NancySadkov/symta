@@ -441,7 +441,21 @@ dyn reader_parse_strip(dyn x) {
   badtag_scan(x, "parse_strip:in");
   if (is_tok(x)) {
     dyn parsed = tok_parsed(x);
-    if (parsed) return reader_parse_strip(LGET(parsed, 0));
+    /* RT-12: the parsed cache is always a list -- mk_token /
+     * parse_term store either `LIST(pp,1); pp[0]=value` or larger.
+     * A size-0 list here means the dyn went stale across a GC
+     * (the C local that fed `LGET(pp,0)=parsed` got moved before
+     * the write; the new pp[0] therefore held a stale dyn whose
+     * gc_head_t got zeroed in the freed-gen-pass, and gc_list
+     * later forwarded it to a fresh 0-element list).  Reading
+     * `LGET(parsed,0)` past the end of a 0-list grabs whatever
+     * the next allocation wrote there -- the source of the
+     * tag-3..5/7 poison observed under tiny gen0.  Defensive
+     * guard: if parsed is empty, fall back to tok_value, same as
+     * the no-parsed-cache branch. */
+    if (parsed && is_list(parsed) && LIST_SIZE(parsed) == 1) {
+      return reader_parse_strip(LGET(parsed, 0));
+    }
     return tok_value(x);
   }
   if (!is_list(x)) return x;

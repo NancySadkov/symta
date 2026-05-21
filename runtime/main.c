@@ -989,6 +989,59 @@ int main(int argc, char **argv) {
   }
   //init_api(2560*PAGE_SIZE);
 
+  /* DEBUG (task #12): install a write watchpoint via DR0 if the
+   * user provided a target.  Two modes:
+   *   SYMTA_WATCH_ADDR=<hex>  -- raw address (full address bytes)
+   *   SYMTA_WATCH_GID=<dec>   -- gid in heap0; slot = api.heap0[gid]
+   *   SYMTA_WATCH_SLOT=<dec>  -- additional slot offset (default 0)
+   *   SYMTA_WATCH_VALUE=<hex> -- log+abort on this value (default 0
+   *                              = log every write)
+   *
+   * Used to nail down the SBC opcode or C builtin that writes the
+   * 0x07 poison dyn into a list slot. */
+#ifdef WINDOWS
+  {
+    char *ws = getenv("SYMTA_WATCH_ADDR");
+    char *gs = getenv("SYMTA_WATCH_GID");
+    char *vs = getenv("SYMTA_WATCH_VALUE");
+    char *ss = getenv("SYMTA_WATCH_SLOT");
+    void *addr = 0;
+    uint64_t target = vs ? strtoull(vs, 0, 0) : 0;
+    int slot = ss ? (int)strtol(ss, 0, 0) : 0;
+    if (ws && *ws) {
+      addr = (void*)(uintptr_t)strtoull(ws, 0, 0);
+    } else if (gs && *gs) {
+      uint64_t gid = strtoull(gs, 0, 0);
+      addr = (void*)((uintptr_t)api.heap0 + (gid + slot) * 8);
+    }
+    if (addr) {
+      /* Prefer page-level protection (works without admin); fall
+       * back to DR0 if SYMTA_WATCH_HW=1 is set. */
+      int ok;
+      ctx_set_watch_target_value(target);
+      if (getenv("SYMTA_WATCH_HW")) {
+        ok = ctx_set_write_watchpoint(addr, target);
+        fprintf(stderr, "[WATCH] HW DR0 armed ok=%d\n", ok);
+      } else {
+        ok = ctx_set_page_watchpoint(addr);
+        fprintf(stderr, "[WATCH] page protect armed ok=%d\n", ok);
+      }
+      fprintf(stderr,
+              "[WATCH] addr=%p target=%016llx slot_offset=%d\n"
+              "[WATCH]   api.heap0=%p api.heap1=%p\n"
+              "[WATCH]   addr - heap0 = 0x%llx bytes (%llu slots)\n"
+              "[WATCH]   exe ImageBase = %p  (subtract rip from this+slide "
+              "to get preferred file address)\n",
+              addr, (unsigned long long)target, slot,
+              (void*)api.heap0, (void*)api.heap1,
+              (unsigned long long)((uintptr_t)addr - (uintptr_t)api.heap0),
+              (unsigned long long)(((uintptr_t)addr - (uintptr_t)api.heap0) / 8),
+              (void*)GetModuleHandleA(NULL));
+      fflush(stderr);
+    }
+  }
+#endif
+
   api.sb = (void**)&tmp;
 
   init_builtins(argc, argv);
