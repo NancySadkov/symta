@@ -1545,14 +1545,11 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
        *   otherwise        -> MCACHE_CALL m_eq / m_ne
        * Packed: [15:0]=dst, [31:16]=a, [47:32]=b, [63:48]=mcache_idx.
        *
-       * Note (step 12f attempt): a T_INT-fast-path inline was tried
-       * here but consistently slowed the game compile by 1-2 %
-       * because most IMMEQs in compile-time code compare text/text
-       * (pattern-match keywords), so the inline added a wasted tag
-       * check before falling to the helper.  Helper is already
-       * T_INT-fast internally.  Keeping the helper-only translation
-       * until a workload appears where T_INT-vs-T_INT IMMEQs
-       * dominate. */
+       * Step 12f: inline the T_INT fast path -- TAGIS(T_INT, L[a])
+       * is sufficient because if L[a] is T_INT and L[b] is not,
+       * the bitwise compare correctly yields !equal (the tag bits
+       * differ).  Matches the helper's first branch exactly.
+       * SYMTA_NO_IMMEQ_INLINE bypasses the inline for bisecting. */
       if (i + 9 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
@@ -1569,8 +1566,32 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       uint64_t bb     = (uint64_t)bc_rd16(bc + i + 5);
       uint64_t mcidx  = (uint64_t)bc_rd16(bc + i + 7);
       uint64_t packed = (mcidx << 48) | (bb << 32) | (a << 16) | dst;
-      b->pending_helper_id = hid;
-      jit_emit_call_with_sbc(b, helper, packed);
+
+      int inline_ok = !getenv("SYMTA_NO_IMMEQ_INLINE");
+      if (inline_ok) {
+        /* Fast path: check L[a] is T_INT.  Low 16 bits zero ==
+         * FXN-tagged int.  If L[a] is T_INT we delegate to
+         * jit_emit_same / jit_emit_vary, which run the same
+         * bitwise-compare-and-FXN-tag sequence the helper takes
+         * on the T_INT-fast branch. */
+        emit_mov_rax_from_slot(b, (int)a);   /* rax = L[a] */
+        emit_test_ax_ax(b);                   /* check T_INT (low 16 bits) */
+        size_t to_slow = emit_jnz_rel32(b);
+
+        if (op == BC_IMMEQ) jit_emit_same(b, (int)dst, (int)a, (int)bb);
+        else                jit_emit_vary(b, (int)dst, (int)a, (int)bb);
+        size_t to_done = jit_emit_jmp(b);
+
+        /* Slow path: full helper call. */
+        jit_patch_jmp_here(b, to_slow);
+        b->pending_helper_id = hid;
+        jit_emit_call_with_sbc(b, helper, packed);
+
+        jit_patch_jmp_here(b, to_done);
+      } else {
+        b->pending_helper_id = hid;
+        jit_emit_call_with_sbc(b, helper, packed);
+      }
       i += 9;
       break;
     }
