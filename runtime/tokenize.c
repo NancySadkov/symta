@@ -547,6 +547,10 @@ static dyn read_string(int incut, int end) {
   return r;
 }
 
+/* DEBUG hook implemented in reader.c -- compiled-in but
+ * inert unless SYMTA_SCAN_AST=1. */
+extern void badtag_scan(dyn o, const char *label);
+
 dyn tokenize(dyn orig, dyn o) {
   char *xs = strdup(text_to_cstring(o));
 
@@ -591,5 +595,6 @@ dyn tokenize(dyn orig, dyn o) {
   
   r_cleanup();
 
+  badtag_scan(r, "tokenize:out");
   return r;
 }

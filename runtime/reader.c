@@ -20,6 +20,55 @@
 #include "am.h"
 #include "reader.h"
 
+/* DEBUG (task #12): recursively scan an AST for tag-3..5/7 dyns and
+ * print the first occurrence with a labelled trail.  Behind
+ * SYMTA_SCAN_AST -- normally compiled out by const-folding the env
+ * read at TU init, but the recursive walk is too expensive for the
+ * production hot path. */
+static int badtag_scan_armed = 0;
+static int badtag_scan_seen  = 0;
+static int badtag_check_dyn(dyn o, const char *trail) {
+  uint64_t t = O_TAG(o);
+  if (((uint64_t)o & 1) && ((t >= 3 && t <= 5) || t == 7)) {
+    if (!badtag_scan_seen) {
+      fprintf(stderr, "[ASTSCAN] FIRST bad dyn = %016llx (tag=%llu) at %s\n",
+              (unsigned long long)(uintptr_t)o,
+              (unsigned long long)t, trail);
+      fflush(stderr);
+      badtag_scan_seen = 1;
+    }
+    return 1;
+  }
+  return 0;
+}
+static void badtag_scan_rec(dyn o, const char *trail, int depth) {
+  if (depth > 200) return;
+  if (badtag_check_dyn(o, trail)) return;
+  if ((uint64_t)o & 1) {
+    uint64_t t = O_TAG(o);
+    if (t == T_LIST) {
+      uint64_t n = LIST_SIZE(o);
+      for (uint64_t i = 0; i < n; i++) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s[%llu]", trail, (unsigned long long)i);
+        badtag_scan_rec(LGET(o, i), buf, depth+1);
+      }
+    } else if (t == T_TOK) {
+      const char *names[7] = {"type","val","pchar","row","col","orig","parsed"};
+      for (int i = 0; i < 7; i++) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s.%s", trail, names[i]);
+        badtag_scan_rec(LGET(o, i), buf, depth+1);
+      }
+    }
+  }
+}
+void badtag_scan(dyn o, const char *label) {
+  if (!badtag_scan_armed) return;
+  if (badtag_scan_seen) return;
+  badtag_scan_rec(o, label, 0);
+}
+
 // ====================================================================
 // Token introspection.
 // ====================================================================
@@ -88,6 +137,7 @@ static void kw_init(void) {
   KW_LIST
 #undef X
   kw_initted = 1;
+  if (getenv("SYMTA_SCAN_AST")) badtag_scan_armed = 1;
 }
 
 // Membership tests via switch -- compact and avoids hash overhead.
@@ -300,6 +350,7 @@ static dyn make_bar(dyn row, dyn col, dyn orig) {
 }
 
 dyn reader_add_bars(dyn xs) {
+  badtag_scan(xs, "add_bars:in");
   GC_DISABLE();
   kw_init();
   uint64_t n = LIST_SIZE(xs);
@@ -328,6 +379,7 @@ dyn reader_add_bars(dyn xs) {
   for (int i = 0; i < outn; i++) LGET(r, i) = out[i];
   arrfree(out);
   GC_ENABLE();
+  badtag_scan(r, "add_bars:out");
   return r;
 }
 
@@ -386,6 +438,7 @@ static dyn make_meta_wrapper(dyn obj, dyn src) {
 }
 
 dyn reader_parse_strip(dyn x) {
+  badtag_scan(x, "parse_strip:in");
   if (is_tok(x)) {
     dyn parsed = tok_parsed(x);
     if (parsed) return reader_parse_strip(LGET(parsed, 0));
@@ -1980,10 +2033,12 @@ static dyn parse_tokens_inner(dyn input) {
 // Kept reachable as `parse_tokens_c_` builtin only so test harnesses
 // can probe it; the production text.parse still uses Symta.
 dyn reader_parse_tokens(dyn input) {
+  badtag_scan(input, "parse_tokens:in");
   GC_DISABLE();
   kw_init();
   dyn r = parse_tokens_inner(input);
   GC_ENABLE();
+  badtag_scan(r, "parse_tokens:out");
   return r;
 }
 

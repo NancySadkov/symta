@@ -26,6 +26,39 @@ GCDEF(gc_list)
   pp = &LGET(p,0);
   oo = &LGET(o,0);
   for (i = 0; i < size; i++) {
+    /* DEBUG (task #12, behind SYMTA_DBG_LISTSCAN): catch list slots
+     * containing a tag-3..5/7 poison dyn at GC time.  The src list
+     * holding the corruption is identified by gid + size + slot
+     * index, so it can be cross-referenced against the construction
+     * site. */
+    {
+      static int list_dbg = -1;
+      if (list_dbg == -1) list_dbg = getenv("SYMTA_DBG_LISTSCAN") ? 1 : 0;
+      if (list_dbg) {
+        uint64_t v = (uint64_t)oo[i];
+        if ((v & 1) && (((v>>1)&0x7FFF) >= 3) &&
+            (((v>>1)&0x7FFF) <= 7) && (((v>>1)&0x7FFF) != 6)) {
+          static int seen_list = 0;
+          if (!seen_list) {
+            fprintf(stderr,
+                    "[LISTSCAN] src list o=%p (gid=%llu size=%u) "
+                    "slot[%u] = %016llx (tag=%llu)\n",
+                    (void*)o, (unsigned long long)O_GID(o), size, i,
+                    (unsigned long long)v,
+                    (unsigned long long)((v>>1)&0x7FFF));
+            for (uint32_t j = 0; j < size && j < 16; j++) {
+              uint64_t vj = (uint64_t)oo[j];
+              fprintf(stderr,
+                      "[LISTSCAN]   slot[%u]=%016llx (tag=%llu)\n",
+                      j, (unsigned long long)vj,
+                      (unsigned long long)((vj>>1)&0x7FFF));
+            }
+            fflush(stderr);
+            seen_list = 1;
+          }
+        }
+      }
+    }
     GC_REC(pp[i], oo[i]);
   }
 GCEND(p)

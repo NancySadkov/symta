@@ -96,6 +96,39 @@ static void gcprint(char *fmt, ...) {
 static void gc_builtins(hg_t *src, hg_t *dst) {
   int i, j;
 
+  /* DEBUG (task #12, behind SYMTA_SCAN_AST): walk frame locals at GC
+   * time looking for tag-3..5 / tag-7 dyns.  These are the truly-
+   * reserved tag slots; a heap dyn with one of these tags is the
+   * smoking gun.  Reports the first occurrence with frame fn and
+   * local index. */
+  static int scan_armed = -1;
+  if (scan_armed == -1) {
+    scan_armed = getenv("SYMTA_SCAN_AST") ? 1 : 0;
+  }
+  if (scan_armed) {
+    static int reported = 0;
+    if (!reported) {
+      for (frame_t *frm = api.frame; frm; frm = frm->prev) {
+        void **pv = FRAME_LOCALS(frm);
+        for (int idx = 0; idx < (int)frm->nvars; idx++) {
+          uint64_t v = (uint64_t)pv[idx];
+          if ((v & 1) && (((v >> 1) & 0x7FFF) >= 3) &&
+              (((v >> 1) & 0x7FFF) <= 7) &&
+              (((v >> 1) & 0x7FFF) != 6)) {
+            fn_meta_t *m = frm->clsr ? (fn_meta_t*)O_META(frm->clsr) : 0;
+            const char *fname = (m && m->name) ? (char*)m->name : "?";
+            fprintf(stderr,
+                    "[FRMSCAN] frame fn=%s L[%d] = %016llx (tag=%llu)\n",
+                    fname, idx, (unsigned long long)v,
+                    (unsigned long long)((v >> 1) & 0x7FFF));
+            fflush(stderr);
+            reported = 1;
+          }
+        }
+      }
+    }
+  }
+
   /* C-side anchors: GC-traced slots that C functions holding heap
    * dyns across allocating calls register via gc_anchor_push so
    * their locals stay valid (the GC rewrites *p when the target
