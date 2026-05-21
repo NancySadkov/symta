@@ -1063,6 +1063,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       break;
     }
     case BC_CALL: {
+      if (getenv("SYMTA_NO_CALL")) { jit_last_fail_opcode = op;
+                                       jit_last_fail_offset = i;
+                                       fail = 1; goto done; }
       /* SBC_CALL: opcode + dst(u16) + fn(u16).  The interpreter
        * also writes `api.frame->pin = pin` for stack traces --
        * we skip that here.  JIT'd code doesn't have a `pin`;
@@ -1124,6 +1127,9 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
 
     case BC_MCALL: {
+      if (getenv("SYMTA_NO_MCALL")) { jit_last_fail_opcode = op;
+                                       jit_last_fail_offset = i;
+                                       fail = 1; goto done; }
       /* SBC_MCALL: opcode + dst(u16) + obj(u16) + met(u16) +
        * mcache_idx(u16, read inside MCACHE_CALL).
        * Total: 9 bytes.  Needs the sbc pointer (mt[met], mcaches[idx]). */
