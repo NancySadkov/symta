@@ -174,6 +174,34 @@ GCDEF(gc_custom)
   void **pp, **oo;
   uint64_t tag = O_TAG(o);
   size = types[tag].size;
+  /* Defensive (task #12): tags 3, 4, 5, 7 are reserved placeholder
+   * slots in the type table (_unused0_, _unused1_, _unused2_,
+   * _data_).  Tag 6 (_tag_, T_TAG) IS a legitimate tag used by
+   * Symta's tagged-enum forms (`_tag (_data X)`), but the others
+   * should never appear on a live heap dyn.  Reaching here for
+   * one of the truly-unused tags means something wrote a raw
+   * integer with low bits matching the tag pattern into a heap
+   * slot.  Treat it as an immediate so the corruption doesn't
+   * propagate -- the stale value is harmless on its own; only
+   * gc_custom's automatic OBJECT-with-reserved-tag re-allocation
+   * snowballs it into segfaults later (the macroexpand crash
+   * pinned in tests/runtime/tiny-gen0.sh).  Set SYMTA_FATAL_BAD_TAG
+   * to abort immediately for diagnosis. */
+  if ((tag >= 3 && tag <= 5) || tag == 7) {
+    static int warned = 0;
+    if (!warned) {
+      fprintf(stderr,
+              "[GC] tag-%llu heap-dyn=%p reached gc_custom (reserved "
+              "slot %s); treating as immediate.  Set "
+              "SYMTA_FATAL_BAD_TAG=1 to abort.\n",
+              (unsigned long long)tag, (void*)o,
+              tag < arrlen(types) ? types[tag].name : "?");
+      fflush(stderr);
+      warned = 1;
+      if (getenv("SYMTA_FATAL_BAD_TAG")) abort();
+    }
+    return o;
+  }
   OBJECT(p, tag, size);
   O_CODE(p) = O_CODE(o);
   GC_REDIR(o,p);

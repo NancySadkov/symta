@@ -401,6 +401,14 @@ NOINLINE void fatal(char *fmt, ...);
 NOINLINE void rterr_(char *msg);
 #define rterr(...) rterr_(fmt(__VA_ARGS__))
 
+/* GC anchor API: register a stack-local dyn slot as a GC root so it
+ * stays consistent across allocating calls (the GC rewrites it when
+ * the pointed-to object is moved).  Push before the risky section,
+ * pop on each exit path. */
+void gc_anchor_push(dyn *p);
+void gc_anchor_pop(void);
+void gc_anchor_pop_n(int n);
+
 void *load_sbc(char *name);
 dyn sbc_exec_fn(uint8_t *bytecode);
 void add_lib_folder(char *folder);

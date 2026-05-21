@@ -6,21 +6,33 @@
 # the compiler crashes with:
 #
 #   _unused0_ has no method `is_list`
-#   object=000003fe466d0007 (tag=3)
+#   object=0000000000000007 (tag=3)
 #
-# Tag 3 is undefined; the dyn is a corrupted value.  Stack trace
-# lands in maybe_doc / has_doc_head -- the macroexpander checking
-# whether a function body's first statement is a docstring.  Pure
-# Symta-side code; reproduces identically under --no-jit, so this
-# is NOT a JIT bug -- it's a missing GC root in one of the C
-# builtins that maybe_doc / its helpers transitively call.
+# Tag 3 is reserved -- the dyn `0x07` decodes as (heap=1, tag=3,
+# gid=0), i.e. the literal integer 7 stored where a heap pointer
+# was expected.  Some C-side code writes a small integer into an
+# AST list slot without converting it to a Symta `dyn` (FXN-encoded
+# integer).  Stack trace lands in maybe_doc / has_doc_head -- the
+# macroexpander checking whether a function body's first statement
+# is a docstring.  Pure Symta-side code; reproduces identically
+# under --no-jit, so this is NOT a JIT bug.
 #
-# Fix candidate: instrument GC tracing to find which root is missed;
-# probably a temporary heap pointer held in a C local that isn't
-# either on api.frame's locals or in an api.* slot the GC traces.
+# Mitigation in place (gc.c gc_custom): a tag-3..5 or tag-7 dyn
+# reaching gc_custom is treated as immediate rather than allocated
+# as a new tag-3 object.  That stops the cascade where each GC
+# cycle multiplied the corruption -- previously the corruption
+# would propagate through the heap until a downstream segfault.
+# Now the failure mode is a clean "has no method" error at the
+# first read site, no segfault.
 #
-# Once fixed: this test should pass; if the bug regresses we'll
-# catch it here.
+# What's still needed: locate the C code that writes raw integer 7
+# (or similar low-bits-0111 values) into a heap slot.  Heavy
+# suspects: token / AST construction in runtime/reader.c and
+# runtime/tokenize.c.  Run with `SYMTA_FATAL_BAD_TAG=1` to abort
+# at the first such reachable value.
+#
+# Once the root cause is fixed: this test should pass; if the bug
+# regresses we'll catch it here.
 
 set -u
 cd "$(dirname "$0")/../.."

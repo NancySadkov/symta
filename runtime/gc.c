@@ -14,6 +14,19 @@
 
 static int gc_cycle = 0;
 
+/* GC-roots stack for C code that holds heap dyns across potentially
+ * allocating callees.  Push with `gc_anchor_push(&local)`, pop with
+ * `gc_anchor_pop()`.  The slots are walked by gc_builtins so the GC
+ * forwards them after moves -- the C local sees the new pointer.
+ *
+ * Implementation: a stb_ds dynamic array of `dyn*`.  Both the array
+ * itself (off-heap) and the slots it points to (on the C stack) get
+ * scanned by GC each cycle. */
+static dyn **gc_anchors = 0;
+void gc_anchor_push(dyn *p) { arrput(gc_anchors, p); }
+void gc_anchor_pop(void)    { (void)arrpop(gc_anchors); }
+void gc_anchor_pop_n(int n) { while (n--) (void)arrpop(gc_anchors); }
+
 #define GC_AGE (api.hgp-1)->age
 
 #define GC_REC3(dst,o,mover) { \
@@ -83,6 +96,14 @@ static void gcprint(char *fmt, ...) {
 static void gc_builtins(hg_t *src, hg_t *dst) {
   int i, j;
 
+  /* C-side anchors: GC-traced slots that C functions holding heap
+   * dyns across allocating calls register via gc_anchor_push so
+   * their locals stay valid (the GC rewrites *p when the target
+   * moves).  Cheap when empty -- skipped without any iteration. */
+  for (int ai = 0; ai < arrlen(gc_anchors); ai++) {
+    dyn *p = gc_anchors[ai];
+    if (p) GC_REC(*p, *p);
+  }
   GC_REC(sink, sink);  /* RT-6b: `sink` is now the dyn fn directly */
   GC_REC(api.empty_,api.empty_);
   GC_REC(main_args,main_args);
