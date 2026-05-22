@@ -304,6 +304,37 @@ normalize_nesting O =
 
 imex Expr = mex Expr
 
+// Walks Body's AST looking for any reassignment to V.  Used by
+// Phase 3 `[_if]` narrowing to detect the `if V.is_T: V = ...`
+// pattern (common idiom in uim.s, compiler.s) and skip the
+// narrow there -- otherwise TS-3.7's reassignment check would
+// fire on the inner store because the narrowed type no longer
+// matches the new value.
+//
+// `[_if]`'s case body runs BEFORE Body is mexed, so we have to
+// recognise both pre-mex shapes (user-level `=` and `=:` macros,
+// with `[V]` brackets around the LHS) AND post-mex (`_set`):
+//
+//   pre-mex:  [`=` [V] _]      from user `V = expr`
+//             [`=:` [V] _]     from user `V =: expr`
+//             [`=` V _]        rare; some sugar paths skip the bracket
+//   post-mex: [`_set` V _]
+//
+// Conservative: any descendant reassignment triggers the skip,
+// not just direct-child reassignments.  False positives cost
+// the narrowing win, not correctness.
+has_reassign_to V Body =
+  | less Body.is_list and Body.n > 0: ret 0
+  | // Direct-match shapes
+  | when Body.n >< 3 and Body.0 >< `_set` and Body.1 >< V: ret 1
+  | when Body.n >< 3 and (Body.0 >< `=` or Body.0 >< `=:`):
+    | LHS Body.1
+    | when LHS.is_list and LHS.n >< 1 and LHS.0 >< V: ret 1
+    | when LHS >< V: ret 1
+  | // Recurse on each child
+  | for X Body: when has_reassign_to V X: ret 1
+  | 0
+
 hcase MexFormCases Expr ()
   [_fn As Body] | [_fn As Body^imex]
   [_set Place Value]
@@ -422,6 +453,16 @@ hcase MexFormCases Expr ()
   // The match is intentionally narrow:
   //   * V must be a plain var sym (no narrowing on complex LHS).
   //   * Predicate must be `is_<known_type>` text.
+  //   * Then must NOT reassign V.  The common Symta idiom
+  //     `if V.is_fn: V = V()` (call V if callable, replace with
+  //     the result) is widespread in uim.s and elsewhere; if we
+  //     narrowed unconditionally, TS-3.7's reassignment check
+  //     would fire on the inner `V = V()` because the inferred
+  //     RHS type doesn't match the narrowed `fn`.  Skip the
+  //     narrow when reassignment is detected -- runtime
+  //     behaviour is unchanged, and code that doesn't reassign
+  //     still gets the typed-fast-path win.
+  //
   // Falls through cleanly when Cond doesn't fit -- the case body
   // still emits a valid `_if` with mexed children, matching the
   // old default-path behaviour for this form.
@@ -442,7 +483,7 @@ hcase MexFormCases Expr ()
       | M CondU.2
       | when V^is_var_sym and M.is_text and M.n > 3 and M.take(3) >< "is_":
         | Tname M.drop(3)
-        | when Tname^is_known_type:
+        | when Tname^is_known_type and not has_reassign_to V Then:
           | NarrowT =  Tname
           | NarrowV =  V
     | MexCond mex Cond
