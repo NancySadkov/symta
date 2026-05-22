@@ -982,6 +982,42 @@ jit_buf *jit_translate_with_sbc_record(const uint8_t *bc, size_t n) {
  * keeps the system safe.
  *
  * Disable with SYMTA_NO_REGALLOC. */
+/* Branch threading: when emitting a jump (BC_JMP / BC_JMP16 /
+ * BC_B / BC_B8 / BC_IFFXN) whose target is itself another
+ * unconditional jump, follow the chain so the JIT'd code jumps
+ * directly to the final destination.  Eliminates redundant
+ * trampoline jumps the compiler may emit through nested
+ * macro-expansion sites.
+ *
+ * Capped at 16 hops to bound the worst case and to defend
+ * against pathological self-loops the compiler shouldn't emit
+ * but the bytecode format permits.
+ *
+ * Disable with SYMTA_NO_BRANCH_THREAD. */
+static uint32_t bc_thread_jmp_target(const uint8_t *bc, size_t n,
+                                      uint32_t target) {
+  if (getenv("SYMTA_NO_BRANCH_THREAD")) return target;
+  for (int step = 0; step < 16; step++) {
+    if (target >= n) break;
+    uint8_t op = bc[target];
+    if (op == BC_JMP) {
+      if (target + 4 > n) break;
+      uint32_t next = bc_rd24(bc + target + 1);
+      if (next >= n || next == target) break;
+      target = next;
+    } else if (op == BC_JMP16) {
+      if (target + 3 > n) break;
+      int16_t diff = (int16_t)(uint16_t)bc_rd16(bc + target + 1);
+      int64_t next = (int64_t)target + 3 + diff;
+      if (next < 0 || (uint64_t)next > n || (uint32_t)next == target) break;
+      target = (uint32_t)next;
+    } else {
+      break;
+    }
+  }
+  return target;
+}
+
 static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
   b->pinned_count = 0;
   for (int i = 0; i < JIT_MAX_PINNED; i++) {
@@ -2800,6 +2836,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       /* SBC_JMP: opcode + 24-bit absolute bytecode offset. */
       if (i + 4 > n) { fail = 1; goto done; }
       uint32_t target = bc_rd24(bc + i + 1);
+      target = (uint32_t)bc_thread_jmp_target(bc, n, target);
       if (target >= n) { fail = 1; goto done; }
       size_t patch_off = jit_emit_jmp(b);
       if (patches_n >= JIT_MAX_PATCHES) { fail = 1; goto done; }
@@ -2817,6 +2854,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       int16_t diff = (int16_t)(uint16_t)bc_rd16(bc + i + 1);
       int64_t target = (int64_t)i + 3 + diff;
       if (target < 0 || (uint64_t)target > n) { fail = 1; goto done; }
+      target = (int64_t)bc_thread_jmp_target(bc, n, (uint32_t)target);
       size_t patch_off = jit_emit_jmp(b);
       if (patches_n >= JIT_MAX_PATCHES) { fail = 1; goto done; }
       patches[patches_n].jit_off = patch_off;
@@ -2831,6 +2869,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       if (i + 6 > n) { fail = 1; goto done; }
       int cnd = bc_rd16(bc + i + 1);
       uint32_t target = bc_rd24(bc + i + 3);
+      target = (uint32_t)bc_thread_jmp_target(bc, n, target);
       if (target >= n) { fail = 1; goto done; }
       /* SBC_B branches WHEN cnd is truthy; jnz_slot matches that. */
       size_t patch_off = jit_emit_jnz_slot(b, cnd);
@@ -2849,6 +2888,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       int16_t diff = (int16_t)(uint16_t)bc_rd16(bc + i + 2);
       int64_t target = (int64_t)i + 4 + diff;
       if (target < 0 || (uint64_t)target > n) { fail = 1; goto done; }
+      target = (int64_t)bc_thread_jmp_target(bc, n, (uint32_t)target);
       size_t patch_off = jit_emit_jnz_slot(b, cnd);
       if (patches_n >= JIT_MAX_PATCHES) { fail = 1; goto done; }
       patches[patches_n].jit_off = patch_off;
@@ -2878,6 +2918,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
         jit_last_fail_offset = i;
         fail = 1; goto done;
       }
+      target = (int64_t)bc_thread_jmp_target(bc, n, (uint32_t)target);
       emit_mov_rax_from_slot(b, cnd);
       /* test eax, 0xfffe : a9 fe ff 00 00  (5 bytes; tests low 16
        * bits while leaving the upper 48 untouched -- they don't
