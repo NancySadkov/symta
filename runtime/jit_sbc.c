@@ -64,42 +64,46 @@ static void jit_register_unwind_2arg(void *jit_code, size_t code_size,
   uint8_t *uw   = (uint8_t*)jit_code + uw_off;
 
   if (pinned_count > 0) {
-    /* Pin-active 2-arg prologue layout (Win64, Phase 2b):
+    /* Pin-active 2-arg prologue layout (Win64, Phase 2b Stage 3):
      *   0x00 (1 byte):  push rbx
      *   0x01 (2 bytes): push r12
      *   0x03 (2 bytes): push r13
      *   0x05 (2 bytes): push r14
      *   0x07 (2 bytes): push r15
-     *   0x09 (1 byte):  push rsi          <-- Phase 2b, Stage 2
-     *   0x0a (3 bytes): mov rbx, rcx
-     *   0x0d (3 bytes): mov r12, rdx
-     *   0x10 (variable): emit_reload_pinned   (not a prologue op
+     *   0x09 (1 byte):  push rsi          <-- Stage 2
+     *   0x0a (1 byte):  push rdi          <-- Stage 3
+     *   0x0b (3 bytes): mov rbx, rcx
+     *   0x0e (3 bytes): mov r12, rdx
+     *   0x11 (variable): emit_reload_pinned   (not a prologue op
      *                                          per SEH; loads only)
-     *   0x..: sub rsp, 40
+     *   0x..: sub rsp, 32
      *   prologue_size:  body starts
      *
-     * UNWIND_CODEs in REVERSE prologue order: alloc, push rsi,
-     * push r15, push r14, push r13, push r12, push rbx.
-     * Total: 7 codes -> 4-byte header + 14 bytes -> 18 bytes.
+     * UNWIND_CODEs in REVERSE prologue order: alloc, push rdi,
+     * push rsi, push r15, push r14, push r13, push r12, push rbx.
+     * Total: 8 codes -> 4-byte header + 16 bytes -> 20 bytes.
      * The 24-byte allocation has room. */
     uw[0] = 0x01;                       /* Version=1, Flags=0 */
     uw[1] = (uint8_t)prologue_size;     /* SizeOfProlog */
-    uw[2] = 7;                          /* CountOfCodes */
+    uw[2] = 8;                          /* CountOfCodes */
     uw[3] = 0x00;                       /* FrameReg=0 */
 
-    /* UWOP_ALLOC_SMALL 40 (OpInfo = 40/8 - 1 = 4) at prologue
-     * end -- the sub rsp grew from 32 to 40 with the extra push. */
+    /* UWOP_ALLOC_SMALL 32 (OpInfo = 32/8 - 1 = 3) at prologue
+     * end -- the second extra push restored stack parity, so
+     * sub rsp is back to 32 (the SysV value too). */
     uw[4]  = (uint8_t)prologue_size;
-    uw[5]  = (4 << 4) | 2;
-    /* UWOP_PUSH_NONVOL RSI at offset 10 (just after the 6th
-     * push; 1+2+2+2+2+1 = 10).  RSI = reg 6, op_info=6. */
-    uw[6]  = 10;  uw[7]  = (6  << 4) | 0;
+    uw[5]  = (3 << 4) | 2;
+    /* UWOP_PUSH_NONVOL RDI at offset 11 (after the 7th push;
+     * 1+2+2+2+2+1+1 = 11).  RDI = reg 7. */
+    uw[6]  = 11;  uw[7]  = (7  << 4) | 0;
+    /* UWOP_PUSH_NONVOL RSI at offset 10. */
+    uw[8]  = 10;  uw[9]  = (6  << 4) | 0;
     /* push r15 completes at offset 9. */
-    uw[8]  = 9;   uw[9]  = (15 << 4) | 0;
-    uw[10] = 7;   uw[11] = (14 << 4) | 0;
-    uw[12] = 5;   uw[13] = (13 << 4) | 0;
-    uw[14] = 3;   uw[15] = (12 << 4) | 0;
-    uw[16] = 1;   uw[17] = (3  << 4) | 0;  /* RBX */
+    uw[10] = 9;   uw[11] = (15 << 4) | 0;
+    uw[12] = 7;   uw[13] = (14 << 4) | 0;
+    uw[14] = 5;   uw[15] = (13 << 4) | 0;
+    uw[16] = 3;   uw[17] = (12 << 4) | 0;
+    uw[18] = 1;   uw[19] = (3  << 4) | 0;  /* RBX */
   } else {
     /* No-pins 2-arg prologue (matches jit_emit_prologue2):
      *   0x00 (1 byte):  push rbx

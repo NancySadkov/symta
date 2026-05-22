@@ -149,10 +149,9 @@ typedef struct {
  * whatever's left in the callee-saved set on each platform:
  *
  *   Win64 callee-saved (besides RBX/R12): R13, R14, R15, RSI, RDI
- *     -> JIT_MAX_PINNED = 4 in Stage 2 (R13, R14, R15, RSI)
- *     -> JIT_MAX_PINNED = 5 in Stage 3 (R13, R14, R15, RSI, RDI)
+ *     -> JIT_MAX_PINNED = 5  (R13, R14, R15, RSI, RDI)
  *   SysV  callee-saved (besides RBX/R12): R13, R14, R15
- *     -> JIT_MAX_PINNED = 3 (RSI/RDI are arg regs, caller-saved)
+ *     -> JIT_MAX_PINNED = 3  (RSI/RDI are arg regs, caller-saved)
  *
  * Each entry records the SBC slot index (0..65535) and the
  * physical x86 register number (one of {6=RSI, 7=RDI, 13, 14, 15}).
@@ -168,7 +167,7 @@ typedef struct {
  * case the helper mutated L[] -- including via GC moving a heap
  * ref). */
 #ifdef _WIN32
-#define JIT_MAX_PINNED 4
+#define JIT_MAX_PINNED 5
 #else
 #define JIT_MAX_PINNED 3
 #endif

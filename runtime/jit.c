@@ -717,10 +717,11 @@ void jit_emit_prologue(jit_buf *b) {
     emit_push_reg(b, 14);
     emit_push_reg(b, 15);
 #ifdef _WIN32
-    /* Phase 2b: push RSI as the 4th pinned slot on Win64 (it's
-     * callee-saved there).  Skipped on SysV where RSI is the
-     * arg1 register. */
+    /* Phase 2b: push RSI + RDI as the 4th and 5th pinned slots
+     * on Win64 (both callee-saved there).  Skipped on SysV
+     * where they're the arg1/arg0 registers. */
     emit_push_reg(b, 6);   /* RSI */
+    emit_push_reg(b, 7);   /* RDI */
 #endif
   }
   /* mov rbx, <arg0>  --  rbx is the new home of the locals ptr */
@@ -744,16 +745,12 @@ void jit_emit_prologue(jit_buf *b) {
    * (entry RSP%16 == 8):
    *   no pins:           1 push  -> %16==0 -> sub 32 -> %16==0 ✓
    *   pins SysV (3 reg): 4 pushes-> %16==8 -> sub 40 -> %16==0 ✓
-   *   pins Win64(4 reg): 5 pushes-> %16==0 -> sub 32 -> %16==0 ✓
+   *   pins Win64(5 reg): 6 pushes-> %16==8 -> sub 40 -> %16==0 ✓
    */
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x83);
   jit_emit_u8(b, 0xec);
-#if defined(_WIN32)
-  jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x20 : 0x20);
-#else
   jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x28 : 0x20);
-#endif
   /* Phase 2a SEH unwind: record the prologue length so the
    * unwind-info builder knows where to put SizeOfProlog and the
    * UWOP_ALLOC_SMALL CodeOffset. */
@@ -772,14 +769,11 @@ void jit_emit_epilogue(jit_buf *b) {
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x83);
   jit_emit_u8(b, 0xc4);
-#if defined(_WIN32)
-  jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x20 : 0x20);
-#else
   jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x28 : 0x20);
-#endif
   if (JIT_PHASE2A_HAS_PINS(b)) {
 #ifdef _WIN32
-    emit_pop_reg(b, 6);    /* RSI -- mirrors Win64 prologue push */
+    emit_pop_reg(b, 7);    /* RDI -- mirrors Win64 prologue push */
+    emit_pop_reg(b, 6);    /* RSI */
 #endif
     emit_pop_reg(b, 15);
     emit_pop_reg(b, 14);
@@ -1686,14 +1680,19 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
   }
   /* Phase 2b: pin-eligible callee-saved registers, ordered by
    * preference.  High regs (R13..R15) first because their inline
-   * encoding is the same byte count as low regs; the existing
-   * pre-Phase-2b code path is unchanged for the first 3 slots.
-   * Slot 4 (Win64 only): RSI = 6.  Slot 5 (Stage 3 follow-up):
-   * RDI = 7. */
+   * encoding is one byte longer than low regs (REX.R prefix);
+   * pinning a hot slot to a high reg costs slightly more per
+   * access than a low reg, so we save the low regs for slots
+   * that get pinned regardless (top-3-by-frequency would have
+   * already picked them).
+   *
+   * Slots 4 and 5 (Win64 only): RSI=6, RDI=7.  Both are
+   * callee-saved on Win64 but caller-saved (arg0/arg1) on SysV. */
   static const uint8_t PIN_REGS[JIT_MAX_PINNED] = {
     13, 14, 15
 #ifdef _WIN32
     , 6   /* RSI -- callee-saved on Win64, caller-saved (arg1) on SysV */
+    , 7   /* RDI -- callee-saved on Win64, caller-saved (arg0) on SysV */
 #endif
   };
   for (int k = 0; k < n_pinned; k++) {
@@ -3632,10 +3631,12 @@ void jit_emit_prologue2(jit_buf *b) {
     emit_push_reg(b, 14);
     emit_push_reg(b, 15);
 #ifdef _WIN32
-    /* Phase 2b: RSI is callee-saved on Win64 (caller-saved on
-     * SysV).  Always save it when pins are active so the
-     * 4th-pin slot lives in RSI without per-call save/restore. */
+    /* Phase 2b: RSI + RDI are callee-saved on Win64 (caller-saved
+     * arg1/arg0 on SysV).  Push BEFORE the mov-rbx-from-rcx /
+     * mov-r12-from-rdx steps below -- arg-reg copy uses RCX/RDX
+     * on Win64, so RDI/RSI are free to push at this point. */
     emit_push_reg(b, 6);   /* RSI */
+    emit_push_reg(b, 7);   /* RDI */
 #endif
   }
   /* mov rbx, <arg0>       :  48 89 cb (Win) / fb (SysV) */
@@ -3665,18 +3666,19 @@ void jit_emit_prologue2(jit_buf *b) {
    * CALL pushed the return addr).  Goal: prologue ends with
    * RSP%16==0 so the inner CALL pushes 8 -> callee sees %16==8.
    *
-   *   no pins:  K=2 pushes (rbx + r12)             %16==8 -> sub 40 -> %16==0
-   *   pins SysV: K=5 pushes (+ r13/r14/r15)         %16==0 -> sub 32 -> %16==0
-   *   pins Win64:K=6 pushes (+ r13/r14/r15 + rsi)   %16==8 -> sub 40 -> %16==0
-   */
+   *   no pins:    2 pushes (rbx + r12)             %16==8 -> sub 40 -> %16==0
+   *   pins SysV:  5 pushes (+ r13/r14/r15)         %16==0 -> sub 32 -> %16==0
+   *   pins Win64: 7 pushes (+ r13/r14/r15+rsi+rdi) %16==0 -> sub 32 -> %16==0
+   *
+   * Stage 3 cleanup: both pin-active variants now happen to
+   * land at %16==0 after pushes (odd push count toggles parity),
+   * so the same `sub 32` works on both platforms.  Stage 2 had
+   * Win64 with 1 extra push -> %16==8 -> sub 40; Stage 3's
+   * second extra push restores parity. */
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x83);
   jit_emit_u8(b, 0xec);
-#if defined(_WIN32)
-  jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x28 : 0x28);
-#else
   jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x20 : 0x28);
-#endif
   /* Phase 2a SEH unwind: record the prologue length. */
   b->prologue_alloc_off = (uint16_t)b->len;
   b->prologue_size      = (uint16_t)b->len;
@@ -3690,14 +3692,12 @@ void jit_emit_epilogue2(jit_buf *b) {
   jit_emit_u8(b, 0x48);
   jit_emit_u8(b, 0x83);
   jit_emit_u8(b, 0xc4);
-#if defined(_WIN32)
-  jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x28 : 0x28);
-#else
   jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x20 : 0x28);
-#endif
   if (JIT_PHASE2A_HAS_PINS(b)) {
 #ifdef _WIN32
-    emit_pop_reg(b, 6);    /* RSI -- mirrors Win64 prologue push */
+    /* Reverse push order: pop RDI first, then RSI, then R15..R13. */
+    emit_pop_reg(b, 7);    /* RDI */
+    emit_pop_reg(b, 6);    /* RSI */
 #endif
     emit_pop_reg(b, 15);
     emit_pop_reg(b, 14);
