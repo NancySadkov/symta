@@ -64,37 +64,42 @@ static void jit_register_unwind_2arg(void *jit_code, size_t code_size,
   uint8_t *uw   = (uint8_t*)jit_code + uw_off;
 
   if (pinned_count > 0) {
-    /* Pin-active 2-arg prologue layout:
+    /* Pin-active 2-arg prologue layout (Win64, Phase 2b):
      *   0x00 (1 byte):  push rbx
      *   0x01 (2 bytes): push r12
      *   0x03 (2 bytes): push r13
      *   0x05 (2 bytes): push r14
      *   0x07 (2 bytes): push r15
-     *   0x09 (3 bytes): mov rbx, <arg0>
-     *   0x0c (3 bytes): mov r12, <arg1>
-     *   0x0f (variable): emit_reload_pinned   (not a prologue op
+     *   0x09 (1 byte):  push rsi          <-- Phase 2b, Stage 2
+     *   0x0a (3 bytes): mov rbx, rcx
+     *   0x0d (3 bytes): mov r12, rdx
+     *   0x10 (variable): emit_reload_pinned   (not a prologue op
      *                                          per SEH; loads only)
-     *   0x..: sub rsp, 32
+     *   0x..: sub rsp, 40
      *   prologue_size:  body starts
      *
-     * UNWIND_CODEs in REVERSE prologue order: alloc, push r15,
-     * push r14, push r13, push r12, push rbx. */
+     * UNWIND_CODEs in REVERSE prologue order: alloc, push rsi,
+     * push r15, push r14, push r13, push r12, push rbx.
+     * Total: 7 codes -> 4-byte header + 14 bytes -> 18 bytes.
+     * The 24-byte allocation has room. */
     uw[0] = 0x01;                       /* Version=1, Flags=0 */
     uw[1] = (uint8_t)prologue_size;     /* SizeOfProlog */
-    uw[2] = 6;                          /* CountOfCodes */
+    uw[2] = 7;                          /* CountOfCodes */
     uw[3] = 0x00;                       /* FrameReg=0 */
 
-    /* UWOP_ALLOC_SMALL 32 (OpInfo = 32/8 - 1 = 3) at the byte
-     * right after sub rsp completes -- i.e. prologue_size. */
+    /* UWOP_ALLOC_SMALL 40 (OpInfo = 40/8 - 1 = 4) at prologue
+     * end -- the sub rsp grew from 32 to 40 with the extra push. */
     uw[4]  = (uint8_t)prologue_size;
-    uw[5]  = (3 << 4) | 2;
-    /* UWOP_PUSH_NONVOL R15 at offset 9 (just after the 4 prior
-     * pushes; rbx=1 + r12=2 + r13=2 + r14=2 + r15=2 = 9). */
-    uw[6]  = 9;   uw[7]  = (15 << 4) | 0;
-    uw[8]  = 7;   uw[9]  = (14 << 4) | 0;
-    uw[10] = 5;   uw[11] = (13 << 4) | 0;
-    uw[12] = 3;   uw[13] = (12 << 4) | 0;
-    uw[14] = 1;   uw[15] = (3  << 4) | 0;  /* RBX */
+    uw[5]  = (4 << 4) | 2;
+    /* UWOP_PUSH_NONVOL RSI at offset 10 (just after the 6th
+     * push; 1+2+2+2+2+1 = 10).  RSI = reg 6, op_info=6. */
+    uw[6]  = 10;  uw[7]  = (6  << 4) | 0;
+    /* push r15 completes at offset 9. */
+    uw[8]  = 9;   uw[9]  = (15 << 4) | 0;
+    uw[10] = 7;   uw[11] = (14 << 4) | 0;
+    uw[12] = 5;   uw[13] = (13 << 4) | 0;
+    uw[14] = 3;   uw[15] = (12 << 4) | 0;
+    uw[16] = 1;   uw[17] = (3  << 4) | 0;  /* RBX */
   } else {
     /* No-pins 2-arg prologue (matches jit_emit_prologue2):
      *   0x00 (1 byte):  push rbx

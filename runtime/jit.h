@@ -142,18 +142,23 @@ typedef struct {
   uint8_t  pad[3];
 } jit_reloc_t;
 
-/* Phase 2a register allocation: pin up to JIT_MAX_PINNED locals
- * to callee-saved registers (R13, R14, R15 on Win64 + SysV) so
- * the hot path of typed-int loops avoids a memory round-trip per
- * arithmetic opcode.  RBX and R12 are already reserved for L and
- * sbc respectively, so R13..R15 are the three free callee-saved
- * GPRs we get for "free" -- they survive every helper call by ABI.
+/* Phase 2a/2b register allocation: pin up to JIT_MAX_PINNED locals
+ * to callee-saved registers so the hot path of typed-int loops
+ * avoids a memory round-trip per arithmetic opcode.  RBX and R12
+ * are reserved for L and sbc respectively; pinning draws from
+ * whatever's left in the callee-saved set on each platform:
+ *
+ *   Win64 callee-saved (besides RBX/R12): R13, R14, R15, RSI, RDI
+ *     -> JIT_MAX_PINNED = 4 in Stage 2 (R13, R14, R15, RSI)
+ *     -> JIT_MAX_PINNED = 5 in Stage 3 (R13, R14, R15, RSI, RDI)
+ *   SysV  callee-saved (besides RBX/R12): R13, R14, R15
+ *     -> JIT_MAX_PINNED = 3 (RSI/RDI are arg regs, caller-saved)
  *
  * Each entry records the SBC slot index (0..65535) and the
- * physical x86 register number (13, 14, or 15).  The slot-access
- * emit primitives consult this map: if the requested slot is
- * pinned, they emit register-to-register moves instead of
- * memory ops.
+ * physical x86 register number (one of {6=RSI, 7=RDI, 13, 14, 15}).
+ * The slot-access emit primitives consult this map: if the
+ * requested slot is pinned, they emit register-to-register moves
+ * instead of memory ops.
  *
  * Invariant: between any two opcodes (and on entry to every
  * helper call after the wrapper's spill), `R<reg>` holds the
@@ -162,10 +167,14 @@ typedef struct {
  * (in case the helper reads L[] directly) and reload after (in
  * case the helper mutated L[] -- including via GC moving a heap
  * ref). */
+#ifdef _WIN32
+#define JIT_MAX_PINNED 4
+#else
 #define JIT_MAX_PINNED 3
+#endif
 typedef struct {
   int32_t slot;    /* SBC slot index, or -1 if this entry is unused */
-  uint8_t reg;     /* x86 register number: 13, 14, or 15 */
+  uint8_t reg;     /* x86 register number: 6, 7, 13, 14, or 15 */
   uint8_t pad[3];
 } jit_pinned_t;
 
