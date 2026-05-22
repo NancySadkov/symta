@@ -198,6 +198,21 @@ typedef struct jit_buf {
   jit_pinned_t pinned[JIT_MAX_PINNED];
   int pinned_count;
 
+  /* Phase 2a SEH unwind support.  jit_emit_prologue / prologue2
+   * record the byte offset of the first body instruction here
+   * (i.e. one past the last byte of the prologue).  Windows SEH
+   * needs this as `SizeOfProlog`.
+   *
+   * `prologue_alloc_off` is the byte offset where the `sub rsp K`
+   * completes -- the unwind-code that allocates the final stack
+   * adjustment lands at that exact CodeOffset.
+   *
+   * For functions with `pinned_count > 0` the prologue includes
+   * the R13..R15 pushes + the initial-load `mov R<n>,
+   * [rbx+slot*8]` sequence, so both values differ from the
+   * no-pins case (13 bytes / sub completes at offset 0x0d). */
+  uint16_t prologue_size;
+  uint16_t prologue_alloc_off;
 } jit_buf;
 
 /* Allocate an executable buffer of `cap` bytes.  Returns NULL on

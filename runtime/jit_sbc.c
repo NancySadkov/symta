@@ -44,39 +44,76 @@
  * jit_translate_with_sbc / sbc_jit_install).  The 1-arg
  * variant is self-test only and never longjmps, so it doesn't
  * need unwind info. */
-static void jit_register_unwind_2arg(void *jit_code, size_t code_size) {
+/* Phase 2a-aware: emit UNWIND_INFO matching either the no-pins
+ * (2 push + 1 sub-rsp) or the pin-active (5 push + 1 sub-rsp)
+ * prologue.  `pinned_count > 0` means R13..R15 were pushed
+ * after R12 (always all three when any one is in use).
+ * `prologue_size` is the byte offset right after the final
+ * sub-rsp K -- the function body starts there.
+ *
+ * Allocated unwind blob size: 4-byte header + 2 bytes per
+ * UNWIND_CODE.  Pin-inactive: 3 codes -> 10 bytes.  Pin-active:
+ * 6 codes -> 16 bytes.  We bump the allocation to 24 bytes
+ * (header + 6 codes + pad to even) so both variants fit and
+ * the RUNTIME_FUNCTION lands 4-aligned. */
+static void jit_register_unwind_2arg(void *jit_code, size_t code_size,
+                                      int pinned_count,
+                                      uint16_t prologue_size) {
   size_t uw_off = (code_size + 3) & ~(size_t)3;
-  size_t rt_off = uw_off + 16;  /* 16 bytes max for UNWIND_INFO */
+  size_t rt_off = uw_off + 24;  /* 24 bytes max for UNWIND_INFO */
   uint8_t *uw   = (uint8_t*)jit_code + uw_off;
 
-  /* 2-arg prologue layout (matches jit_emit_prologue2):
-   *   0x00 (1 byte):  push rbx
-   *   0x01 (2 bytes): push r12
-   *   0x03 (3 bytes): mov rbx, <arg0>
-   *   0x06 (3 bytes): mov r12, <arg1>
-   *   0x09 (4 bytes): sub rsp, 40
-   *   0x0d:           body starts
-   *
-   * UNWIND_INFO header (4 bytes) + UNWIND_CODEs (in REVERSE
-   * prologue order, 2 bytes each). */
-  uw[0] = 0x01;             /* Version=1, Flags=0      */
-  uw[1] = 0x0d;             /* SizeOfProlog            */
-  uw[2] = 0x03;             /* CountOfCodes            */
-  uw[3] = 0x00;             /* FrameReg=0, FrameOff=0  */
+  if (pinned_count > 0) {
+    /* Pin-active 2-arg prologue layout:
+     *   0x00 (1 byte):  push rbx
+     *   0x01 (2 bytes): push r12
+     *   0x03 (2 bytes): push r13
+     *   0x05 (2 bytes): push r14
+     *   0x07 (2 bytes): push r15
+     *   0x09 (3 bytes): mov rbx, <arg0>
+     *   0x0c (3 bytes): mov r12, <arg1>
+     *   0x0f (variable): emit_reload_pinned   (not a prologue op
+     *                                          per SEH; loads only)
+     *   0x..: sub rsp, 32
+     *   prologue_size:  body starts
+     *
+     * UNWIND_CODEs in REVERSE prologue order: alloc, push r15,
+     * push r14, push r13, push r12, push rbx. */
+    uw[0] = 0x01;                       /* Version=1, Flags=0 */
+    uw[1] = (uint8_t)prologue_size;     /* SizeOfProlog */
+    uw[2] = 6;                          /* CountOfCodes */
+    uw[3] = 0x00;                       /* FrameReg=0 */
 
-  /* UNWIND_CODE 0: UWOP_ALLOC_SMALL 40 at offset 0x0d.
-   *   CodeOffset = 0x0d
-   *   UnwindOp   = 2 (UWOP_ALLOC_SMALL)
-   *   OpInfo     = (40/8) - 1 = 4 */
-  uw[4] = 0x0d;  uw[5] = (4 << 4) | 2;
+    /* UWOP_ALLOC_SMALL 32 (OpInfo = 32/8 - 1 = 3) at the byte
+     * right after sub rsp completes -- i.e. prologue_size. */
+    uw[4]  = (uint8_t)prologue_size;
+    uw[5]  = (3 << 4) | 2;
+    /* UWOP_PUSH_NONVOL R15 at offset 9 (just after the 4 prior
+     * pushes; rbx=1 + r12=2 + r13=2 + r14=2 + r15=2 = 9). */
+    uw[6]  = 9;   uw[7]  = (15 << 4) | 0;
+    uw[8]  = 7;   uw[9]  = (14 << 4) | 0;
+    uw[10] = 5;   uw[11] = (13 << 4) | 0;
+    uw[12] = 3;   uw[13] = (12 << 4) | 0;
+    uw[14] = 1;   uw[15] = (3  << 4) | 0;  /* RBX */
+  } else {
+    /* No-pins 2-arg prologue (matches jit_emit_prologue2):
+     *   0x00 (1 byte):  push rbx
+     *   0x01 (2 bytes): push r12
+     *   0x03 (3 bytes): mov rbx, <arg0>
+     *   0x06 (3 bytes): mov r12, <arg1>
+     *   0x09 (4 bytes): sub rsp, 40
+     *   0x0d:           body starts */
+    uw[0] = 0x01;             /* Version=1, Flags=0 */
+    uw[1] = (uint8_t)prologue_size;   /* SizeOfProlog (= 0x0d) */
+    uw[2] = 0x03;             /* CountOfCodes */
+    uw[3] = 0x00;             /* FrameReg=0 */
 
-  /* UNWIND_CODE 1: UWOP_PUSH_NONVOL R12 at offset 0x03.
-   *   UnwindOp = 0, OpInfo = 12 (R12). */
-  uw[6] = 0x03;  uw[7] = (12 << 4) | 0;
-
-  /* UNWIND_CODE 2: UWOP_PUSH_NONVOL RBX at offset 0x01.
-   *   UnwindOp = 0, OpInfo = 3 (RBX). */
-  uw[8] = 0x01;  uw[9] = (3 << 4) | 0;
+    /* UWOP_ALLOC_SMALL 40 (OpInfo = 40/8 - 1 = 4) at prologue end. */
+    uw[4] = (uint8_t)prologue_size;
+    uw[5] = (4 << 4) | 2;
+    uw[6] = 0x03;  uw[7] = (12 << 4) | 0;  /* push R12 */
+    uw[8] = 0x01;  uw[9] = (3  << 4) | 0;  /* push RBX */
+  }
 
   /* RUNTIME_FUNCTION sits 4-aligned right after UNWIND_INFO. */
   PRUNTIME_FUNCTION rt = (PRUNTIME_FUNCTION)((uint8_t*)jit_code + rt_off);
@@ -93,8 +130,11 @@ static void jit_register_unwind_2arg(void *jit_code, size_t code_size) {
  * need to emit __register_frame data.  Leaving as a TODO --
  * non-Windows builds still work for any JIT'd function that
  * doesn't have an inner longjmp through its frame. */
-static void jit_register_unwind_2arg(void *jit_code, size_t code_size) {
+static void jit_register_unwind_2arg(void *jit_code, size_t code_size,
+                                      int pinned_count,
+                                      uint16_t prologue_size) {
   (void)jit_code; (void)code_size;
+  (void)pinned_count; (void)prologue_size;
 }
 #endif
 
@@ -1274,10 +1314,20 @@ int sbc_install_ia64(struct sbc_t *sbc) {
                        | ((uint32_t)e[6] << 16)
                        | ((uint32_t)e[7] << 24);
     uint16_t reloc_count = (uint16_t)e[8]  | ((uint16_t)e[9]  << 8);
-    /* e[10..11] unwind_size -- 0; loader rebuilds via
-     * jit_register_unwind_2arg from the known prologue layout. */
+    /* e[10..11]: prologue_size (Phase 2a-aware loaders) or 0
+     * (older SBCs).  When 0, the no-pins fallback in
+     * jit_register_unwind_2arg handles it via the hardcoded
+     * 13-byte layout. */
+    uint16_t prologue_size_e = (uint16_t)e[10] | ((uint16_t)e[11] << 8);
     uint16_t nvars = (uint16_t)e[12] | ((uint16_t)e[13] << 8);
-    /* e[14..15] flags -- reserved. */
+    /* e[14..15]: pinned_count (low byte; Phase 2a-aware
+     * loaders) or 0 (older SBCs).  Treat 0 as "no pins". */
+    uint8_t  pinned_count_e = e[14];
+    /* If e[10..11] is missing (older SBC bake), fall back to the
+     * no-pins prologue length so the unwind data is at least
+     * self-consistent. */
+    uint16_t effective_prologue_size = prologue_size_e ? prologue_size_e
+                                                       : (uint16_t)13;
 
     /* Bound-check the blob inside the section. */
     uint32_t blob_end = payload_off + code_size + (uint32_t)reloc_count * 8;
@@ -1331,9 +1381,15 @@ int sbc_install_ia64(struct sbc_t *sbc) {
 
     /* Register SEH unwind BEFORE finalize -- the unwind blob is
      * written into the same mapping (right after the code), and
-     * POSIX finalize drops write permission on the page. */
+     * POSIX finalize drops write permission on the page.
+     *
+     * Phase 2a: pass the recorded prologue_size + pinned_count
+     * from the directory entry so the unwind data matches the
+     * actual prologue layout. */
     void *jit_code = jit_buf_finalize(jb);
-    jit_register_unwind_2arg(jit_code, jb->len);
+    jit_register_unwind_2arg(jit_code, jb->len,
+                              (int)pinned_count_e,
+                              effective_prologue_size);
 
     jit_adapter_payload_t *payload =
       (jit_adapter_payload_t*)malloc(sizeof(*payload));
@@ -1460,8 +1516,13 @@ int sbc_jit_install(struct sbc_t *sbc) {
 
     /* Register Windows SEH unwind info so longjmp through this
      * frame works.  Zero-cost on the happy path -- the table
-     * entry just sits in memory until RtlUnwindEx looks it up. */
-    jit_register_unwind_2arg(jit_code, jb->len);
+     * entry just sits in memory until RtlUnwindEx looks it up.
+     *
+     * Phase 2a: pass jb->pinned_count + jb->prologue_size so
+     * the unwind data matches the actual prologue layout. */
+    jit_register_unwind_2arg(jit_code, jb->len,
+                              jb->pinned_count,
+                              jb->prologue_size);
 
     jit_adapter_payload_t *payload =
       (jit_adapter_payload_t*)malloc(sizeof(*payload));

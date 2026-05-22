@@ -1120,6 +1120,14 @@ uint8_t *sif2sbc(sif_t *sif) {
       uint32_t code_size;
       uint16_t reloc_count;
       uint16_t nvars;
+      uint16_t prologue_size;     /* Phase 2a SEH unwind: byte offset
+                                   * of first body instruction.  Equals
+                                   * 13 for no-pins prologue; varies
+                                   * for pin-active prologue. */
+      uint8_t  pinned_count;      /* Phase 2a: how many slots are
+                                   * pinned to R13..R15.  0 means
+                                   * no-pins prologue. */
+      uint8_t  flags_pad;
       uint8_t *code_bytes;        /* not owned; lives inside jit_buf */
       jit_reloc_t *relocs;        /* not owned; lives inside jit_buf */
       jit_buf *jb;                /* freed after writing payload */
@@ -1150,13 +1158,15 @@ uint8_t *sif2sbc(sif_t *sif) {
       jit_buf *jb = jit_translate_with_sbc_record(body, body_len);
       if (!jb) continue;
 
-      blobs[fi].success     = 1;
-      blobs[fi].code_size   = (uint32_t)jb->len;
-      blobs[fi].reloc_count = (uint16_t)jb->relocs_count;
-      blobs[fi].nvars       = nvars;
-      blobs[fi].code_bytes  = jb->code;
-      blobs[fi].relocs      = jb->relocs;
-      blobs[fi].jb          = jb;
+      blobs[fi].success       = 1;
+      blobs[fi].code_size     = (uint32_t)jb->len;
+      blobs[fi].reloc_count   = (uint16_t)jb->relocs_count;
+      blobs[fi].nvars         = nvars;
+      blobs[fi].prologue_size = jb->prologue_size;
+      blobs[fi].pinned_count  = (uint8_t)jb->pinned_count;
+      blobs[fi].code_bytes    = jb->code;
+      blobs[fi].relocs        = jb->relocs;
+      blobs[fi].jb            = jb;
       aot_jit_ok++;
     }
 
@@ -1173,9 +1183,18 @@ uint8_t *sif2sbc(sif_t *sif) {
         EMIT32(cursor);                       /* payload_offset */
         EMIT32(blobs[fi].code_size);          /* code_size      */
         EMIT16(blobs[fi].reloc_count);        /* reloc_count    */
-        EMIT16(0);                            /* unwind_size (loader rebuilds) */
+        /* e[10..11]: was "unwind_size, loader rebuilds" (always 0).
+         * Phase 2a repurpose: prologue_size in bytes.  Old loaders
+         * that read this as 0 still fall back to the hardcoded
+         * 13-byte prologue layout; new loaders use it directly. */
+        EMIT16(blobs[fi].prologue_size);      /* prologue_size  */
         EMIT16(blobs[fi].nvars);              /* nvars          */
-        EMIT16(0);                            /* flags          */
+        /* e[14..15]: was "flags" (always 0).  Phase 2a:
+         *   low byte  = pinned_count (0..3)
+         *   high byte = reserved (0)
+         * Loaders that don't know about Phase 2a see 0 and use
+         * the no-pins unwind layout. */
+        EMIT16((uint16_t)blobs[fi].pinned_count);
         cursor += blobs[fi].code_size +
                   (uint32_t)blobs[fi].reloc_count * 8;
       } else {

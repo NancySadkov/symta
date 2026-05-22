@@ -580,6 +580,11 @@ void jit_emit_prologue(jit_buf *b) {
   jit_emit_u8(b, 0x83);
   jit_emit_u8(b, 0xec);
   jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x28 : 0x20);
+  /* Phase 2a SEH unwind: record the prologue length so the
+   * unwind-info builder knows where to put SizeOfProlog and the
+   * UWOP_ALLOC_SMALL CodeOffset. */
+  b->prologue_alloc_off = (uint16_t)b->len;
+  b->prologue_size      = (uint16_t)b->len;
 }
 
 void jit_emit_epilogue(jit_buf *b) {
@@ -983,31 +988,22 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
     b->pinned[i].slot = -1;
     b->pinned[i].reg = 0;
   }
-  /* OPT-IN ONLY (Phase 2a, May 2026): Windows SEH unwind info
-   * for the JIT'd functions is hardcoded to the no-pins prologue
-   * layout (jit_register_unwind_2arg in jit_sbc.c records exactly
-   * 2 push + 1 sub-rsp at SizeOfProlog=0x0d).  Enabling pinning
-   * changes the prologue to 5 push + 1 sub-rsp at a longer
-   * SizeOfProlog -- which the SEH walker doesn't know about.
-   * Any JIT'd frame that gets unwound via longjmp (`bad`/`btjump`
-   * /etc.) then mis-restores callee-saved registers and corrupts
-   * the caller's frame.  Symptoms: 30-anaphoric / 34-xml /
-   * 35-json segfault on the error-path branches; drift bootstrap
-   * is intermittently non-deterministic.
-   *
-   * Until jit_register_unwind_2arg learns about the variable
-   * prologue (per-function unwind data stored alongside the
-   * jit_buf), Phase 2a stays opt-in via SYMTA_REGALLOC=1.  The
-   * infrastructure (slot primitives consulting b->pinned, the
-   * helper-call spill/reload wrap, the prologue extension and
-   * matching epilogue) is wired up correctly -- it just isn't
-   * activated by default.
-   *
-   * The TYPED-INT counted-loop smoke test (`times I 1000: A=A+I;
-   * say A` -> 499500) confirms the inline reg-to-reg moves work
-   * on the no-SEH path; opt-in benchmarking can measure the
-   * gain without affecting the default test suite. */
-  if (!getenv("SYMTA_REGALLOC")) return;
+  /* Phase 2a is now default-on (May 2026).  Earlier the SEH
+   * unwind info was hardcoded to the no-pins prologue layout,
+   * which mis-restored callee-saved registers when a longjmp
+   * unwound through a pinned-slot JIT'd frame.  The fix landed
+   * in the same commit as this default flip:
+   *   - jit_emit_prologue / prologue2 record `prologue_size` and
+   *     `prologue_alloc_off` into the jit_buf.
+   *   - jit_register_unwind_2arg now takes (pinned_count,
+   *     prologue_size) and emits a 6-code (vs 3-code) UNWIND_INFO
+   *     for the pin-active prologue.
+   *   - sif2sbc.c stores these per-function in the IA64
+   *     directory entries (former unwind_size + flags slots).
+   *   - jit_sbc.c's AOT loader reads them and forwards to the
+   *     unwind registrar.
+   * SYMTA_NO_REGALLOC disables for emergency bisecting. */
+  if (getenv("SYMTA_NO_REGALLOC")) return;
 
   enum { JIT_SCAN_MAX_SLOT = 4096 };
   uint32_t counts[JIT_SCAN_MAX_SLOT];
@@ -3181,6 +3177,9 @@ void jit_emit_prologue2(jit_buf *b) {
   jit_emit_u8(b, 0x83);
   jit_emit_u8(b, 0xec);
   jit_emit_u8(b, JIT_PHASE2A_HAS_PINS(b) ? 0x20 : 0x28);
+  /* Phase 2a SEH unwind: record the prologue length. */
+  b->prologue_alloc_off = (uint16_t)b->len;
+  b->prologue_size      = (uint16_t)b->len;
 }
 
 void jit_emit_epilogue2(jit_buf *b) {
