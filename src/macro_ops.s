@@ -306,13 +306,44 @@ typed_float_binop_for Op =
   elif Op >< _div then \_fdiv
   else No
 
+// Phase 4 strength reduction for typed-int binary ops with a
+// literal constant operand.  Catches:
+//   X * 0 -> 0      X * 1 -> X      X * 2 -> X+X
+//   0 * X -> 0      1 * X -> X      2 * X -> X+X
+//   X + 0 -> X      0 + X -> X
+//   X - 0 -> X
+// Conservative: only fires when the non-constant operand is a
+// simple var-sym (text-without-keyword tag) or another literal,
+// so the rewrite can't lose side effects.  Complex operands
+// (function calls, method dispatch) fall through to the regular
+// typed-op path.  Saves the LDFXN of the literal slot plus
+// (for `* 2`) the per-iter IMUL latency vs IADD.
+strength_reduce_int_op A B Op =
+  | AS (A^is_var_sym or A.is_int)
+  | BS (B^is_var_sym or B.is_int)
+  | when Op >< _mul:
+    | when AS and B.is_int and B >< 0: ret 0
+    | when AS and B.is_int and B >< 1: ret A
+    | when AS and B.is_int and B >< 2: ret [_iadd A A]
+    | when BS and A.is_int and A >< 0: ret 0
+    | when BS and A.is_int and A >< 1: ret B
+    | when BS and A.is_int and A >< 2: ret [_iadd B B]
+  | when Op >< _add:
+    | when AS and B.is_int and B >< 0: ret A
+    | when BS and A.is_int and A >< 0: ret B
+  | when Op >< _sub:
+    | when AS and B.is_int and B >< 0: ret A
+  | No
+
 bin_op A B Op Method =
   TA infer_type A
   TB infer_type B
   IntOp typed_int_binop_for Op
   FltOp typed_float_binop_for Op
   if got IntOp and TA >< "int" and TB >< "int"
-    then [IntOp A B]
+    then
+      | SR strength_reduce_int_op A B Op
+      | if got SR then SR else [IntOp A B]
   elif got FltOp and TA >< "float" and TB >< "float"
     then [FltOp A B]
   // TS-4.4: inside `static`, refuse to fall back to the dyn
