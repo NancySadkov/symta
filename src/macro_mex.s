@@ -411,7 +411,23 @@ hcase MexFormCases Expr ()
     | mex [`let_` [[G E2]] [`_type` Type G G]]
   [`&` O] | if O.is_keyword then O else bad "implement `&Var` ([O])" // [O^mex]
 
-mex ExprIn =
+// ============================================================
+// STACK-1 Step 1: rename `mex` body to `mex_loop_body` and wrap
+// `mex` in a one-liner that calls it.  This is a NO-OP refactor:
+// the body is byte-identical to the prior `mex ExprIn = ...`.
+// It exists so that Step 1.5 (next commit) can add a heap
+// work-stack around the body without touching every call site.
+//
+// The rename + wrapper proves the indirection is benign (drift
+// + tests must still pass).  Recursive `mex` calls from inside
+// case bodies now go `mex Expr -> mex_loop_body Expr` per level,
+// adding exactly one Symta frame per recursion -- a small cost
+// to pay for the architectural foothold.
+// ============================================================
+
+mex Expr = mex_loop_body Expr
+
+mex_loop_body ExprIn =
 #if #NCM_TRACE_MACROS
 | mtrace_say \mex ExprIn
 #endif
@@ -428,7 +444,7 @@ mex ExprIn =
 | R let GExpansionDepth GExpansionDepth+1: hcase_go MexFormCases Expr ()
       (Head NArgs =>
           mex_error "special form `[Head]` expects [NArgs] arguments")
-  | Src when Expr.is_meta: Expr.meta_ 
+  | Src when Expr.is_meta: Expr.meta_
   | let GSrc (if got Src then Src else GSrc)
     | mex_normal Expr.head Expr.tail 1
 | when R.is_list: R = supply_meta R ExprIn
