@@ -261,6 +261,95 @@ static void emit_cmp_reg_zero(jit_buf *b, int reg) {
   jit_emit_u8(b, 0x00);
 }
 
+/* ============================================================
+ * In-place arithmetic helpers for the pinned-dst optimisation.
+ *
+ * The default Phase 2a pattern for `IADD dst a b` is:
+ *   mov  rax, R<a>     ; 3 bytes
+ *   add  rax, R<b>     ; 3 bytes  (or 4-5 bytes for memory)
+ *   mov  R<dst>, rax   ; 3 bytes
+ * = 3-cycle serial dependency chain on RAX.
+ *
+ * For dst pinned, we can sidestep RAX entirely:
+ *   add  R<dst>, R<b>      ; 3 bytes, 1 cycle  (if dst == a)
+ * or
+ *   mov  R<dst>, R<a>      ; 3 bytes
+ *   add  R<dst>, R<b>      ; 3 bytes        (if dst != a)
+ *
+ * The 1-cycle dst==a case is the hot one for counted loops
+ * (`X += I`, `Count + 1`).  Saves 2 cycles per such IADD.
+ *
+ * Helpers below handle both reg-to-reg and reg-to-memory
+ * operand combinations.  Each assumes `reg` is one of the
+ * pinned-eligible R13..R15.
+ * ============================================================ */
+
+/* add R<dst_reg>, R<src_reg>  --  4D 03 (C0 | dst3<<3 | src3)  3 bytes */
+static void emit_add_reg_from_reg(jit_buf *b, int dst_reg, int src_reg) {
+  jit_emit_u8(b, 0x4d);                            /* REX.W + REX.R + REX.B */
+  jit_emit_u8(b, 0x03);                            /* add r64, r/m64 */
+  jit_emit_u8(b, (uint8_t)(0xc0 | ((dst_reg - 8) << 3) | (src_reg - 8)));
+}
+
+/* add R<dst_reg>, [rbx + slot*8]  --  4C 03 ModR/M+disp  (4-5 / 7 bytes) */
+static void emit_add_reg_from_slot(jit_buf *b, int dst_reg, int slot) {
+  jit_emit_u8(b, 0x4c);                            /* REX.W + REX.R */
+  jit_emit_u8(b, 0x03);                            /* add r64, r/m64 */
+  emit_mem_op(b, (uint8_t)(dst_reg - 8), slot);    /* reg field = dst */
+}
+
+/* sub R<dst_reg>, R<src_reg>  --  4D 2B + ModR/M  3 bytes */
+static void emit_sub_reg_from_reg(jit_buf *b, int dst_reg, int src_reg) {
+  jit_emit_u8(b, 0x4d);
+  jit_emit_u8(b, 0x2b);
+  jit_emit_u8(b, (uint8_t)(0xc0 | ((dst_reg - 8) << 3) | (src_reg - 8)));
+}
+
+/* sub R<dst_reg>, [rbx + slot*8]  --  4C 2B + ModR/M + disp */
+static void emit_sub_reg_from_slot(jit_buf *b, int dst_reg, int slot) {
+  jit_emit_u8(b, 0x4c);
+  jit_emit_u8(b, 0x2b);
+  emit_mem_op(b, (uint8_t)(dst_reg - 8), slot);
+}
+
+/* mov R<dst_reg>, R<src_reg>  --  4D 89 ModR/M  3 bytes */
+static void emit_mov_reg_from_reg(jit_buf *b, int dst_reg, int src_reg) {
+  jit_emit_u8(b, 0x4d);
+  jit_emit_u8(b, 0x89);
+  /* opcode 0x89: mov r/m64, r64.  reg field = src, r/m field = dst. */
+  jit_emit_u8(b, (uint8_t)(0xc0 | ((src_reg - 8) << 3) | (dst_reg - 8)));
+}
+
+/* mov R<dst_reg>, [rbx + slot*8]  --  4C 8B + ModR/M + disp */
+static void emit_mov_reg_from_slot(jit_buf *b, int dst_reg, int slot) {
+  jit_emit_u8(b, 0x4c);
+  jit_emit_u8(b, 0x8b);
+  emit_mem_op(b, (uint8_t)(dst_reg - 8), slot);
+}
+
+/* add R<reg>, imm32 (sign-extended)  --  49 81 (C0 | r3) imm32  7 bytes
+ * Used by INC/DEC fast path: `add R<reg>, FXN(1)` = +/- 0x10000.
+ * Could use the shorter 81-with-imm8 form when the constant fits
+ * in s8, but FXN(1) = 0x10000 doesn't, and unifying on imm32 keeps
+ * the encoding simple. */
+static void emit_add_reg_imm32(jit_buf *b, int reg, int32_t imm) {
+  jit_emit_u8(b, 0x49);                            /* REX.W + REX.B */
+  jit_emit_u8(b, 0x81);                            /* add/sub r/m64, imm32 */
+  jit_emit_u8(b, (uint8_t)(0xc0 | (reg - 8)));     /* /0 = ADD */
+  jit_emit_u32(b, (uint32_t)imm);
+}
+
+/* test R<reg>w, R<reg>w  --  66 (REX) 85 ModR/M  4-5 bytes.
+ * 16-bit prefix + test r/m16, r16, with both fields = R<reg>'s
+ * low 3 bits.  Detects FXN-tagged int (low 16 == 0) without
+ * touching RAX. */
+static void emit_test_regw_regw(jit_buf *b, int reg) {
+  jit_emit_u8(b, 0x66);                            /* operand-size override */
+  if (reg >= 8) jit_emit_u8(b, 0x45);              /* REX.R + REX.B */
+  jit_emit_u8(b, 0x85);                            /* test r/m16, r16 */
+  jit_emit_u8(b, (uint8_t)(0xc0 | ((reg & 7) << 3) | (reg & 7)));
+}
+
 /* Spill every pinned register back to its L[slot] memory cell.
  * Called immediately before a helper invocation so the helper
  * reads the up-to-date value of every pinned slot when it
@@ -450,13 +539,55 @@ static void emit_cqo(jit_buf *b) {
   jit_emit_u8(b, 0x99);
 }
 
+/* Step 13a: in-place arithmetic for pinned dst.
+ *
+ * When dst is pinned to a callee-saved register, we can sidestep
+ * the RAX round-trip:
+ *
+ *   dst == a:  add  R<dst>, R<x>  (or [rbx+x*8])         -- 1 cycle
+ *   dst != a:  mov  R<dst>, R<a>; add R<dst>, R<x>       -- 2 cycles
+ *
+ * vs the unpinned/default:
+ *   mov rax, R<a>; add rax, R<x>; mov R<dst>, rax        -- 3 cycles
+ *
+ * Saves 2 cycles per IADD when dst is pinned and dst == a (the
+ * canonical counted-loop accumulator pattern), 1 cycle otherwise.
+ *
+ * SYMTA_NO_INPLACE_ARITH disables for bisecting. */
 void jit_emit_iadd(jit_buf *b, int dst, int a, int x) {
+  int dst_reg = jit_slot_reg(b, dst);
+  if (dst_reg >= 0 && !getenv("SYMTA_NO_INPLACE_ARITH")) {
+    /* dst is pinned; emit in-place. */
+    if (dst != a) {
+      /* Copy a into dst's register first.  Cheap reg-to-reg. */
+      int a_reg = jit_slot_reg(b, a);
+      if (a_reg >= 0) emit_mov_reg_from_reg(b, dst_reg, a_reg);
+      else            emit_mov_reg_from_slot(b, dst_reg, a);
+    }
+    int x_reg = jit_slot_reg(b, x);
+    if (x_reg >= 0) emit_add_reg_from_reg(b, dst_reg, x_reg);
+    else            emit_add_reg_from_slot(b, dst_reg, x);
+    return;
+  }
+  /* dst lives in memory -- fall back to the RAX round-trip. */
   emit_mov_rax_from_slot(b, a);
   emit_add_rax_from_slot(b, x);
   emit_mov_slot_from_rax(b, dst);
 }
 
 void jit_emit_isub(jit_buf *b, int dst, int a, int x) {
+  int dst_reg = jit_slot_reg(b, dst);
+  if (dst_reg >= 0 && !getenv("SYMTA_NO_INPLACE_ARITH")) {
+    if (dst != a) {
+      int a_reg = jit_slot_reg(b, a);
+      if (a_reg >= 0) emit_mov_reg_from_reg(b, dst_reg, a_reg);
+      else            emit_mov_reg_from_slot(b, dst_reg, a);
+    }
+    int x_reg = jit_slot_reg(b, x);
+    if (x_reg >= 0) emit_sub_reg_from_reg(b, dst_reg, x_reg);
+    else            emit_sub_reg_from_slot(b, dst_reg, x);
+    return;
+  }
   emit_mov_rax_from_slot(b, a);
   emit_sub_rax_from_slot(b, x);
   emit_mov_slot_from_rax(b, dst);
@@ -1075,9 +1206,30 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
     case BC_LEAVE:                     i += 1; break;
     case BC_LEAVE0:                    i += 1; break;
     case BC_CNAS:                      i += 3; break;
-    case BC_IFFXN:                     i += 4; break;
     case BC_JMP:                       i += 4; break;
+    case BC_JMP16:                     i += 3; break;
     case BC_FATAL:                     i += 3; break;
+    /* BC_IFFXN / BC_B / BC_B8 read a condition slot.  Tracking
+     * their access here means a loop's branch-condition slot
+     * contributes to the pin-frequency score -- crucial because
+     * a counted loop typically writes the ILT result to a
+     * temporary slot and reads it back for the branch each
+     * iteration. */
+    case BC_IFFXN: {  /* 4 bytes: opcode + cnd(u8) + diff(int16) */
+      if (i + 4 > n) return;
+      BUMP(bc[i + 1]);
+      i += 4; break;
+    }
+    case BC_B: {  /* 6 bytes: opcode + cnd(u16) + target(u24) */
+      if (i + 6 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      i += 6; break;
+    }
+    case BC_B8: {  /* 4 bytes: opcode + cnd(u8) + diff(int16) */
+      if (i + 4 > n) return;
+      BUMP(bc[i + 1]);
+      i += 4; break;
+    }
 
     /* 5-byte slot pairs: opcode + dst(u16) + src(u16).
      * MOVE is pure inline; INC / DEC have a helper fallback for
@@ -1343,7 +1495,19 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
    *
    * Pin only if savings > cost.  Avoids making helper-call-heavy
    * functions (compilation paths, macroexpand, dispatch-only
-   * helpers) pay net negative for pinning. */
+   * helpers) pay net negative for pinning.
+   *
+   * Note: a more permissive filter (treating each inline access
+   * as worth ~32x its static count, the "hot loop" heuristic)
+   * was tried in step 13b and reverted -- it correctly enabled
+   * pinning on the bench's add-loop function but the modern
+   * CPU's OoO engine hid the rax-chain savings (in-place arith
+   * was a wash) while the extra spill overhead at every helper
+   * call in compilation code regressed the game compile by
+   * ~4-5 s.  Better heuristic would need actual loop detection
+   * (backward-jump pass to weight in-loop accesses).  Out of
+   * scope for now; the current conservative threshold rejects
+   * pinning on most functions but is safe. */
   uint32_t total_inline = 0;
   for (int k = 0; k < JIT_MAX_PINNED; k++) total_inline += best_counts[k];
 
@@ -1353,9 +1517,6 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
     n_pinned++;
   }
   if (n_pinned > 0) {
-    /* Skip the threshold check when SYMTA_REGALLOC_ALWAYS is set
-     * (lets bench harnesses force pinning to measure the upside
-     * separately from the heuristic). */
     if (!getenv("SYMTA_REGALLOC_ALWAYS")) {
       uint64_t savings_bytes = (uint64_t)total_inline * 2;
       uint64_t spill_bytes   = (uint64_t)helper_call_sites * 14 *
@@ -2816,12 +2977,32 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
       uint32_t a   = (uint32_t)bc_rd16(bc + i + 3);
 
-      emit_mov_rax_from_slot(b, a);
-      emit_test_ax_ax(b);
-      size_t to_slow = emit_jnz_rel32(b);
-      /* Fast path: aa is FXN-tagged int. */
-      emit_add_rax_imm32(b, delta);
-      emit_mov_slot_from_rax(b, dst);
+      /* Step 13a: in-place fast path for `INC dst dst` / `DEC dst dst`
+       * (the canonical counter-increment pattern) when dst is pinned.
+       *
+       *   test  R<dst>w, R<dst>w   ; T_INT check on low 16
+       *   jnz   slow
+       *   add   R<dst>, +/-0x10000 ; FXN(1) in-place
+       *   jmp   done
+       *
+       * Saves the `mov rax, R<dst>` / `mov R<dst>, rax` round-trip
+       * (2 cycles) on every loop iteration.  For a 10^9-iter loop
+       * that's ~0.5-0.7 s wall time. */
+      size_t to_slow;
+      int dst_reg;
+      if (dst == a &&
+          (dst_reg = jit_slot_reg(b, (int)dst)) >= 0 &&
+          !getenv("SYMTA_NO_INPLACE_ARITH")) {
+        emit_test_regw_regw(b, dst_reg);
+        to_slow = emit_jnz_rel32(b);
+        emit_add_reg_imm32(b, dst_reg, delta);
+      } else {
+        emit_mov_rax_from_slot(b, a);
+        emit_test_ax_ax(b);
+        to_slow = emit_jnz_rel32(b);
+        emit_add_rax_imm32(b, delta);
+        emit_mov_slot_from_rax(b, dst);
+      }
       size_t to_done = jit_emit_jmp(b);
       /* Slow path. */
       jit_patch_jmp_here(b, to_slow);
