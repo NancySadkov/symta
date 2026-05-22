@@ -409,6 +409,48 @@ hcase MexFormCases Expr ()
     | G @rand 'G'
     | E2 mex E
     | mex [`let_` [[G E2]] [`_type` Type G G]]
+  // Phase 3 conditional narrowing.  When Cond is `V.is_T` (post-
+  // reader dot-form `[. V is_T]`) and T is a known type, wrap
+  // Then in `[_type T V Then]` so refs to V inside Then see V
+  // narrowed.  Handles both
+  //   `if X.is_int: body`     -> `[_if [. X is_int] body]`        (3-elem)
+  //   `if X.is_int A else B`  -> `[_if [. X is_int] A B]`         (4-elem)
+  //   `when X.is_int: body`   -> `[_if [[. X is_int]] body No]`   (Cond
+  //     wrapped in a 1-elem outer list by the `when` substitution
+  //     macro `=: _if Xs.lead Xs.~ No`; we unwrap below.)
+  //
+  // The match is intentionally narrow:
+  //   * V must be a plain var sym (no narrowing on complex LHS).
+  //   * Predicate must be `is_<known_type>` text.
+  // Falls through cleanly when Cond doesn't fit -- the case body
+  // still emits a valid `_if` with mexed children, matching the
+  // old default-path behaviour for this form.
+  //
+  // Previously blocked by C-stack overflow during bootstrap
+  // (the `[_type]` wrap compounded with mex's tree recursion);
+  // STACK-2's heap-arena L_blk_ bounds C-stack growth to a
+  // constant per Symta call, making this safe at any depth.
+  [_if @As]
+    | Cond As.0
+    | Then As.1
+    | NarrowT No
+    | NarrowV No
+    | CondU if Cond.is_list and Cond.n >< 1 and Cond.0.is_list
+              then Cond.0 else Cond
+    | when CondU.is_list and CondU.n >< 3 and CondU.0 >< `.`:
+      | V CondU.1
+      | M CondU.2
+      | when V^is_var_sym and M.is_text and M.n > 3 and M.take(3) >< "is_":
+        | Tname M.drop(3)
+        | when Tname^is_known_type:
+          | NarrowT =  Tname
+          | NarrowV =  V
+    | MexCond mex Cond
+    | TrueBranch if got NarrowT then [`_type` NarrowT NarrowV Then] else Then
+    | MexThen mex TrueBranch
+    | if As.n >< 3
+        then [`_if` MexCond MexThen (mex As.2)]
+        else [`_if` MexCond MexThen]
   [`&` O] | if O.is_keyword then O else bad "implement `&Var` ([O])" // [O^mex]
 
 // ============================================================

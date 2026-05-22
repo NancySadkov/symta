@@ -676,8 +676,13 @@ ssa_form K Xs =
 
 ssa_atom K X =
 | if X.is_int then
-    | when X > 0x7FFFFFFF or X < -0x7FFFFFFF: X =  "[X]LL" //FIXME: kludge
-    | ssa ldfxn K X
+    // Large ints lower to a `LL`-suffixed text in the emitted SBC
+    // so the C reader parses them as int64.  Phase 3 narrowing now
+    // tracks `X : int` inside the `is_int` branch, so we can't
+    // reassign X to text here without tripping the TS-3.7
+    // reassignment-type check.  Use a separate value var.
+    | Val if X > 0x7FFFFFFF or X < -0x7FFFFFFF then "[X]LL" else X
+    | ssa ldfxn K Val
   else if X.is_text then ssa_symbol K X No
   else if no X then ssa mv K 'No'
   else if X.is_float then ssa ldflt K X
