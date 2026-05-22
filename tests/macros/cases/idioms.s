@@ -138,3 +138,17 @@ say L3{_ ~ _}                      // -> (1 3 (5 6))
 say L3{:_ ~ _}                     // -> (1 3)
 say L3{_ ~ _;~ _}                  // -> (1 3 5)
 say L3{_ ~ ~}                      // -> ((1 1) (3 4) (5 6))
+
+
+// ----------------------------------------------------------------
+// B10 regression: `[@list]` inside string splice used to crash
+// the compiler with `unknown symbol _insert`.  The fix lowers
+// `"prefix [@list]"` to the same shape as `"prefix [list.text]"`
+// (concatenate element texts) -- see expand_text_splice in
+// macro_ops.s.
+// ----------------------------------------------------------------
+say "splat in string splice:"
+Words [\a \b \c]
+say "x [@Words]"                   // -> x abc
+say "y [Words]"                    // -> y (a b c)
+say "z [Words.text]"               // -> z abc

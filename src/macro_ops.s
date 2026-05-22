@@ -214,7 +214,28 @@ expand_text_splice Xs =
 | case Xs
    [X] | when X.is_text: ret [_quote X]
    [] | ret [_quote '']
-| As map X Xs: if X.is_text then [_quote X] else [_mcall X textify_]
+| // B10 fix: an embedded `[@Y]` parses as `[\`@\` Y]` -- the splat
+| // form, not a list literal containing a splat.  Naively wrapping
+| // it as `[_mcall [`@` Y] textify_]` leaves `_insert` (which `@`
+| // expands to in `expand_block`) surviving past mex into ssa,
+| // where ssa_atom errors with "unknown symbol `_insert`".  The
+| // intuitive semantics for `"prefix [@list]"` is "join each
+| // element's text" -- same shape as the documented user
+| // workaround `"prefix [list.text]"`.  So lower `[@Y]` to
+| // `[_mcall Y text]` directly.
+| As map X Xs:
+    if X.is_text then [_quote X]
+    else
+      // B10 fix: the parser hands us each non-text embedded expr
+      // wrapped in a 1-element list (source-position meta).  Peek
+      // through the wrapper to detect `[@Y]` (= `[\`@\` Y]`) inside.
+      // Without the unwrap, `X.0 >< \`@\`` checks the wrapper head
+      // (`[]`-implicit), not the splat marker, and the splat falls
+      // through to the textify_ branch, leaving `_insert` to crash
+      // ssa_atom with "unknown symbol `_insert`".
+      XU if X.is_list and X.n >< 1 and X.0.is_list then X.0 else X
+      if XU.is_list and XU.0 >< `@` and XU.n >< 2 then [_mcall XU.1 text]
+      else [_mcall X textify_]
 | [_mcall [_list @As] text]
 
 `"` @Xs /*"*/ = expand_text_splice Xs
