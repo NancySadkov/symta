@@ -130,6 +130,14 @@ typedef enum {
    * &api_g.hgp and &api_g.theap0. */
   JIT_HELPER_AMP_HGP     = 68,
   JIT_HELPER_AMP_THEAP0  = 69,
+  /* Phase 1d partial -- SBC_CTX sub-opcode helpers.  CTX_BTLAND
+   * (setjmp) still bails since it needs to live in the JIT'd
+   * function's own frame; the three below are all valid helper
+   * calls from JIT'd code.  Together they unblock `fin`-block
+   * bodies and `callcc`-callback lambdas. */
+  JIT_HELPER_CTX_BTJUMP        = 70,
+  JIT_HELPER_CTX_SET_UNWIND    = 71,
+  JIT_HELPER_CTX_REMOVE_UNWIND = 72,
   JIT_HELPER_MAX
 } jit_helper_id_t;
 
@@ -758,6 +766,14 @@ extern void (*jit_rt_subtype_helper)(int64_t *L, struct sbc_t *sbc,
 /* SBC_MNAME: L[dst] = get_method_name(UNFXN(L[src])).  Wire:
  *   opcode + dst(u16) + src(u16) = 5 bytes.  Helper3 sig. */
 extern void (*jit_rt_mname_helper)(int64_t *L, int dst, int src, int u);
+
+/* Phase 1d partial -- SBC_CTX sub-opcode helpers.  CTX_BTLAND
+ * still bails (needs inline setjmp); these three are valid as
+ * helper calls from JIT'd code.  Together they unblock `fin`
+ * blocks and `callcc` callback lambdas. */
+extern void (*jit_rt_ctx_btjump_helper)(int64_t *L, int state, int value, int u);
+extern void (*jit_rt_ctx_set_unwind_helper)(int64_t *L, int h, int u1, int u2);
+extern void (*jit_rt_ctx_remove_unwind_helper)(int64_t *L, int u1, int u2, int u3);
 
 /* SBC_TINIT: type init for named text (sbc->tx[name]).  Wire:
  *   opcode + type(u16) + size(u16) + name(u24) = 8 bytes.

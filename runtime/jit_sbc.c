@@ -266,6 +266,32 @@ static void jit_rt_ld4_impl(int64_t *L, int dst, int src, int index) {
  * stack frames from JIT'd callsites won't have row/col info.
  * Trade-off acceptable for the coverage win; can revisit if
  * traces from JIT'd code prove unusable. */
+/* Phase 1d partial -- SBC_CTX sub-opcode helpers.  Mirror the
+ * SBC interpreter bodies at sbc.c:1939-1996.  CTX_BTLAND (setjmp)
+ * still needs to live in the JIT'd function's own frame, so the
+ * translator bails on that one; the three handled here are all
+ * valid helper calls from JIT'd code.
+ *
+ *   btjump (state, value)         -- calls runtime/bltin.c:btjump,
+ *                                    which longjmps through the
+ *                                    JIT-installed SEH unwind info.
+ *   set_unwind_handler (h)        -- pushes L[h] onto api.puwh.
+ *   remove_unwind_handler ()      -- pops api.puwh. */
+static void jit_rt_ctx_btjump_impl(int64_t *L, int state, int value, int u) {
+  (void)u;
+  btjump((dyn)L[state], (dyn)L[value]);
+}
+static void jit_rt_ctx_set_unwind_impl(int64_t *L, int h, int u1, int u2) {
+  (void)u1; (void)u2;
+  ++api.puwh;
+  *api.puwh = (dyn)L[h];
+}
+static void jit_rt_ctx_remove_unwind_impl(int64_t *L, int u1, int u2, int u3) {
+  (void)L; (void)u1; (void)u2; (void)u3;
+  *api.puwh = 0;
+  --api.puwh;
+}
+
 static void jit_rt_arglist0_impl(int64_t *L, int a, int b, int c) {
   (void)L; (void)a; (void)b; (void)c;
   ARGLIST(0);
@@ -1060,6 +1086,10 @@ static void jit_install_helpers_once(void) {
   jit_rt_tinit_helper    = jit_rt_tinit_impl;
   jit_rt_subtype_helper  = jit_rt_subtype_impl;
   jit_rt_mname_helper    = jit_rt_mname_impl;
+  /* Phase 1d partial -- SBC_CTX sub-opcode helpers. */
+  jit_rt_ctx_btjump_helper        = jit_rt_ctx_btjump_impl;
+  jit_rt_ctx_set_unwind_helper    = jit_rt_ctx_set_unwind_impl;
+  jit_rt_ctx_remove_unwind_helper = jit_rt_ctx_remove_unwind_impl;
   /* Step 12e: hand the inline LD4 emitter the address of
    * `api_g.heap0` (the field) so it can bake it as an imm64.  At
    * AOT install time the JIT_HELPER_AMP_HEAP0 reloc rebinds it
@@ -1152,6 +1182,10 @@ void *jit_helper_pointer(int helper_id) {
     case JIT_HELPER_AMP_HEAP0: return (void*)&api_g.heap0;
     case JIT_HELPER_AMP_HGP:   return (void*)&api_g.hgp;
     case JIT_HELPER_AMP_THEAP0: return (void*)&api_g.theap0;
+    /* Phase 1d partial -- SBC_CTX sub-opcode helpers. */
+    case JIT_HELPER_CTX_BTJUMP:        return (void*)jit_rt_ctx_btjump_helper;
+    case JIT_HELPER_CTX_SET_UNWIND:    return (void*)jit_rt_ctx_set_unwind_helper;
+    case JIT_HELPER_CTX_REMOVE_UNWIND: return (void*)jit_rt_ctx_remove_unwind_helper;
     default:                  return NULL;
   }
 }

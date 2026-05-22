@@ -846,6 +846,11 @@ void jit_emit_mov_arg0_from_locals(jit_buf *b) {
 #define BC_FSUB    0xAF
 #define BC_FMUL    0xB0
 #define BC_FDIV    0xB1
+#define BC_CTX     0x9A    /* type=u8 [+ sub-op operands].
+                              type=0 BTLAND  : + dst=u16   (4 bytes; JIT bails)
+                              type=1 BTJUMP  : + state=u16 + value=u16 (6 bytes)
+                              type=2 SET_UWH : + h=u16     (4 bytes)
+                              type=3 REM_UWH : no operands (2 bytes) */
 #define BC_INC     0x9E    /* dst=u16 a=u16; INC(L[dst], L[a]) */
 #define BC_DEC     0x9F    /* dst=u16 a=u16; DEC(L[dst], L[a]) */
 #define BC_LOAD   0x24    /* dst=u16 src=u16 index=u16; L[dst]=O_PTR(L[src])[index] */
@@ -1110,6 +1115,10 @@ void (*jit_rt_tinit_helper)(int64_t *L, struct sbc_t *sbc,
 void (*jit_rt_subtype_helper)(int64_t *L, struct sbc_t *sbc,
                               uint64_t packed) = NULL;
 void (*jit_rt_mname_helper)(int64_t *L, int dst, int src, int u) = NULL;
+/* Phase 1d partial -- SBC_CTX sub-opcode helpers. */
+void (*jit_rt_ctx_btjump_helper)(int64_t *L, int state, int value, int u) = NULL;
+void (*jit_rt_ctx_set_unwind_helper)(int64_t *L, int h, int u1, int u2) = NULL;
+void (*jit_rt_ctx_remove_unwind_helper)(int64_t *L, int u1, int u2, int u3) = NULL;
 
 /* Step 8: platform-aware default for the AOT pipeline.  Windows
  * has SEH unwind registered (step 5n) so longjmp through native
@@ -1603,6 +1612,36 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
       BUMP(bc[i + 1]);
       BUMP(bc[i + 2]);
       i += 4; break;
+    }
+    /* Phase 1d partial -- variable-size, dispatched by type byte.
+     * Every sub-op is a helper call (or, for BTLAND, a translation
+     * bail).  BUMP slot operands per sub-type. */
+    case BC_CTX: {
+      if (i + 2 > n) return;
+      uint8_t type = bc[i + 1];
+      switch (type) {
+      case 0:  /* BTLAND: dst=u16 */
+        if (i + 4 > n) return;
+        BUMP(bc_rd16(bc + i + 2));
+        BUMP_HELPER();
+        i += 4; break;
+      case 1:  /* BTJUMP: state=u16 value=u16 */
+        if (i + 6 > n) return;
+        BUMP(bc_rd16(bc + i + 2));
+        BUMP(bc_rd16(bc + i + 4));
+        BUMP_HELPER();
+        i += 6; break;
+      case 2:  /* SET_UNWIND_HANDLER: h=u16 */
+        if (i + 4 > n) return;
+        BUMP(bc_rd16(bc + i + 2));
+        BUMP_HELPER();
+        i += 4; break;
+      case 3:  /* REMOVE_UNWIND_HANDLER: no operands */
+        BUMP_HELPER();
+        i += 2; break;
+      default: return;  /* unknown sub-type */
+      }
+      break;
     }
     /* Default: unknown opcode -- bail.  Function gets no pinning. */
     default:
@@ -3434,6 +3473,73 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       else          jit_emit_epilogue(b);
       i += 1;
       break;
+
+    /* Phase 1d partial -- SBC_CTX sub-opcode coverage.
+     * BTLAND (setjmp) bails to interpreter; the other three are
+     * helper calls.  See sbc.c:1939-1996 for the interpreter
+     * bodies these mirror. */
+    case BC_CTX: {
+      if (i + 2 > n) { jit_last_fail_opcode = op;
+                       jit_last_fail_offset = i;
+                       fail = 1; goto done; }
+      uint8_t type = bc[i + 1];
+      if (type == 0) {
+        /* CTX_BTLAND -- setjmp.  Needs to live in the JIT'd
+         * function's own frame; helper-call setjmp would have
+         * its jmp_buf go out of scope before longjmp fires.
+         * Bail to interpreter for the whole function. */
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      } else if (type == 1) {
+        /* CTX_BTJUMP -- longjmp through the SEH unwind chain.
+         * Safe to call from a helper: longjmp doesn't have the
+         * C-stack-frame-liveness restriction setjmp has. */
+        if (i + 6 > n) { jit_last_fail_opcode = op;
+                         jit_last_fail_offset = i;
+                         fail = 1; goto done; }
+        if (!jit_rt_ctx_btjump_helper) { jit_last_fail_opcode = op;
+                                         jit_last_fail_offset = i;
+                                         fail = 1; goto done; }
+        uint32_t state = bc_rd16(bc + i + 2);
+        uint32_t value = bc_rd16(bc + i + 4);
+        b->pending_helper_id = JIT_HELPER_CTX_BTJUMP;
+        jit_emit_call_helper3(b, (void*)jit_rt_ctx_btjump_helper,
+                              state, value, 0);
+        i += 6;
+        break;
+      } else if (type == 2) {
+        /* CTX_SET_UNWIND_HANDLER -- push L[h] onto api.puwh. */
+        if (i + 4 > n) { jit_last_fail_opcode = op;
+                         jit_last_fail_offset = i;
+                         fail = 1; goto done; }
+        if (!jit_rt_ctx_set_unwind_helper) { jit_last_fail_opcode = op;
+                                             jit_last_fail_offset = i;
+                                             fail = 1; goto done; }
+        uint32_t h = bc_rd16(bc + i + 2);
+        b->pending_helper_id = JIT_HELPER_CTX_SET_UNWIND;
+        jit_emit_call_helper3(b, (void*)jit_rt_ctx_set_unwind_helper,
+                              h, 0, 0);
+        i += 4;
+        break;
+      } else if (type == 3) {
+        /* CTX_REMOVE_UNWIND_HANDLER -- pop api.puwh. */
+        if (!jit_rt_ctx_remove_unwind_helper) { jit_last_fail_opcode = op;
+                                                jit_last_fail_offset = i;
+                                                fail = 1; goto done; }
+        b->pending_helper_id = JIT_HELPER_CTX_REMOVE_UNWIND;
+        jit_emit_call_helper3(b, (void*)jit_rt_ctx_remove_unwind_helper,
+                              0, 0, 0);
+        i += 2;
+        break;
+      } else {
+        /* Unknown sub-type -- shouldn't happen in well-formed
+         * SBC, but bail safely. */
+        jit_last_fail_opcode = op;
+        jit_last_fail_offset = i;
+        fail = 1; goto done;
+      }
+    }
 
     default:
       /* Unsupported opcode -- bail out so the caller falls back
