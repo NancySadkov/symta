@@ -1016,6 +1016,9 @@ static void jit_install_helpers_once(void) {
    * AOT install time the JIT_HELPER_AMP_HEAP0 reloc rebinds it
    * to the current process's field address. */
   jit_rt_heap0_addr      = (void*)&api_g.heap0;
+  /* Step 12j: same shape for the inline LIST1 / LIST2 emitter. */
+  jit_rt_hgp_addr        = (void*)&api_g.hgp;
+  jit_rt_theap0_addr     = (void*)&api_g.theap0;
 }
 
 void jit_install_helpers_public(void) {
@@ -1098,6 +1101,8 @@ void *jit_helper_pointer(int helper_id) {
     case JIT_HELPER_MNAME:    return (void*)jit_rt_mname_helper;
     /* Step 12e: address-of-runtime-field relocs.  See jit.h. */
     case JIT_HELPER_AMP_HEAP0: return (void*)&api_g.heap0;
+    case JIT_HELPER_AMP_HGP:   return (void*)&api_g.hgp;
+    case JIT_HELPER_AMP_THEAP0: return (void*)&api_g.theap0;
     default:                  return NULL;
   }
 }

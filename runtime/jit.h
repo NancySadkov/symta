@@ -125,6 +125,11 @@ typedef enum {
    * heap-deref opcodes (LD4 / LOAD / LOAD8 / FXNLGET fast path)
    * to avoid the helper-call overhead. */
   JIT_HELPER_AMP_HEAP0 = 67,
+  /* Step 12j: more address-of-runtime-field reloc kinds, mirroring
+   * AMP_HEAP0.  Used by the inline LIST1 / LIST2 fast path to bake
+   * &api_g.hgp and &api_g.theap0. */
+  JIT_HELPER_AMP_HGP     = 68,
+  JIT_HELPER_AMP_THEAP0  = 69,
   JIT_HELPER_MAX
 } jit_helper_id_t;
 
@@ -335,6 +340,25 @@ void jit_emit_fxnlset(jit_buf *b, uint32_t dst, uint32_t src,
                       uint64_t fxnlset_packed1, uint64_t fxnlset_packed2,
                       int with_result);
 
+/* Step 12j: inline LIST1 / LIST2 fast path.  Bumps the nursery
+ * pointer (api.hgp->top -= size*8+8), checks against
+ * api.hgp->ts, writes gc_head.size, builds the tagged dyn, sets
+ * theap0[gid-1] = hgp->age, then fills slot 0 (and slot 1 if
+ * size == 2) from va / vb, then writes the dyn to L[dst].  On
+ * threshold-miss, falls through to the existing list1/list2
+ * helper (which calls gc_alloc -> potentially gc()).
+ *
+ * `size` MUST be 1 or 2; the slot count is hard-coded into the
+ * bump amount and the fill loop.  Caller is responsible for
+ * supplying the matching helper.
+ *
+ * Register clobbers: RAX, RCX, RDX, R8..R11 (all caller-saved).
+ * RBX (locals), R12 (sbc), R13..R15 (pinned slots) preserved. */
+void jit_emit_listn(jit_buf *b, uint32_t dst, uint32_t size,
+                    uint32_t va, uint32_t vb,
+                    void *hgp_addr, void *heap0_addr, void *theap0_addr,
+                    void *list_helper, jit_helper_id_t list_helper_id);
+
 /* ============================================================
  * Step 2: control flow + typed-int comparison emitters.
  *
@@ -513,6 +537,12 @@ extern void (*jit_rt_ld4_helper)(int64_t *L, int dst, int src, int index);
  * code then dereferences it at run time to fetch the heap base
  * pointer.  See jit.c:jit_emit_ld4. */
 extern void *jit_rt_heap0_addr;
+
+/* Step 12j: more runtime-field addresses for the inline LIST1 /
+ * LIST2 fast path.  Same convention as jit_rt_heap0_addr (the
+ * FIELD address, not its value).  Set by jit_install_helpers_once. */
+extern void *jit_rt_hgp_addr;
+extern void *jit_rt_theap0_addr;
 
 /* SBC_ST4_* / SBC_STOR (when added).
  * Signature: (L, target_obj_slot, value_slot, struct_field_index).

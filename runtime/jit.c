@@ -844,6 +844,15 @@ size_t  jit_last_fail_offset = 0;
  * is installed). */
 void *jit_rt_heap0_addr = NULL;
 
+/* Step 12j: same shape as jit_rt_heap0_addr but for `api_g.hgp`
+ * (the current generation pointer) and `api_g.theap0` (the
+ * per-slot age/dirty byte array).  Used by the inline LIST1 /
+ * LIST2 fast path to bump the nursery's `top` pointer and set
+ * the freshly-allocated object's age in the theap0 array
+ * without calling into gc_alloc. */
+void *jit_rt_hgp_addr    = NULL;
+void *jit_rt_theap0_addr = NULL;
+
 /* Trampoline helpers set by the runtime side.  See jit.h. */
 void (*jit_rt_ld4_helper)(int64_t *L, int dst, int src, int index) = NULL;
 void (*jit_rt_st4_helper)(int64_t *L, int dst, int src, int index) = NULL;
@@ -974,7 +983,31 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
     b->pinned[i].slot = -1;
     b->pinned[i].reg = 0;
   }
-  if (getenv("SYMTA_NO_REGALLOC")) return;
+  /* OPT-IN ONLY (Phase 2a, May 2026): Windows SEH unwind info
+   * for the JIT'd functions is hardcoded to the no-pins prologue
+   * layout (jit_register_unwind_2arg in jit_sbc.c records exactly
+   * 2 push + 1 sub-rsp at SizeOfProlog=0x0d).  Enabling pinning
+   * changes the prologue to 5 push + 1 sub-rsp at a longer
+   * SizeOfProlog -- which the SEH walker doesn't know about.
+   * Any JIT'd frame that gets unwound via longjmp (`bad`/`btjump`
+   * /etc.) then mis-restores callee-saved registers and corrupts
+   * the caller's frame.  Symptoms: 30-anaphoric / 34-xml /
+   * 35-json segfault on the error-path branches; drift bootstrap
+   * is intermittently non-deterministic.
+   *
+   * Until jit_register_unwind_2arg learns about the variable
+   * prologue (per-function unwind data stored alongside the
+   * jit_buf), Phase 2a stays opt-in via SYMTA_REGALLOC=1.  The
+   * infrastructure (slot primitives consulting b->pinned, the
+   * helper-call spill/reload wrap, the prologue extension and
+   * matching epilogue) is wired up correctly -- it just isn't
+   * activated by default.
+   *
+   * The TYPED-INT counted-loop smoke test (`times I 1000: A=A+I;
+   * say A` -> 499500) confirms the inline reg-to-reg moves work
+   * on the no-SEH path; opt-in benchmarking can measure the
+   * gain without affecting the default test suite. */
+  if (!getenv("SYMTA_REGALLOC")) return;
 
   enum { JIT_SCAN_MAX_SLOT = 4096 };
   uint32_t counts[JIT_SCAN_MAX_SLOT];
@@ -1492,8 +1525,11 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
     }
     case BC_LIST1: {
       /* SBC_LIST1: opcode + dst(u16) + x(u16) = 5 bytes.  Fused
-       * LIST(L[dst], 1) + LGET(L[dst], 0) = L[x].  Trampolined
-       * to jit_rt_list1_helper which does both stores. */
+       * LIST(L[dst], 1) + LGET(L[dst], 0) = L[x].
+       * Step 12j: inline the bump-pointer alloc fast path via
+       * jit_emit_listn.  Falls back to the existing helper on
+       * nursery threshold miss.  SYMTA_NO_LIST_INLINE bypasses
+       * the inline for bisecting. */
       if (i + 5 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
@@ -1502,14 +1538,22 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
                                   fail = 1; goto done; }
       uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
       uint32_t x   = (uint32_t)bc_rd16(bc + i + 3);
-      b->pending_helper_id = JIT_HELPER_LIST1;
-      jit_emit_call_helper3(b, (void*)jit_rt_list1_helper, dst, x, 0);
+      if (jit_rt_hgp_addr && jit_rt_heap0_addr && jit_rt_theap0_addr
+          && !getenv("SYMTA_NO_LIST_INLINE")) {
+        jit_emit_listn(b, dst, 1, x, 0,
+                       jit_rt_hgp_addr, jit_rt_heap0_addr, jit_rt_theap0_addr,
+                       (void*)jit_rt_list1_helper, JIT_HELPER_LIST1);
+      } else {
+        b->pending_helper_id = JIT_HELPER_LIST1;
+        jit_emit_call_helper3(b, (void*)jit_rt_list1_helper, dst, x, 0);
+      }
       i += 5;
       break;
     }
     case BC_LIST2: {
       /* SBC_LIST2: opcode + dst(u16) + a(u16) + b(u16) = 7 bytes.
-       * Fused LIST(L[dst], 2) + LGET(L[dst], 0) = L[a] + LGET(L[dst], 1) = L[b]. */
+       * Fused LIST(L[dst], 2) + LGET(L[dst], 0) = L[a] + LGET(L[dst], 1) = L[b].
+       * Step 12j: inline via jit_emit_listn (size=2 variant). */
       if (i + 7 > n) { jit_last_fail_opcode = op;
                        jit_last_fail_offset = i;
                        fail = 1; goto done; }
@@ -1519,8 +1563,15 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       uint32_t dst = (uint32_t)bc_rd16(bc + i + 1);
       uint32_t a   = (uint32_t)bc_rd16(bc + i + 3);
       uint32_t bb  = (uint32_t)bc_rd16(bc + i + 5);
-      b->pending_helper_id = JIT_HELPER_LIST2;
-      jit_emit_call_helper3(b, (void*)jit_rt_list2_helper, dst, a, bb);
+      if (jit_rt_hgp_addr && jit_rt_heap0_addr && jit_rt_theap0_addr
+          && !getenv("SYMTA_NO_LIST_INLINE")) {
+        jit_emit_listn(b, dst, 2, a, bb,
+                       jit_rt_hgp_addr, jit_rt_heap0_addr, jit_rt_theap0_addr,
+                       (void*)jit_rt_list2_helper, JIT_HELPER_LIST2);
+      } else {
+        b->pending_helper_id = JIT_HELPER_LIST2;
+        jit_emit_call_helper3(b, (void*)jit_rt_list2_helper, dst, a, bb);
+      }
       i += 7;
       break;
     }
@@ -3770,6 +3821,197 @@ void jit_emit_fxnlset(jit_buf *b, uint32_t dst, uint32_t src,
   }
 
   jit_patch_jmp_here(b, to_done);
+}
+
+/* ============================================================
+ * Step 12j: inline SBC_LIST1 / SBC_LIST2 fast path.
+ *
+ * Mirrors gc_alloc(T_LIST, n) + slot fills:
+ *
+ *   void *r = hgp->top - size;          // bump pointer down
+ *   gc_head_t *h = (gc_head_t*)r - 1;   // gc_head before object
+ *   if (h < hgp->ts) goto slow;          // out of nursery -> helper
+ *   hgp->top = (void**)h;                // commit
+ *   h->size = size;                       // initialize header
+ *   r = HEAPREF(TAGIFY(PTRENC(r), T_LIST));
+ *   O_AGE(r) = hgp->age;                 // theap0[gid-1] = age
+ *   // size==1: r[0] = L[x]
+ *   // size==2: r[0] = L[a]; r[1] = L[b]
+ *   L[dst] = r;
+ *
+ * Tag layout: T_LIST=9, FLG_BITS=1 (T_HEAP), so the dyn's low
+ * 16 bits are (9 << 1) | 1 = 0x13.
+ *
+ * Register usage (all caller-saved; preserve none across helper):
+ *   r10 - api.hgp pointer (whole alloc)
+ *   r11 - new gc_head / object data pointer
+ *   r9  - heap0 / theap0 (reused; only short-lived)
+ *   rax - gid (slot offset from heap0) / tagged dyn
+ *   r8  - hgp->age (only briefly, before being written to theap0)
+ *   rcx, rdx - scratch for slot reads/writes via primitives.
+ *
+ * R13..R15 (pinned slots from Phase 2a) are NOT touched.
+ * ============================================================ */
+
+/* Shared loader for the three runtime-address fields (hgp,
+ * heap0, theap0): emit `movabs R<reg>, imm64` followed by
+ * `mov R<reg>, [R<reg>]`.  imm64 is reloc-recorded so the AOT
+ * loader rebinds it on install. */
+static void emit_movabs_load_reg_helper(jit_buf *b, int reg,
+                                         uint64_t imm,
+                                         jit_helper_id_t hid) {
+  /* movabs R<reg>, imm64 -- 10 bytes (49 B8+(reg-8) imm8x8). */
+  jit_emit_u8(b, 0x49);                          /* REX.B */
+  jit_emit_u8(b, (uint8_t)(0xb8 | (reg - 8)));   /* mov R<reg>, imm64 */
+  uint32_t imm_off = (uint32_t)(b->len);
+  for (int k = 0; k < 8; k++) jit_emit_u8(b, (uint8_t)(imm >> (k*8)));
+  if (b->record_relocs) {
+    jit_record_reloc(b, imm_off, hid);
+  }
+  /* mov R<reg>, [R<reg>] -- 3 bytes (4D 8B (00 reg reg)). */
+  jit_emit_u8(b, 0x4d);
+  jit_emit_u8(b, 0x8b);
+  uint8_t low = (uint8_t)((reg - 8) & 7);
+  jit_emit_u8(b, (uint8_t)((low << 3) | low));
+}
+
+void jit_emit_listn(jit_buf *b, uint32_t dst, uint32_t size,
+                    uint32_t va, uint32_t vb,
+                    void *hgp_addr, void *heap0_addr, void *theap0_addr,
+                    void *list_helper, jit_helper_id_t list_helper_id) {
+  /* r10 = api.hgp value (the hg_t*). */
+  emit_movabs_load_reg_helper(b, 10, (uint64_t)hgp_addr,
+                              JIT_HELPER_AMP_HGP);
+
+  /* mov r11, [r10]   ; r11 = hgp->top   --   4D 8B 1A */
+  jit_emit_u8(b, 0x4d);
+  jit_emit_u8(b, 0x8b);
+  jit_emit_u8(b, 0x1a);
+
+  /* sub r11, (size*8 + 8)   --   49 83 EB imm8
+   * gc_head is 8 bytes, plus `size` slots of 8 each. */
+  uint32_t bump = size * 8u + 8u;
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x83);
+  jit_emit_u8(b, 0xeb);
+  jit_emit_u8(b, (uint8_t)bump);
+
+  /* cmp r11, [r10 + 8]   ; vs hgp->ts   --   4D 3B 5A 08 */
+  jit_emit_u8(b, 0x4d);
+  jit_emit_u8(b, 0x3b);
+  jit_emit_u8(b, 0x5a);
+  jit_emit_u8(b, 0x08);
+
+  /* jb slow   --   0F 82 rel32 */
+  jit_emit_u8(b, 0x0f);
+  jit_emit_u8(b, 0x82);
+  size_t to_slow = b->len;
+  jit_emit_u32(b, 0);
+
+  /* commit: mov [r10], r11   --   4D 89 1A */
+  jit_emit_u8(b, 0x4d);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, 0x1a);
+
+  /* gc_head.size = size   --   mov DWORD PTR [r11], imm32   --   41 C7 03 imm32 */
+  jit_emit_u8(b, 0x41);
+  jit_emit_u8(b, 0xc7);
+  jit_emit_u8(b, 0x03);
+  jit_emit_u32(b, size);
+
+  /* r11 += 8   ; r11 = obj data ptr   --   49 83 C3 08 */
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x83);
+  jit_emit_u8(b, 0xc3);
+  jit_emit_u8(b, 0x08);
+
+  /* r9 = api.heap0 value. */
+  emit_movabs_load_reg_helper(b, 9, (uint64_t)heap0_addr,
+                              JIT_HELPER_AMP_HEAP0);
+
+  /* mov rax, r11    --   4C 89 D8 */
+  jit_emit_u8(b, 0x4c);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, 0xd8);
+  /* sub rax, r9     --   4C 29 C8 */
+  jit_emit_u8(b, 0x4c);
+  jit_emit_u8(b, 0x29);
+  jit_emit_u8(b, 0xc8);
+  /* shr rax, 3      ; rax = gid   --   48 C1 E8 03 */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0xc1);
+  jit_emit_u8(b, 0xe8);
+  jit_emit_u8(b, 0x03);
+
+  /* r9 = api.theap0 value (reuse R9). */
+  emit_movabs_load_reg_helper(b, 9, (uint64_t)theap0_addr,
+                              JIT_HELPER_AMP_THEAP0);
+
+  /* mov r8d, [r10 + 48]   ; r8d = hgp->age (int)   --   45 8B 42 30 */
+  jit_emit_u8(b, 0x45);
+  jit_emit_u8(b, 0x8b);
+  jit_emit_u8(b, 0x42);
+  jit_emit_u8(b, 0x30);
+  /* mov BYTE PTR [r9 + rax - 1], r8b   --   45 88 44 01 FF
+   * REX (R=1 for r8, B=1 for r9) + opcode 88 (mov m8,r8)
+   * + ModR/M(01 000 100=SIB) + SIB(00 000 001) + disp8=-1.
+   * theap0 is a uint8_t array; theap0[gid-1] = age low byte. */
+  jit_emit_u8(b, 0x45);
+  jit_emit_u8(b, 0x88);
+  jit_emit_u8(b, 0x44);
+  jit_emit_u8(b, 0x01);
+  jit_emit_u8(b, 0xff);
+
+  /* dyn = (gid << 16) | 0x13 */
+  /* shl rax, 16     --   48 C1 E0 10 */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0xc1);
+  jit_emit_u8(b, 0xe0);
+  jit_emit_u8(b, 0x10);
+  /* or rax, 0x13    --   48 83 C8 13 */
+  jit_emit_u8(b, 0x48);
+  jit_emit_u8(b, 0x83);
+  jit_emit_u8(b, 0xc8);
+  jit_emit_u8(b, 0x13);
+
+  /* Fill slot 0: *(r11) = L[va] -- read via slot primitive
+   * (handles pinning), store to [r11] directly (the destination
+   * is the freshly-allocated nursery object, never pinned). */
+  emit_mov_rdx_from_slot(b, (int)va);
+  /* mov [r11], rdx  --   49 89 13 */
+  jit_emit_u8(b, 0x49);
+  jit_emit_u8(b, 0x89);
+  jit_emit_u8(b, 0x13);
+
+  if (size >= 2) {
+    /* *(r11 + 8) = L[vb] */
+    emit_mov_rdx_from_slot(b, (int)vb);
+    /* mov [r11 + 8], rdx  --   49 89 53 08 */
+    jit_emit_u8(b, 0x49);
+    jit_emit_u8(b, 0x89);
+    jit_emit_u8(b, 0x53);
+    jit_emit_u8(b, 0x08);
+  }
+
+  /* L[dst] = rax (the tagged dyn) -- via slot primitive
+   * (writes through pinned reg if dst is pinned). */
+  emit_mov_slot_from_rax(b, (int)dst);
+
+  /* jmp done   --   E9 rel32 */
+  jit_emit_u8(b, 0xe9);
+  size_t to_done = b->len;
+  jit_emit_u32(b, 0);
+
+  /* Slow path: full helper call. */
+  jit_patch_jmp_to(b, to_slow, b->len);
+  b->pending_helper_id = list_helper_id;
+  if (size == 1) {
+    jit_emit_call_helper3(b, list_helper, dst, va, 0);
+  } else {
+    jit_emit_call_helper3(b, list_helper, dst, va, vb);
+  }
+
+  jit_patch_jmp_to(b, to_done, b->len);
 }
 
 size_t jit_here(jit_buf *b) { return b->len; }
