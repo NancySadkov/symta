@@ -292,7 +292,14 @@ struct api_t {
   int gc_disable;        /* hot enough -- GC_DISABLE / GC_ENABLE
                             fire on every internal GC_DISABLE()
                             section; not pure-fast-path but close */
-  void **puwh;
+  /* STACK-2: arena_top promoted into the hot 64-byte line.
+   * PROLOGUE / CALL touch it on every Symta-level call (in fact
+   * twice per call -- once to bump, once to save -- so a cold-line
+   * miss here cost ~40% of game cold-compile time in early
+   * measurements).  Replaces `puwh` in this slot; puwh demoted to
+   * the warm tier since it's only touched on btland /
+   * SET_UNWIND_HANDLER which fire much less often than per-call. */
+  void **arena_top;
 
   /* ---- WARM second line: btrap/btland state, runtime constants
    * that show up on common but non-innermost paths. */
@@ -321,6 +328,33 @@ struct api_t {
   void **heap1;
   theap_t *theap1;
   void **uwhs;
+
+  /* puwh demoted from the hot tier in STACK-2 to make room for
+   * arena_top.  Touched only on btland and SET_UNWIND_HANDLER /
+   * REMOVE_UNWIND_HANDLER, all of which fire orders of magnitude
+   * less often than per-Symta-call PROLOGUE. */
+  void **puwh;
+
+  /* ---- STACK-2: heap-allocated frame arena.
+   *
+   * Replaces PROLOGUE's C-stack VLA (`void *L_blk_[FRAME_PREFIX_SLOTS
+   * + fsize]`) with a bump-pointer pull from a per-thread heap arena.
+   * Bounds C-stack depth to a constant per Symta call (just the
+   * callee's local C frame, no per-Symta-function VLA) so deeply
+   * recursive macroexpander runs no longer blow the Win64 64 MB
+   * reservation.
+   *
+   * arena_base : start of the big malloc'd arena (initialised
+   *              at startup, ~256 MB virtual reservation).
+   * arena_top  : current bump pointer.  In the HOT tier (see the
+   *              first half of api_t) because PROLOGUE / CALL hit
+   *              it on every Symta call.
+   * arena_end  : one past the arena's last usable slot.  PROLOGUE
+   *              checks against this; overflow is fatal in v1
+   *              (geometric chunk growth is a future optimisation).
+   */
+  void **arena_base;
+  void **arena_end;
 
   /* ---- COLD: setup constants, infrequent function pointers,
    * FFI scratch space. */
@@ -485,8 +519,25 @@ typedef struct tot_entry_t { //table of tables entry
 #define FRAME_PREFIX_SLOTS \
   ((sizeof(frame_t) + sizeof(void*) - 1) / sizeof(void*))
 
+/* STACK-2: PROLOGUE now bumps the per-thread heap arena instead
+ * of allocating a C-stack VLA.  The CALL macro's outer
+ * save/restore of `api.arena_top` unwinds this allocation on
+ * return, mimicking the VLA's automatic-storage lifetime.
+ * Overflow check is a single signed-compare branch -- mispredict
+ * cost is amortised by the win on deep recursion (no per-frame
+ * C-stack VLA setup, no chkstk on Windows for fsize > a page).
+ *
+ * The frame layout is unchanged: `frame_t` header in the first
+ * FRAME_PREFIX_SLOTS slots, locals immediately after.  GC walks
+ * the same `api.frame -> prev` chain regardless of where each
+ * frame lives (arena, C stack via jit_adapter pre-migration, or
+ * caller's local in a few BLTIN sites that explicitly
+ * CLOSE_FRAME). */
 #define PROLOGUE(fsize) \
-  void *L_blk_[FRAME_PREFIX_SLOTS + (fsize)]; \
+  void **L_blk_ = api.arena_top; \
+  api.arena_top = L_blk_ + FRAME_PREFIX_SLOTS + (fsize); \
+  if (api.arena_top > api.arena_end) \
+    fatal("frame arena overflow (fsize=%d). Recompile with a larger arena.", (int)(fsize)); \
   frame_t *frm_ = (frame_t*)L_blk_; \
   void **L = L_blk_ + FRAME_PREFIX_SLOTS; \
   frm_->prev = api.frame; \
@@ -522,8 +573,19 @@ typedef struct tot_entry_t { //table of tables entry
  * The CALL macro doesn't use CLOSE_FRAME any more -- it snapshots
  * api.frame around the inner dispatch -- but the explicit
  * `sbc_exec` driver does, since it's the outermost frame for an
- * entire Symta module run. */
-#define CLOSE_FRAME api.frame = frm_->prev;
+ * entire Symta module run.
+ *
+ * STACK-2: also rolls back `api.arena_top` to where this frame
+ * was allocated.  `(void**)frm_` is the same pointer PROLOGUE
+ * captured into L_blk_ before the bump, so resetting arena_top
+ * to it releases exactly this frame's slots.  Normal Symta-call
+ * exits go through the CALL macro's outer save/restore; only
+ * the two BLTIN sites with explicit CLOSE_FRAME (cls_set_, cls_get_)
+ * and sbc_exec's top-level need this. */
+#define CLOSE_FRAME do { \
+  api.frame = frm_->prev; \
+  api.arena_top = (void**)frm_; \
+} while (0)
 
 
 #define ARGLIST1(a) do {\
@@ -567,8 +629,10 @@ extern hook_t hooks_heap[];
   uint32_t _fz = (uint32_t)O_SIZE(f); \
   psf_t _h = (psf_t)_fp[_fz]; \
   frame_t *_saved_frame = api.frame; \
+  void **_saved_arena = api.arena_top; \
   k = _h((uint8_t*)_fp[_fz + 1]); \
   api.frame = _saved_frame; \
+  api.arena_top = _saved_arena; \
 }
 
 #define GC_DISABLE() ++api.gc_disable
@@ -626,6 +690,12 @@ typedef struct {
   void *uwh; //top of the unwind handlers stack
   frame_t *frame;
   uint8_t *ip; //instruction pointer
+  /* STACK-2: snapshot of api.arena_top at setjmp time.  btjump
+   * restores this so the unwound frames between setjmp and the
+   * jump point are released from the arena (without it, those
+   * slots would stay reserved and the arena would grow until
+   * exhausting the 256 MB reservation under repeated try/catch). */
+  void **arena_top;
 } jmp_state;
 
 #define CHECK_NARGS(expected) \

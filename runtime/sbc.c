@@ -1952,6 +1952,9 @@ dyn sbc_exec_fn(uint8_t *pin) {
       js_->uwh = api.puwh;
       js_->frame = api.frame;
       js_->ip = pin;
+      /* STACK-2: snapshot the frame arena's bump pointer so
+       * btjump can release the unwound frames' slots on jump. */
+      js_->arena_top = api.arena_top;
       jmp_buf jb;
       entry = setjmp(jb);
       js_->anchor = &jb;

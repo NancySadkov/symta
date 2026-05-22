@@ -1194,10 +1194,18 @@ static dyn jit_adapter(uint8_t *payload_ptr) {
   jit_adapter_payload_t *p = (jit_adapter_payload_t*)payload_ptr;
   int nvars = p->nvars;
 
-  /* Inline SUBR / PROLOGUE: allocate frame on the C stack via
-   * VLA, link into the api.frame chain, zero non-special
-   * slots, then populate L[0]=closure / L[1]=args. */
-  void *L_blk_[FRAME_PREFIX_SLOTS + nvars];
+  /* STACK-2: inline SUBR / PROLOGUE -- bumps the per-thread heap
+   * arena rather than allocating a C-stack VLA, matching the
+   * symta.h PROLOGUE macro.  Caller's CALL macro restores
+   * api.arena_top after we return.  GC continues to walk the
+   * api.frame chain regardless of where each frame physically
+   * lives, so the JIT path inter-operates with arena-backed
+   * interpreter frames and the few remaining VLA sites without
+   * special casing. */
+  void **L_blk_ = api.arena_top;
+  api.arena_top = L_blk_ + FRAME_PREFIX_SLOTS + nvars;
+  if (api.arena_top > api.arena_end)
+    fatal("frame arena overflow (jit_adapter nvars=%d). Recompile with a larger arena.", nvars);
   frame_t *frm_ = (frame_t*)L_blk_;
   void **L = L_blk_ + FRAME_PREFIX_SLOTS;
   frm_->prev = api.frame;

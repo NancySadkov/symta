@@ -1809,6 +1809,11 @@ void btjump(dyn land, dyn value) {
   LSET(r,1,value);
   api.jmp_return = r;
   api.frame = js_->frame;
+  /* STACK-2: roll the frame arena back to the setjmp point so
+   * the unwound frames' slots are released; otherwise repeated
+   * try/catch in a loop would walk the bump pointer to the end
+   * of the arena's 256 MB reservation. */
+  api.arena_top = js_->arena_top;
   while (js_->uwh != api.puwh) { //run finalizers
     dyn h_ = *api.puwh--;
     dyn k_;

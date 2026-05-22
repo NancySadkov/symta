@@ -768,6 +768,25 @@ static void init_api(int gen0sz) {
 
   api.frame = 0;
 
+  /* STACK-2: allocate the per-thread frame arena that backs
+   * PROLOGUE's L_blk_.  256 MB virtual reservation -- on Linux
+   * and Windows the OS only commits pages on first touch, so
+   * idle reservation cost is negligible.  Sized to comfortably
+   * hold the deepest Symta call chains we expect (compiler.s
+   * bootstrap peaks ~5-10 MB of live frames; user code's mex
+   * recursion was the motivator at up to ~50 MB pre-STACK-2,
+   * which the old 64 MB Win64 reservation couldn't always
+   * fit).  Overflow is fatal in v1; geometric chunk growth is
+   * a follow-up if real workloads ever brush the ceiling. */
+  {
+    size_t arena_bytes = (size_t)256 * 1024 * 1024;
+    size_t arena_slots = arena_bytes / sizeof(void*);
+    api.arena_base = (void**)malloc(arena_bytes);
+    if (!api.arena_base) fatal("init_api: malloc %zu bytes for frame arena failed", arena_bytes);
+    api.arena_top = api.arena_base;
+    api.arena_end = api.arena_base + arena_slots;
+  }
+
   api.uwhs = gc_heap.uwhs;
   api.heap0 = gc_heap.heap;
   api.heap1 = gc_heap.heap + HEAP_SIZE;
