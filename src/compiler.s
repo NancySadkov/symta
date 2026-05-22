@@ -868,7 +868,15 @@ produce_ssa Expr =
     Types Types.s(?0 < ??0){?1}
     Meths map Name,[Index SN CStr] GMethods: Index,CStr
     Meths Meths.s(?0 < ??0){?1}
-    Metas map Fn,M GFnMeta: ssa_fnmeta_entry Fn M.name M.size M.nargs M.origin
+    // Sort GFnMeta by key before iterating: `ssa_fnmeta_entry`
+    // has side effects (ssa_cstring on M.name and M.origin),
+    // so the iteration order leaks into the cstring table's
+    // layout.  Without the sort, hash-iteration ordering of
+    // GFnMeta drifts across consecutive `symta pkg/symta .`
+    // invocations on the same input -- caught by drift.sh at a
+    // ~15% rate, manifesting as a few bytes of difference around
+    // offset ~18400 of eval.sbc (the cstring table).
+    Metas GFnMeta.l.s(?0 < ??0).map([F M] => ssa_fnmeta_entry F M.name M.size M.nargs M.origin)
     Imps map Name,[N R Key Lib Symbol] GImports: [N Lib Symbol]
     Imps Imps.s(?0 < ??0)
     Header: header OrigString GBytes tbls fmtbl,Metas
