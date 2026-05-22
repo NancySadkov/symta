@@ -81,12 +81,14 @@ say ""
 
 // ----------------------------------------------------------------
 // 6. Reading a text file. `.lines` returns a list of text lines.
-//    The README that ships with this repo is a convenient subject.
+//    The README that ships with this repo is a convenient subject,
+//    but its line count drifts as docs evolve; print only the
+//    first 3 lines so the test stays stable across doc edits.
 // ----------------------------------------------------------------
 F "README.md"
 when F.exists:
   L F.lines
-  say "README has [L.n] lines, first 3:"
+  say "README, first 3 lines:"
   for Line L[:3]: say "  | [Line]"
 say ""
 

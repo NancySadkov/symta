@@ -16,7 +16,7 @@ age + 1 = 31
 
 user_full_name -> User Full Name
 
-README has 171 lines, first 3:
+README, first 3 lines:
   | <img src="logo.webp" alt="Symta logo" width="128" align="right">
   | 
   | # Symta
