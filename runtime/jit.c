@@ -1149,6 +1149,112 @@ static uint32_t bc_thread_jmp_target(const uint8_t *bc, size_t n,
   return target;
 }
 
+/* Forward decl for the fusion helper below -- this primitive
+ * is defined later (right next to the existing setcc-style
+ * compare emitters), so we forward-declare here to keep the
+ * fusion code adjacent to the branch-threading helper. */
+static void emit_cmp_rax_to_slot(jit_buf *b, int slot);
+
+/* ============================================================
+ * Step 13c: cmp-branch fusion.
+ *
+ * When the SBC stream is the canonical loop pattern
+ *
+ *   ILT result a x    ; result = FXN(a < x)
+ *   BC_B result tgt   ; branch if result != 0
+ *
+ * the default JIT emits (at best):
+ *
+ *   mov rax, [a]
+ *   cmp rax, [x]
+ *   setl al
+ *   movzx rax, al
+ *   shl  rax, 16
+ *   mov  [result], rax       <- L1 store
+ *   cmp  qword [result], 0   <- L1 load (waits for store)
+ *   jnz  tgt
+ *
+ * The store+load through [result] is a serial dependency
+ * (~4-5 L1 cycles) that dominates the loop body when the
+ * comparison is the loop edge.  For the canonical "result is a
+ * fresh temp consumed only by this branch" pattern -- emitted by
+ * `times` / `while` / `for` macros -- we can fuse to:
+ *
+ *   mov rax, [a]
+ *   cmp rax, [x]
+ *   jl  tgt           <- direct branch on cmp flags
+ *
+ * Same logic for IGT (jg), ILTE (jle), IGTE (jge), SAME (je),
+ * VARY (jne).  The result slot store is SKIPPED -- correct iff
+ * no later opcode reads it.  The macros that emit this pattern
+ * use a fresh `@rand` temp slot for `result`, so the only reader
+ * is the immediate BC_B.  If a future emitter violates that
+ * invariant the consequence is stale-data corruption in that
+ * specific slot; SYMTA_NO_CMP_BR_FUSION disables for bisecting.
+ *
+ * Returns 1 if fused (and writes the number of bytecode bytes
+ * consumed including the BC_B to *consumed); 0 if the pattern
+ * didn't match. */
+static int try_emit_cmp_branch_fused(jit_buf *b, const uint8_t *bc, size_t n,
+                                      uint8_t op, int dst, int a, int x,
+                                      size_t after_cmp,
+                                      jit_patch *patches, size_t *patches_n,
+                                      size_t max_patches, size_t *consumed) {
+  uint8_t jcc;
+  switch (op) {
+    case BC_ILT:  jcc = 0x8c; break;  /* jl  */
+    case BC_IGT:  jcc = 0x8f; break;  /* jg  */
+    case BC_ILTE: jcc = 0x8e; break;  /* jle */
+    case BC_IGTE: jcc = 0x8d; break;  /* jge */
+    case BC_SAME: jcc = 0x84; break;  /* je  */
+    case BC_VARY: jcc = 0x85; break;  /* jne */
+    default: return 0;
+  }
+
+  if (after_cmp >= n) return 0;
+  uint8_t next_op = bc[after_cmp];
+  size_t target;
+  size_t next_op_len;
+
+  if (next_op == BC_B) {
+    if (after_cmp + 6 > n) return 0;
+    int cnd = (int)bc_rd16(bc + after_cmp + 1);
+    if (cnd != dst) return 0;
+    uint32_t tgt = bc_rd24(bc + after_cmp + 3);
+    tgt = bc_thread_jmp_target(bc, n, tgt);
+    if (tgt >= n) return 0;
+    target = (size_t)tgt;
+    next_op_len = 6;
+  } else if (next_op == BC_B8) {
+    if (after_cmp + 4 > n) return 0;
+    int cnd = (int)bc[after_cmp + 1];
+    if (cnd != dst) return 0;
+    if (dst > 255) return 0;
+    int16_t diff = (int16_t)(uint16_t)bc_rd16(bc + after_cmp + 2);
+    int64_t tgt_s = (int64_t)after_cmp + 4 + diff;
+    if (tgt_s < 0 || (uint64_t)tgt_s > n) return 0;
+    tgt_s = (int64_t)bc_thread_jmp_target(bc, n, (uint32_t)tgt_s);
+    target = (size_t)tgt_s;
+    next_op_len = 4;
+  } else {
+    return 0;
+  }
+
+  if (*patches_n >= max_patches) return 0;
+
+  emit_mov_rax_from_slot(b, a);
+  emit_cmp_rax_to_slot(b, x);
+  jit_emit_u8(b, 0x0f);
+  jit_emit_u8(b, jcc);
+  size_t patch_off = b->len;
+  jit_emit_u32(b, 0);
+  patches[*patches_n].jit_off = patch_off;
+  patches[*patches_n].bc_target = target;
+  (*patches_n)++;
+  *consumed = 7 + next_op_len;  /* 7-byte ILT/etc. + BC_B's bytes */
+  return 1;
+}
+
 static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
   b->pinned_count = 0;
   for (int i = 0; i < JIT_MAX_PINNED; i++) {
@@ -2785,6 +2891,23 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
       int dst = bc_rd16(bc + i + 1);
       int a   = bc_rd16(bc + i + 3);
       int x   = bc_rd16(bc + i + 5);
+
+      /* Step 13c: try ILT+BC_B fusion for compare ops.  Skips the
+       * cmp's result-slot store and emits cmp+jcc directly. */
+      if (!getenv("SYMTA_NO_CMP_BR_FUSION") &&
+          (op == BC_ILT  || op == BC_IGT  || op == BC_ILTE ||
+           op == BC_IGTE || op == BC_SAME || op == BC_VARY)) {
+        size_t consumed = 0;
+        if (try_emit_cmp_branch_fused(b, bc, n, op, dst, a, x,
+                                       i + 7,
+                                       patches, &patches_n,
+                                       JIT_MAX_PATCHES,
+                                       &consumed)) {
+          i += consumed;
+          break;
+        }
+      }
+
       switch (op) {
         case BC_IADD: jit_emit_iadd(b, dst, a, x); break;
         case BC_ISUB: jit_emit_isub(b, dst, a, x); break;
