@@ -1009,9 +1009,22 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
   uint32_t counts[JIT_SCAN_MAX_SLOT];
   memset(counts, 0, sizeof(counts));
 
+  /* Phase 2b: also count helper-call sites.  Each helper call
+   * pays ~7 bytes spill + ~7 bytes reload per pinned slot.  For
+   * 3 pinned slots that's 42 bytes per helper-call site.  Pinning
+   * only pays off when the resulting inline-access savings
+   * (~2-3 cycles per access) amortise that cost (~18 cycles per
+   * helper call for 3 pins).  If a function has few inline
+   * accesses but many helper calls, the spill overhead dominates
+   * and pinning becomes a net loss -- skip it. */
+  uint32_t helper_call_sites = 0;
+
 #define BUMP(slot_expr) do { \
   uint32_t _s = (uint32_t)(slot_expr); \
   if (_s < JIT_SCAN_MAX_SLOT && counts[_s] != UINT32_MAX) counts[_s]++; \
+} while (0)
+#define BUMP_HELPER() do { \
+  if (helper_call_sites != UINT32_MAX) helper_call_sites++; \
 } while (0)
 
   /* Opcode-length-aware walk.  Lengths cribbed from each `case
@@ -1030,12 +1043,20 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
     case BC_JMP:                       i += 4; break;
     case BC_FATAL:                     i += 3; break;
 
-    /* 5-byte slot pairs: opcode + dst(u16) + src(u16) */
-    case BC_MOVE:
+    /* 5-byte slot pairs: opcode + dst(u16) + src(u16).
+     * MOVE is pure inline; INC / DEC have a helper fallback for
+     * non-T_INT operands. */
+    case BC_MOVE: {
+      if (i + 5 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      i += 5; break;
+    }
     case BC_INC: case BC_DEC: {
       if (i + 5 > n) return;
       BUMP(bc_rd16(bc + i + 1));
       BUMP(bc_rd16(bc + i + 3));
+      BUMP_HELPER();
       i += 5; break;
     }
     /* 3-byte slot pairs: opcode + dst(u8) + src(u8) */
@@ -1059,10 +1080,22 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
     }
     /* 7-byte slot triples: opcode + dst(u16) + a(u16) + b(u16).
      * Covers typed arith / cmp, FXN-arith / cmp, FXN-bitops,
-     * OBJECT (dst tid size -- last is size, count anyway). */
+     * OBJECT (dst tid size -- last is size, count anyway).
+     *
+     * Pure-inline (no helper path): IADD/ISUB/IMUL/IDIV/IREM,
+     * ILT/IGT/ILTE/IGTE, SAME, VARY.
+     * Helper-fallback (T_INT fast path inline + helper on miss):
+     * the FXN-arith/cmp and FXN-bitops family.  These contribute
+     * a helper-call site to the spill cost. */
     case BC_IADD: case BC_ISUB: case BC_IMUL: case BC_IDIV: case BC_IREM:
     case BC_ILT:  case BC_IGT:  case BC_ILTE: case BC_IGTE:
-    case BC_SAME: case BC_VARY:
+    case BC_SAME: case BC_VARY: {
+      if (i + 7 > n) return;
+      BUMP(bc_rd16(bc + i + 1));
+      BUMP(bc_rd16(bc + i + 3));
+      BUMP(bc_rd16(bc + i + 5));
+      i += 7; break;
+    }
     case BC_FXNADD: case BC_FXNSUB: case BC_FXNMUL: case BC_FXNDIV: case BC_FXNREM:
     case BC_FXNLT:  case BC_FXNGT:  case BC_FXNLTE: case BC_FXNGTE:
     case BC_FXNAND: case BC_FXNIOR: case BC_FXNXOR:
@@ -1071,6 +1104,7 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
       BUMP(bc_rd16(bc + i + 1));
       BUMP(bc_rd16(bc + i + 3));
       BUMP(bc_rd16(bc + i + 5));
+      BUMP_HELPER();
       i += 7; break;
     }
     case BC_OBJECT: {  /* dst + tid + size; only dst is a slot */
@@ -1080,13 +1114,14 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
     }
     /* 9-byte: IMMEQ/IMMNE (dst, a, b, mcache), FXNLGET (dst, src,
      * index, mcache), FXNLSETIR (src, index, val, mcache),
-     * MCALL (dst, obj, met, mcache). */
+     * MCALL (dst, obj, met, mcache).  All have helper fallbacks. */
     case BC_IMMEQ: case BC_IMMNE: case BC_FXNLGET:
     case BC_FXNLSETIR: case BC_MCALL: {
       if (i + 9 > n) return;
       BUMP(bc_rd16(bc + i + 1));
       BUMP(bc_rd16(bc + i + 3));
       BUMP(bc_rd16(bc + i + 5));
+      BUMP_HELPER();
       i += 9; break;
     }
     case BC_FXNLSET: {  /* 11 bytes: dst, src, idx, val, mcache */
@@ -1095,42 +1130,50 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
       BUMP(bc_rd16(bc + i + 3));
       BUMP(bc_rd16(bc + i + 5));
       BUMP(bc_rd16(bc + i + 7));
+      BUMP_HELPER();
       i += 11; break;
     }
     case BC_LIST: case BC_LIST1:
-    case BC_FXNLISTN: case BC_FXNSIZE: {  /* 5 bytes: dst, x or src */
+    case BC_FXNLISTN: case BC_FXNSIZE: {  /* 5 bytes: dst, x or src.
+                                            Allocation helpers. */
       if (i + 5 > n) return;
       BUMP(bc_rd16(bc + i + 1));
       BUMP(bc_rd16(bc + i + 3));
+      BUMP_HELPER();
       i += 5; break;
     }
-    case BC_LIST2: {  /* 7 bytes: dst, a, b */
+    case BC_LIST2: {  /* 7 bytes: dst, a, b -- allocation helper */
       if (i + 7 > n) return;
       BUMP(bc_rd16(bc + i + 1));
       BUMP(bc_rd16(bc + i + 3));
       BUMP(bc_rd16(bc + i + 5));
+      BUMP_HELPER();
       i += 7; break;
     }
-    case BC_CALL: case BC_CALLT: {  /* 5 bytes: dst, fn */
+    case BC_CALL: case BC_CALLT: {  /* 5 bytes: dst, fn -- direct call */
       if (i + 5 > n) return;
       BUMP(bc_rd16(bc + i + 1));
       BUMP(bc_rd16(bc + i + 3));
+      BUMP_HELPER();
       i += 5; break;
     }
-    case BC_CALLIR: case BC_CALLTIR: {  /* 3 bytes: fn */
+    case BC_CALLIR: case BC_CALLTIR: {  /* 3 bytes: fn (direct call) */
       if (i + 3 > n) return;
       BUMP(bc_rd16(bc + i + 1));
+      BUMP_HELPER();
       i += 3; break;
     }
-    case BC_MCALLIR: {  /* 7 bytes: obj, met, mcache */
+    case BC_MCALLIR: {  /* 7 bytes: obj, met, mcache (method call) */
       if (i + 7 > n) return;
       BUMP(bc_rd16(bc + i + 1));
+      BUMP_HELPER();
       i += 7; break;
     }
     case BC_MCALL8: {  /* 6 bytes: dst u8, obj u8, met u8, mcache u16 */
       if (i + 6 > n) return;
       BUMP(bc[i + 1]);
       BUMP(bc[i + 2]);
+      BUMP_HELPER();
       i += 6; break;
     }
     case BC_ARGLIST0: i += 1; break;
@@ -1230,6 +1273,7 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
   }
 
 #undef BUMP
+#undef BUMP_HELPER
 
   /* Pick top-3 by count.  Skip slot 0 and slot 1 (P and E --
    * the parent/args slots; PROLOGUE populates them, so pinning
@@ -1251,12 +1295,44 @@ static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
       }
     }
   }
+
+  /* Phase 2b helper-density filter.  Each helper call pays
+   * roughly 7 bytes of spill + 7 bytes of reload per pinned
+   * slot.  Each saved inline access saves ~2 bytes (5-byte
+   * memory op -> 3-byte reg-to-reg move).  Compute the break-
+   * even threshold:
+   *
+   *   savings  = sum_top3_inline_accesses * 2 bytes
+   *   cost     = helper_call_sites * 14 bytes * n_pinned
+   *
+   * Pin only if savings > cost.  Avoids making helper-call-heavy
+   * functions (compilation paths, macroexpand, dispatch-only
+   * helpers) pay net negative for pinning. */
+  uint32_t total_inline = 0;
+  for (int k = 0; k < JIT_MAX_PINNED; k++) total_inline += best_counts[k];
+
   int n_pinned = 0;
   for (int k = 0; k < JIT_MAX_PINNED; k++) {
     if (best_counts[k] < 2) break;
-    b->pinned[n_pinned].slot = (int32_t)best_slots[k];
-    b->pinned[n_pinned].reg  = (uint8_t)(13 + n_pinned);
     n_pinned++;
+  }
+  if (n_pinned > 0) {
+    /* Skip the threshold check when SYMTA_REGALLOC_ALWAYS is set
+     * (lets bench harnesses force pinning to measure the upside
+     * separately from the heuristic). */
+    if (!getenv("SYMTA_REGALLOC_ALWAYS")) {
+      uint64_t savings_bytes = (uint64_t)total_inline * 2;
+      uint64_t spill_bytes   = (uint64_t)helper_call_sites * 14 *
+                               (uint64_t)n_pinned;
+      if (savings_bytes <= spill_bytes) {
+        b->pinned_count = 0;
+        return;
+      }
+    }
+  }
+  for (int k = 0; k < n_pinned; k++) {
+    b->pinned[k].slot = (int32_t)best_slots[k];
+    b->pinned[k].reg  = (uint8_t)(13 + k);
   }
   b->pinned_count = n_pinned;
 }
