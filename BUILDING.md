@@ -183,6 +183,80 @@ Two integration patterns:
 
 ---
 
+## Releasing a milestone
+
+Symta is distributed as periodic milestone releases — a Linux
+tarball and a Windows zip, both self-contained. There is no
+public git endpoint; only released snapshots are published. See
+`symta/symta.aermia.com.md` for the rationale.
+
+The release flow:
+
+```sh
+# 1. Build the Windows binary on a Windows host (or via WSL2 +
+#    w64devkit). The result must end up at
+#    /mnt/c/.../symta/symta.exe — the dist script reads it from
+#    there (override with SYMTA_EXE_PATH=).
+build.bat                    # from Windows, or via cmd.exe
+
+# 2. Drive the rest from a WSL or Linux shell:
+cd ~/code/som
+./symta/dev/build-dist.sh              # uses today's date
+./symta/dev/build-dist.sh --publish    # rsyncs to symta.aermia.com
+```
+
+What the script does:
+
+1.  Rebuilds the Linux ELF (`make -f Makefile.linux clean && make`).
+2.  Sanity-checks that the Windows `.exe` exists at the configured
+    path.
+3.  Stages two parallel trees under `/tmp/symta-dist-<stamp>/{linux,windows}/`,
+    each containing a copy of the `symta/` source tree (excluding
+    build artifacts and `node_modules`-equivalents).
+4.  Drops the right binary into each tree.
+5.  Writes a per-archive `README.md` with quick-start instructions
+    matched to the target platform.
+6.  Packs `symta-<stamp>-linux.tar.gz` + `symta-<stamp>-windows.zip`
+    into `~/code/som/dist/`, with `symta-latest-*` symlink-style
+    copies for stable URLs.
+7.  Verifies the Linux archive extracts and runs `hello.s` from a
+    clean directory.
+8.  Optionally rsyncs the artifacts to the live VPS at
+    `nancy@<vps>:~/aermia.com/symta-site/downloads/`.
+
+Useful env-var overrides:
+
+| Variable          | Default                                                     | Purpose                                  |
+|---                |---                                                          |---                                       |
+| `SYMTA_EXE_PATH`  | `/mnt/c/Users/nangl/d/code/som/symta/symta.exe`             | Where to read the Windows binary from    |
+| `DIST_OUT_DIR`    | `~/code/som/dist`                                           | Where to drop the final archives         |
+| `STAGING_DIR`     | `/tmp/symta-dist-<stamp>`                                   | Scratch space (auto-cleaned)             |
+| `STRIP`           | `0`                                                         | Set to `1` to `strip(1)` both binaries (~30-40% smaller archives) |
+| `PUBLISH`         | `0`                                                         | Set to `1` (or pass `--publish`) to rsync to the VPS |
+
+After a release ships, the live URLs are:
+
+  - `https://symta.aermia.com/downloads/`
+  - `https://symta.aermia.com/downloads/symta-latest-linux.tar.gz`
+  - `https://symta.aermia.com/downloads/symta-latest-windows.zip`
+  - `https://symta.aermia.com/downloads/symta-<stamp>-linux.tar.gz`
+  - `https://symta.aermia.com/downloads/symta-<stamp>-windows.zip`
+
+The `-latest-` copies always point at the most recent build. The
+dated copies are permanent — old releases stay browseable at
+`/downloads/`.
+
+### Cache-purge note
+
+Cloudflare caches the archives at its edge. After a fresh `--publish`,
+the `-latest-*` URLs may serve a stale build for ~4 hours unless you
+purge the CF cache (or temporarily add `Cache-Control: no-cache` to
+the `Caddyfile` block for that path). The dated URLs are
+content-addressed by name so they're always fresh; prefer linking to
+those from blog posts / forum messages.
+
+---
+
 ## Known issues
 
 - **`pkg/symta` bootstrap fails on `go.s`** with a parser error
