@@ -1308,6 +1308,1186 @@ static int try_emit_cmp_branch_fused(jit_buf *b, const uint8_t *bc, size_t n,
   return 1;
 }
 
+/* ============================================================
+ * Phase 4 step 1: basic-block partitioning.
+ *
+ * Dead-store elim, copy propagation, and constant folding all
+ * walk basic blocks.  This pass identifies them once so the
+ * three callers don't each re-derive control flow.
+ *
+ * A leader is the start offset of a basic block.  i is a leader iff
+ *   - i == 0, OR
+ *   - some branch/jump targets i, OR
+ *   - the immediately preceding instruction terminates a block
+ *     (BC_LEAVE / BC_LEAVE0 / BC_JMP / BC_JMP16 / BC_FATAL /
+ *      BC_CTX::BTJUMP -- the longjmp sub-op).
+ *
+ * Conditional branches (BC_B / BC_B8 / BC_IFFXN) end a block
+ * via the target edge but the fallthrough is also a leader.
+ *
+ * BC_CALL / BC_CALLT / BC_CALLIR / BC_CALLTIR / BC_MCALL etc.
+ * return normally and do NOT terminate a block here.  Their
+ * possible longjmp-out behaviour is dynamic and handled by SEH
+ * unwind, not static control flow.
+ *
+ * The opcode-length table is the same one implicit in
+ * jit_select_pinned_slots and the translator's i+=N steps;
+ * keeping it in one place avoids drift.  Future commit can
+ * migrate jit_select_pinned_slots to use it. */
+
+typedef struct {
+  uint32_t start;     /* leader offset */
+  uint32_t end;       /* exclusive: start of next block, or n at end */
+} jit_bb_t;
+
+typedef struct {
+  size_t n_blocks;
+  jit_bb_t *blocks;       /* malloc'd, n_blocks entries */
+  uint8_t *leader;        /* malloc'd, [n+1]; leader[i]=1 iff i is a leader */
+  size_t n;               /* bytecode length */
+} jit_bb_info;
+
+/* Returns byte length of opcode at bc[i], or 0 if i is past end /
+ * the opcode is unknown / the operand stream is truncated.  A 0
+ * return means "callers should bail; this function can't be
+ * partitioned".  Mirrors the i+=N steps in the translator + the
+ * pin-scan switch in jit_select_pinned_slots. */
+static size_t bc_op_length(const uint8_t *bc, size_t i, size_t n) {
+  if (i >= n) return 0;
+  uint8_t op = bc[i];
+  switch (op) {
+    case BC_NOP: case BC_LEAVE0: case BC_ARGLIST0:
+      return 1;
+    /* BC_FXNB0 (0x27): opcode + dst(u8) = 2 bytes.
+     * BC_MOVE4 (0x97): opcode + opr(u8) = 2 bytes.
+     * BC_ARGLIST1: opcode + src(u8) = 2 bytes -- note pin-scan
+     *   incorrectly treats these as u16-indexed (3/5/7/9/11);
+     *   the translator + interpreter both decode as u8. */
+    case BC_FXNB0: case BC_MOVE4:
+    case BC_ARGLIST1:
+      return 2;
+    case BC_LEAVE:           /* opcode + src(u16) */
+    case BC_JMP16: case BC_FATAL: case BC_CNAS:
+    case BC_MOVE8: case BC_MOVEMT8: case BC_MOVETX8:
+    case BC_MOVEEMT: case BC_MOVENO:
+    case BC_CALLIR: case BC_CALLTIR:
+    case BC_FXN0:            /* opcode + dst(u16) */
+    case BC_FXNB8:           /* opcode + dst(u8) + imm(int8) */
+    case BC_CURMET:
+    case BC_ARGLIST2:        /* opcode + 2*u8 = 3 bytes */
+      return 3;
+    case BC_JMP: case BC_IFFXN: case BC_B8:
+    case 0x23 /* BC_STOR8 */:
+    case BC_LOAD8:
+    case BC_FXN8:            /* opcode + dst(u16) + imm(int8) */
+    case BC_FXNB16:          /* opcode + dst(u8) + imm(int16) */
+    case BC_ARGLIST3:        /* opcode + 3*u8 = 4 bytes */
+      return 4;
+    case BC_MOVE: case BC_INC: case BC_DEC:
+    case BC_LIST: case BC_LIST1: case BC_FXNLISTN: case BC_FXNSIZE:
+    case BC_CALL: case BC_CALLT:
+    case BC_FXN16:
+    case BC_FXNTAG: case BC_NOT: case BC_GOT: case BC_NO:
+    case BC_NEG: case BC_ABS:
+    case BC_SUBTYPE: case BC_MNAME:
+    case BC_ARGLIST4:        /* opcode + 4*u8 = 5 bytes */
+      return 5;
+    case BC_B: case BC_MCALL8:
+    case BC_MOVEIM: case BC_MOVEMT: case BC_MOVETX:
+    case BC_CLOSURE:         /* opcode + dst(u16) + idx(u16) + size(u8) */
+    case BC_FXNB32:          /* opcode + dst(u8) + imm(int32) */
+    case BC_ARGLIST5:        /* opcode + 5*u8 = 6 bytes */
+      return 6;
+    case BC_IADD: case BC_ISUB: case BC_IMUL: case BC_IDIV: case BC_IREM:
+    case BC_ILT:  case BC_IGT:  case BC_ILTE: case BC_IGTE:
+    case BC_SAME: case BC_VARY:
+    case BC_FXNADD: case BC_FXNSUB: case BC_FXNMUL: case BC_FXNDIV: case BC_FXNREM:
+    case BC_FXNLT:  case BC_FXNGT:  case BC_FXNLTE: case BC_FXNGTE:
+    case BC_FXNAND: case BC_FXNIOR: case BC_FXNXOR:
+    case BC_FXNSHL: case BC_FXNSHR:
+    case BC_FADD: case BC_FSUB: case BC_FMUL: case BC_FDIV:
+    case BC_OBJECT:
+    case BC_MCALLIR:
+    case BC_LIST2:
+    case 0x22 /* BC_STOR */: case BC_LOAD:
+    case BC_FXN32:           /* opcode + dst(u16) + imm(int32) */
+      return 7;
+    case BC_TINIT:           /* opcode + type(u16) + size(u16) + name(u24) */
+    case BC_DMET:            /* opcode + tyidx(u16) + mtidx(u24) + handler(u16) */
+      return 8;
+    case BC_IMMEQ: case BC_IMMNE: case BC_FXNLGET:
+    case BC_FXNLSETIR: case BC_MCALL:
+    case BC_COPY:            /* opcode + dst(u16)+src(u16)+dindex(u16)+sindex(u16) */
+      return 9;
+    case 0x2F /* BC_IMMB64 */:  /* opcode + dst(u8) + imm(u64) */
+      return 10;
+    case BC_FXNLSET:
+    case 0x30 /* BC_IMM64 */:   /* opcode + dst(u16) + imm(u64) */
+      return 11;
+    case BC_TINITI:          /* opcode + tag(u16) + size(u16) + name(u64) */
+      return 13;
+    /* BC_FXT8..56 (0x90..0x96): opcode + dst(u8) + imm(width bytes).
+     * width = (op - BC_FXT8) + 1, i.e. FXT8=1 byte imm -> total 3,
+     * FXT56=7 byte imm -> total 9. */
+    case BC_FXT8:  return 3;
+    case BC_FXT16: return 4;
+    case BC_FXT24: return 5;
+    case BC_FXT32: return 6;
+    case BC_FXT40: return 7;
+    case BC_FXT48: return 8;
+    case BC_FXT56: return 9;
+    /* LD4_0..LD4_F (0x6A..0x79), ST4_0..ST4_F (0x7A..0x89): 2 bytes each */
+    case 0x6A: case 0x6B: case 0x6C: case 0x6D:
+    case 0x6E: case 0x6F: case 0x70: case 0x71:
+    case 0x72: case 0x73: case 0x74: case 0x75:
+    case 0x76: case 0x77: case 0x78: case 0x79:
+    case 0x7A: case 0x7B: case 0x7C: case 0x7D:
+    case 0x7E: case 0x7F: case 0x80: case 0x81:
+    case 0x82: case 0x83: case 0x84: case 0x85:
+    case 0x86: case 0x87: case 0x88: case 0x89:
+      return 2;
+    /* Variable: ARGLIST / ARGLIST8 carry size(u16) + size*u16 srcs */
+    case BC_ARGLIST: case BC_ARGLIST8: {
+      if (i + 3 > n) return 0;
+      uint32_t sz = bc_rd16(bc + i + 1);
+      size_t len = 3u + sz * 2u;
+      if (i + len > n) return 0;
+      return len;
+    }
+    /* Variable: BC_CTX dispatches on type byte. */
+    case BC_CTX: {
+      if (i + 2 > n) return 0;
+      uint8_t type = bc[i + 1];
+      switch (type) {
+        case 0: return 4;   /* BTLAND: type + dst(u16)            */
+        case 1: return 6;   /* BTJUMP: type + state(u16) + val    */
+        case 2: return 4;   /* SET_UNWIND_HANDLER: type + h(u16)  */
+        case 3: return 2;   /* REMOVE_UNWIND_HANDLER: type only   */
+        default: return 0;
+      }
+    }
+    default:
+      return 0;  /* unknown opcode -> partition can't proceed */
+  }
+}
+
+/* ============================================================
+ * Phase 4 step 2: per-opcode slot def/use enumeration.
+ *
+ * For each opcode in a basic block, `bc_op_defuse_visit` invokes
+ * `def_cb(slot, user)` for every L[] slot the opcode WRITES and
+ * `use_cb(slot, user)` for every L[] slot it READS.  Non-slot
+ * operands (im-table indices, mt-table indices, literals,
+ * sub-type bytes) are skipped.
+ *
+ * Conservative classifications:
+ *   - BC_LIST writes dst but doesn't read any slot (size is an
+ *     immediate; the helper allocates with no slot inputs).
+ *   - BC_STOR / BC_ST4_* / BC_COPY have NO def -- they mutate
+ *     heap state via L[dst]'s heap ref, but L[dst] itself isn't
+ *     written.  Both dst and src are uses.
+ *   - BC_CALL / BC_CALLT defs dst, uses fn.  Any slots read by
+ *     the callee come via api.args which BC_ARGLIST set up;
+ *     those slots show up at the ARGLIST opcode, not here.
+ *   - BC_CALLIR / BC_CALLTIR / BC_MCALLIR: ignore-result variants
+ *     -- use fn (or obj for MCALLIR), no def.
+ *   - BC_FXNLSET (with-result): conservatively treated as both
+ *     def AND use of dst.  The macro's fast path does NOT write
+ *     L[dst], but the slow-path MCALL handler does -- so the
+ *     conservative analysis must assume the def can happen.
+ *
+ * Returns 1 if classified, 0 if the opcode is unknown.  Caller
+ * MUST keep this in sync with bc_op_length (any opcode that
+ * bc_op_length returns >0 for should also classify here). */
+
+typedef void (*jit_slot_cb)(uint32_t slot, void *user);
+
+static int bc_op_defuse_visit(const uint8_t *bc, size_t i, size_t n,
+                               jit_slot_cb def_cb, jit_slot_cb use_cb,
+                               void *user) {
+  if (i >= n) return 0;
+  uint8_t op = bc[i];
+
+#define DEF(s) do { if (def_cb) def_cb((uint32_t)(s), user); } while (0)
+#define USE(s) do { if (use_cb) use_cb((uint32_t)(s), user); } while (0)
+
+  switch (op) {
+    /* No slot operands. */
+    case BC_NOP: case BC_LEAVE0: case BC_JMP: case BC_JMP16:
+    case BC_CNAS: case BC_ARGLIST0:
+    case BC_SUBTYPE:           /* super/sub are type-table indices */
+    case BC_TINIT: case BC_TINITI:  /* all operands are immediates */
+      return 1;
+
+    /* dst-only def (no use): immediate / table-lookup loads. */
+    case BC_MOVEEMT: case BC_MOVENO:
+    case BC_FXN0:                    /* opcode + dst(u16) */
+    case BC_CURMET:                  /* opcode + dst(u16) */
+      DEF(bc_rd16(bc + i + 1)); return 1;
+    case BC_FXN8: case BC_FXN16: case BC_FXN32:
+      DEF(bc_rd16(bc + i + 1)); return 1;
+    case BC_FXNB0:                   /* opcode + dst(u8) -- narrow form */
+    case BC_FXNB8: case BC_FXNB16: case BC_FXNB32:
+      DEF(bc[i + 1]); return 1;
+    case BC_FXT8: case BC_FXT16: case BC_FXT24:
+    case BC_FXT32: case BC_FXT40: case BC_FXT48: case BC_FXT56:
+      DEF(bc[i + 1]); return 1;
+    case 0x2F /* BC_IMMB64 */:
+      DEF(bc[i + 1]); return 1;
+    case 0x30 /* BC_IMM64 */:
+      DEF(bc_rd16(bc + i + 1)); return 1;
+    case BC_MOVEIM: case BC_MOVEMT: case BC_MOVETX:
+      DEF(bc_rd16(bc + i + 1)); return 1;  /* src is table index */
+    case BC_MOVEMT8: case BC_MOVETX8:
+      DEF(bc[i + 1]); return 1;
+    case BC_CLOSURE:
+      DEF(bc_rd16(bc + i + 1)); return 1;  /* idx is hooks-table */
+    case BC_OBJECT:
+      DEF(bc_rd16(bc + i + 1)); return 1;  /* tid, size are immediates */
+    case BC_LIST:
+      DEF(bc_rd16(bc + i + 1)); return 1;  /* size is immediate */
+
+    /* Single-slot uses (no def). */
+    case BC_FATAL:
+      USE(bc_rd16(bc + i + 1)); return 1;
+    case BC_LEAVE:
+      USE(bc_rd16(bc + i + 1)); return 1;
+    case BC_B:
+      USE(bc_rd16(bc + i + 1)); return 1;  /* cnd; target is bc offset */
+    case BC_B8: case BC_IFFXN:
+      USE(bc[i + 1]); return 1;            /* cnd; diff is rel offset */
+    case BC_CALLIR: case BC_CALLTIR:
+      USE(bc_rd16(bc + i + 1)); return 1;  /* fn slot */
+    case BC_DMET:
+      /* handler slot is at offset 6 (after tyidx u16, mtidx u24).
+       * tyidx/mtidx are table indices. */
+      USE(bc_rd16(bc + i + 6)); return 1;
+
+    /* 2-slot dst, src: def dst + use src. */
+    case BC_MOVE: case BC_INC: case BC_DEC:
+    case BC_FXNTAG: case BC_NOT: case BC_GOT: case BC_NO:
+    case BC_NEG: case BC_ABS:
+    case BC_FXNLISTN: case BC_FXNSIZE: case BC_MNAME:
+    case BC_LIST1:
+      DEF(bc_rd16(bc + i + 1));
+      USE(bc_rd16(bc + i + 3));
+      return 1;
+    case BC_MOVE8:
+      DEF(bc[i + 1]); USE(bc[i + 2]); return 1;
+    case BC_MOVE4: {
+      uint8_t opr = bc[i + 1];
+      DEF(opr & 0xF); USE(opr >> 4); return 1;
+    }
+    case BC_LOAD:
+      /* dst=u16 src=u16 index=u16; index is a struct-field index,
+       * not a slot. */
+      DEF(bc_rd16(bc + i + 1)); USE(bc_rd16(bc + i + 3)); return 1;
+    case BC_LOAD8:
+      DEF(bc[i + 1]); USE(bc[i + 2]); return 1;
+    /* LD4_0..LD4_F: opr byte holds dst (low 4 bits) + src (high 4).
+     * Field index is the (op - 0x6A) literal. */
+    case 0x6A: case 0x6B: case 0x6C: case 0x6D:
+    case 0x6E: case 0x6F: case 0x70: case 0x71:
+    case 0x72: case 0x73: case 0x74: case 0x75:
+    case 0x76: case 0x77: case 0x78: case 0x79: {
+      uint8_t opr = bc[i + 1];
+      DEF(opr & 0xF); USE(opr >> 4); return 1;
+    }
+
+    /* Stores: heap-mutating, NO def of L[dst].  Both dst and src
+     * are reads (dst = heap ref to store into, src = value). */
+    case 0x22 /* BC_STOR */:
+      USE(bc_rd16(bc + i + 1));  /* dst */
+      USE(bc_rd16(bc + i + 3));  /* src */
+      return 1;
+    case 0x23 /* BC_STOR8 */:
+      USE(bc[i + 1]); USE(bc[i + 2]); return 1;
+    /* ST4_0..ST4_F: same as LD4 layout but conceptually a store.
+     * Both opr halves are reads. */
+    case 0x7A: case 0x7B: case 0x7C: case 0x7D:
+    case 0x7E: case 0x7F: case 0x80: case 0x81:
+    case 0x82: case 0x83: case 0x84: case 0x85:
+    case 0x86: case 0x87: case 0x88: case 0x89: {
+      uint8_t opr = bc[i + 1];
+      USE(opr & 0xF); USE(opr >> 4); return 1;
+    }
+
+    /* 3-slot dst,a,b: typed-int / FXN arith + cmp + bitops + float. */
+    case BC_IADD: case BC_ISUB: case BC_IMUL: case BC_IDIV: case BC_IREM:
+    case BC_ILT:  case BC_IGT:  case BC_ILTE: case BC_IGTE:
+    case BC_SAME: case BC_VARY:
+    case BC_FXNADD: case BC_FXNSUB: case BC_FXNMUL: case BC_FXNDIV: case BC_FXNREM:
+    case BC_FXNLT:  case BC_FXNGT:  case BC_FXNLTE: case BC_FXNGTE:
+    case BC_FXNAND: case BC_FXNIOR: case BC_FXNXOR:
+    case BC_FXNSHL: case BC_FXNSHR:
+    case BC_FADD: case BC_FSUB: case BC_FMUL: case BC_FDIV:
+    case BC_LIST2:
+      DEF(bc_rd16(bc + i + 1));
+      USE(bc_rd16(bc + i + 3));
+      USE(bc_rd16(bc + i + 5));
+      return 1;
+
+    /* IMMEQ / IMMNE / FXNLGET: dst,a,b + mcache_idx (literal).  All
+     * three slot operands are at the u16 positions 1/3/5. */
+    case BC_IMMEQ: case BC_IMMNE: case BC_FXNLGET:
+      DEF(bc_rd16(bc + i + 1));
+      USE(bc_rd16(bc + i + 3));
+      USE(bc_rd16(bc + i + 5));
+      return 1;
+    /* FXNLSETIR: src,index,val + mcache.  No def. */
+    case BC_FXNLSETIR:
+      USE(bc_rd16(bc + i + 1));
+      USE(bc_rd16(bc + i + 3));
+      USE(bc_rd16(bc + i + 5));
+      return 1;
+    /* FXNLSET (with-result): dst,src,index,val + mcache.  Conservative
+     * def+use of dst (fast path doesn't write but slow path does). */
+    case BC_FXNLSET:
+      DEF(bc_rd16(bc + i + 1)); USE(bc_rd16(bc + i + 1));
+      USE(bc_rd16(bc + i + 3));
+      USE(bc_rd16(bc + i + 5));
+      USE(bc_rd16(bc + i + 7));
+      return 1;
+    /* COPY: dst,src + dindex,sindex (literals).  No L[] def. */
+    case BC_COPY:
+      USE(bc_rd16(bc + i + 1));
+      USE(bc_rd16(bc + i + 3));
+      return 1;
+
+    /* CALL family: def dst, use fn. */
+    case BC_CALL: case BC_CALLT:
+      DEF(bc_rd16(bc + i + 1));
+      USE(bc_rd16(bc + i + 3));
+      return 1;
+    /* MCALL: def dst, use obj.  met is mt-table index, mcache is
+     * mcache-slot index -- neither is a L[] slot. */
+    case BC_MCALL:
+      DEF(bc_rd16(bc + i + 1));
+      USE(bc_rd16(bc + i + 3));
+      return 1;
+    case BC_MCALLIR:
+      USE(bc_rd16(bc + i + 1)); return 1;  /* obj */
+    case BC_MCALL8:
+      DEF(bc[i + 1]); USE(bc[i + 2]); return 1;  /* dst, obj */
+
+    /* ARGLIST family: every slot listed is a USE (api.args setup). */
+    case BC_ARGLIST1:
+      USE(bc[i + 1]); return 1;
+    case BC_ARGLIST2:
+      USE(bc[i + 1]); USE(bc[i + 2]); return 1;
+    case BC_ARGLIST3:
+      USE(bc[i + 1]); USE(bc[i + 2]); USE(bc[i + 3]); return 1;
+    case BC_ARGLIST4:
+      USE(bc[i + 1]); USE(bc[i + 2]); USE(bc[i + 3]); USE(bc[i + 4]); return 1;
+    case BC_ARGLIST5:
+      USE(bc[i + 1]); USE(bc[i + 2]); USE(bc[i + 3]);
+      USE(bc[i + 4]); USE(bc[i + 5]); return 1;
+    case BC_ARGLIST: case BC_ARGLIST8: {
+      if (i + 3 > n) return 0;
+      uint32_t sz = bc_rd16(bc + i + 1);
+      if (i + 3 + sz * 2u > n) return 0;
+      for (uint32_t k = 0; k < sz; k++) USE(bc_rd16(bc + i + 3 + k * 2));
+      return 1;
+    }
+
+    /* CTX sub-ops.  See sbc.c:1939 for body semantics. */
+    case BC_CTX: {
+      if (i + 2 > n) return 0;
+      switch (bc[i + 1]) {
+        case 0:  /* BTLAND: dst */
+          DEF(bc_rd16(bc + i + 2)); return 1;
+        case 1:  /* BTJUMP: state + value (both uses) */
+          USE(bc_rd16(bc + i + 2));
+          USE(bc_rd16(bc + i + 4));
+          return 1;
+        case 2:  /* SET_UNWIND_HANDLER: h */
+          USE(bc_rd16(bc + i + 2)); return 1;
+        case 3:  /* REMOVE_UNWIND_HANDLER: no operands */
+          return 1;
+        default: return 0;
+      }
+    }
+
+    default:
+      return 0;
+  }
+
+#undef DEF
+#undef USE
+}
+
+/* For an opcode at bc[i], fills branch info:
+ *   *out_target   = absolute target offset, or (uint32_t)-1 if none
+ *   *out_has_fallthrough = 1 if the next-instruction at i+len is
+ *                          a successor (false for unconditional jumps,
+ *                          BC_LEAVE/LEAVE0, BC_FATAL, BC_CTX::BTJUMP).
+ * Returns 1 if this opcode ends a basic block, 0 otherwise.
+ *
+ * Branch target resolution does NOT follow chains here (that's
+ * the translator's job via bc_thread_jmp_target).  We record the
+ * direct target; chasing chains in the partition would obscure
+ * the true CFG. */
+static int bc_op_branch_info(const uint8_t *bc, size_t i, size_t n,
+                              uint32_t *out_target,
+                              int *out_has_fallthrough) {
+  *out_target = (uint32_t)-1;
+  *out_has_fallthrough = 1;
+  if (i >= n) return 0;
+  uint8_t op = bc[i];
+  switch (op) {
+    case BC_LEAVE: case BC_LEAVE0: case BC_FATAL:
+      *out_has_fallthrough = 0;
+      return 1;
+    case BC_JMP:
+      if (i + 4 > n) return 0;
+      *out_target = bc_rd24(bc + i + 1);
+      *out_has_fallthrough = 0;
+      return 1;
+    case BC_JMP16: {
+      if (i + 3 > n) return 0;
+      int16_t diff = (int16_t)(uint16_t)bc_rd16(bc + i + 1);
+      int64_t tgt = (int64_t)i + 3 + diff;
+      if (tgt < 0 || (uint64_t)tgt > n) return 0;
+      *out_target = (uint32_t)tgt;
+      *out_has_fallthrough = 0;
+      return 1;
+    }
+    case BC_B: {
+      if (i + 6 > n) return 0;
+      *out_target = bc_rd24(bc + i + 3);
+      return 1;
+    }
+    case BC_B8: {
+      if (i + 4 > n) return 0;
+      int16_t diff = (int16_t)(uint16_t)bc_rd16(bc + i + 2);
+      int64_t tgt = (int64_t)i + 4 + diff;
+      if (tgt < 0 || (uint64_t)tgt > n) return 0;
+      *out_target = (uint32_t)tgt;
+      return 1;
+    }
+    case BC_IFFXN: {
+      if (i + 4 > n) return 0;
+      int16_t diff = (int16_t)(uint16_t)bc_rd16(bc + i + 2);
+      int64_t tgt = (int64_t)i + 4 + diff;
+      if (tgt < 0 || (uint64_t)tgt > n) return 0;
+      *out_target = (uint32_t)tgt;
+      return 1;
+    }
+    case BC_CTX: {
+      if (i + 2 > n) return 0;
+      if (bc[i + 1] == 1) {       /* BTJUMP -- longjmp out, no fallthrough */
+        *out_has_fallthrough = 0;
+        return 1;
+      }
+      return 0;                   /* BTLAND / SET / REMOVE: not terminators */
+    }
+    default:
+      return 0;
+  }
+}
+
+/* Partition bc[0..n) into basic blocks.  On success fills *out
+ * (caller owns out->blocks and out->leader; release with
+ * jit_bb_free) and returns 1.  On failure (unknown opcode,
+ * truncated stream) returns 0 and *out is untouched.
+ *
+ * Allocation is single-shot: two malloc()s, no growth.  Worst
+ * case n_blocks = n (one block per byte), but realistic SBC is
+ * far smaller -- ~1 block per ~20 bytes. */
+static int jit_partition_bbs(const uint8_t *bc, size_t n, jit_bb_info *out) {
+  if (n == 0) {
+    out->n_blocks = 0;
+    out->blocks = NULL;
+    out->leader = NULL;
+    out->n = 0;
+    return 1;
+  }
+  uint8_t *leader = (uint8_t*)calloc(n + 1, 1);
+  if (!leader) return 0;
+
+  /* Pass 1: mark leaders.  Walk every instruction, recording
+   * branch targets and post-terminator offsets.  Sets leader[0]=1
+   * up front since the function entry is always a leader. */
+  leader[0] = 1;
+  size_t i = 0;
+  while (i < n) {
+    size_t len = bc_op_length(bc, i, n);
+    if (len == 0) { free(leader); return 0; }
+    if (i + len > n) { free(leader); return 0; }
+
+    uint32_t target;
+    int has_ft;
+    int is_term = bc_op_branch_info(bc, i, n, &target, &has_ft);
+    if (is_term) {
+      if (target != (uint32_t)-1 && target <= n) {
+        leader[target] = 1;
+      }
+      /* Always mark `i+len` as a leader after a terminator, even
+       * when has_ft=0 (unconditional jump / leave / fatal).  Code
+       * after an unconditional terminator may be dead but still
+       * consists of instructions that need to belong to SOME
+       * block; the CFG (constructed later) records whether the
+       * fallthrough edge actually exists. */
+      (void)has_ft;
+      if (i + len < n) {
+        leader[i + len] = 1;
+      }
+    }
+    i += len;
+  }
+
+  /* Pass 2: count and emit blocks.  Walk leader[] once, joining
+   * each leader to the next leader (or n at end). */
+  size_t n_blocks = 0;
+  for (size_t k = 0; k <= n; k++) if (leader[k]) n_blocks++;
+  /* The walk above marks every leader EXCEPT possibly n itself --
+   * we don't need a block past the end.  If leader[n] got set
+   * (a branch target right at the end), that's an empty block;
+   * drop it. */
+  if (leader[n]) { leader[n] = 0; n_blocks--; }
+
+  jit_bb_t *blocks = (jit_bb_t*)malloc(n_blocks * sizeof(jit_bb_t));
+  if (!blocks) { free(leader); return 0; }
+
+  size_t bi = 0;
+  size_t prev_start = (size_t)-1;
+  for (size_t k = 0; k <= n; k++) {
+    if (!leader[k]) continue;
+    if (prev_start != (size_t)-1) {
+      blocks[bi].start = (uint32_t)prev_start;
+      blocks[bi].end   = (uint32_t)k;
+      bi++;
+    }
+    prev_start = k;
+  }
+  if (prev_start != (size_t)-1) {
+    blocks[bi].start = (uint32_t)prev_start;
+    blocks[bi].end   = (uint32_t)n;
+    bi++;
+  }
+
+  out->n_blocks = bi;
+  out->blocks   = blocks;
+  out->leader   = leader;
+  out->n        = n;
+  return 1;
+}
+
+static void jit_bb_free(jit_bb_info *info) {
+  if (!info) return;
+  free(info->blocks);
+  free(info->leader);
+  info->blocks = NULL;
+  info->leader = NULL;
+  info->n_blocks = 0;
+  info->n = 0;
+}
+
+/* Audit-time callback: counts def/use invocations so the audit can
+ * detect "bc_op_length classified but bc_op_defuse_visit didn't"
+ * mismatches.  No semantic checking beyond the counter. */
+static void jit_bb_audit_def_cb(uint32_t slot, void *user) {
+  (void)slot;
+  (*(size_t*)user)++;
+}
+static void jit_bb_audit_use_cb(uint32_t slot, void *user) {
+  (void)slot;
+  (*(size_t*)user)++;
+}
+
+/* ============================================================
+ * Phase 4 step 3: inter-block liveness fixpoint.
+ *
+ * For each basic block B, compute the set of slots that are
+ * LIVE_IN[B] (read before being overwritten on some path from B's
+ * entry) and LIVE_OUT[B] (live at B's exit).  Standard backward
+ * dataflow:
+ *
+ *   GEN[B]      = slots used in B before any local def of them
+ *   KILL[B]     = slots defined in B
+ *   LIVE_OUT[B] = union over successors S of LIVE_IN[S]
+ *   LIVE_IN[B]  = GEN[B]  union  (LIVE_OUT[B]  minus  KILL[B])
+ *
+ * Iterate until LIVE_IN/LIVE_OUT stabilize.  For Symta-shape
+ * bytecode (small functions, ~few blocks, few back-edges)
+ * convergence takes 2-3 passes.
+ *
+ * Slot space: sized adaptively to (max slot index seen) + 1.  A
+ * single bitset word covers 64 slots; for typical functions with
+ * <128 slots that's 2 uint64_ts per block.  Function-level slot
+ * caps at the JIT_LIVENESS_MAX_SLOTS guard so a runaway slot
+ * index doesn't allocate megabytes -- the build bails safely.
+ *
+ * Successors: at most 2 per block.
+ *   - Conditional branch (BC_B/B8/IFFXN): target + fallthrough
+ *   - Unconditional jump (BC_JMP/JMP16): target only
+ *   - Terminator with no continuation (BC_LEAVE/LEAVE0/FATAL/
+ *     BC_CTX::BTJUMP): zero successors
+ *   - Block ending naturally (no terminator, just a leader at
+ *     block.end): the next block via fallthrough
+ *
+ * Helper-call sites are NOT block boundaries here -- a CALL/MCALL
+ * is treated as a regular instruction.  Its slot defs/uses come
+ * from bc_op_defuse_visit. */
+
+enum { JIT_LIVENESS_MAX_SLOTS = 65536 };  /* u16 max + 1; functions with
+                                             higher slot indices don't
+                                             exist in real SBC */
+
+typedef struct {
+  jit_bb_info bbs;           /* the underlying partition */
+
+  size_t n_slots;            /* width of each bitset (slots, not words) */
+  size_t bs_words;           /* (n_slots + 63) / 64 */
+
+  /* Flat per-block bitset arrays.  Index = block_idx * bs_words + word.
+   * All four arrays have the same length (n_blocks * bs_words). */
+  uint64_t *gen;
+  uint64_t *kill;
+  uint64_t *live_in;
+  uint64_t *live_out;
+
+  /* Successor block indices.  succ[b*2 + 0] = primary successor or -1
+   * (no successor / out of bounds).  succ[b*2 + 1] = secondary or -1. */
+  int32_t *succ;
+} jit_liveness;
+
+static void jit_liveness_free(jit_liveness *info);
+
+static inline void jit_bs_set(uint64_t *bs, uint32_t bit) {
+  bs[bit >> 6] |= ((uint64_t)1) << (bit & 63);
+}
+static inline int jit_bs_test(const uint64_t *bs, uint32_t bit) {
+  return (bs[bit >> 6] >> (bit & 63)) & 1;
+}
+
+/* Callback context for the GEN/KILL pass: pass GEN and KILL bitset
+ * pointers + width so the def/use callbacks can mutate them in-place. */
+typedef struct {
+  uint64_t *gen;
+  uint64_t *kill;
+  uint32_t max_slot;     /* highest slot index seen; for sizing checks */
+} jit_genkill_ctx;
+
+static void jit_liveness_use_cb(uint32_t slot, void *user) {
+  jit_genkill_ctx *c = (jit_genkill_ctx*)user;
+  if (slot > c->max_slot) c->max_slot = slot;
+  /* USE counts toward GEN[B] only if the slot hasn't already been
+   * killed (locally defined) earlier in this block. */
+  if (!jit_bs_test(c->kill, slot)) {
+    jit_bs_set(c->gen, slot);
+  }
+}
+static void jit_liveness_def_cb(uint32_t slot, void *user) {
+  jit_genkill_ctx *c = (jit_genkill_ctx*)user;
+  if (slot > c->max_slot) c->max_slot = slot;
+  /* DEF kills the slot for the rest of the block (subsequent uses
+   * within B no longer contribute to GEN[B]). */
+  jit_bs_set(c->kill, slot);
+}
+
+/* Discovery callbacks: track max slot without touching any bitset.
+ * Used by jit_liveness_find_max_slot below. */
+static void jit_liveness_maxslot_cb(uint32_t slot, void *user) {
+  uint32_t *max = (uint32_t*)user;
+  if (slot > *max) *max = slot;
+}
+
+/* Adaptive sizing: walk the entire stream once just to find max slot.
+ *
+ * Bails (returns 0) if any opcode in the function isn't classified
+ * by bc_op_defuse_visit or if max_slot exceeds the safety cap. */
+static int jit_liveness_find_max_slot(const uint8_t *bc, size_t n,
+                                       uint32_t *out_max) {
+  uint32_t max_slot = 0;
+  size_t i = 0;
+  while (i < n) {
+    size_t L = bc_op_length(bc, i, n);
+    if (L == 0) {
+      if (getenv("SYMTA_JIT_BB_AUDIT_VERBOSE")) {
+        fprintf(stderr, "liv-audit: bc_op_length unknown at %zu (op=0x%02X)\n",
+                i, bc[i]);
+      }
+      return 0;
+    }
+    if (!bc_op_defuse_visit(bc, i, n,
+                            jit_liveness_maxslot_cb,
+                            jit_liveness_maxslot_cb,
+                            &max_slot)) {
+      if (getenv("SYMTA_JIT_BB_AUDIT_VERBOSE")) {
+        fprintf(stderr, "liv-audit: defuse_visit unknown at %zu (op=0x%02X)\n",
+                i, bc[i]);
+      }
+      return 0;
+    }
+    i += L;
+  }
+  if (max_slot >= JIT_LIVENESS_MAX_SLOTS) {
+    if (getenv("SYMTA_JIT_BB_AUDIT_VERBOSE")) {
+      fprintf(stderr, "liv-audit: max_slot %u exceeds cap\n", max_slot);
+    }
+    return 0;
+  }
+  *out_max = max_slot;
+  return 1;
+}
+
+/* For block B, return the (up to 2) successor block indices into
+ * info->bbs.blocks[].  Successors are determined from B's last
+ * instruction.
+ *
+ * Linear search for the target offset's block index is O(log N) via
+ * binary search; for the common case of <20 blocks per function the
+ * linear scan is fine and avoids the prep cost. */
+static int jit_block_find(const jit_bb_info *bbs, uint32_t off) {
+  for (size_t k = 0; k < bbs->n_blocks; k++) {
+    if (bbs->blocks[k].start == off) return (int)k;
+  }
+  return -1;
+}
+
+static void jit_liveness_compute_succ(const uint8_t *bc, size_t n,
+                                       const jit_bb_info *bbs,
+                                       int32_t *succ) {
+  for (size_t k = 0; k < bbs->n_blocks; k++) {
+    succ[k * 2 + 0] = -1;
+    succ[k * 2 + 1] = -1;
+
+    /* Find the last instruction in block k. */
+    uint32_t start = bbs->blocks[k].start;
+    uint32_t end   = bbs->blocks[k].end;
+    size_t last_off = start;
+    size_t walk = start;
+    while (walk < end) {
+      size_t L = bc_op_length(bc, walk, n);
+      if (L == 0) break;
+      last_off = walk;
+      walk += L;
+    }
+
+    uint32_t target;
+    int has_ft;
+    int is_term = bc_op_branch_info(bc, last_off, n, &target, &has_ft);
+
+    int n_succ = 0;
+    if (is_term) {
+      if (target != (uint32_t)-1 && target <= n) {
+        int b = jit_block_find(bbs, target);
+        if (b >= 0) succ[k * 2 + (n_succ++)] = b;
+      }
+      if (has_ft && end < n) {
+        int b = jit_block_find(bbs, end);
+        if (b >= 0) succ[k * 2 + (n_succ++)] = b;
+      }
+    } else {
+      /* No terminator at end -- block ends because next offset is a
+       * leader (some other branch targets it).  Natural fallthrough. */
+      if (end < n) {
+        int b = jit_block_find(bbs, end);
+        if (b >= 0) succ[k * 2 + (n_succ++)] = b;
+      }
+    }
+  }
+}
+
+/* Build the full liveness info for a function.  Returns 1 on
+ * success (caller owns the buffers, free with jit_liveness_free),
+ * 0 on failure (function uses unclassified opcodes / slot index
+ * overflow / OOM).  *out is left zero-initialised on failure. */
+static int jit_liveness_build(const uint8_t *bc, size_t n,
+                               jit_liveness *out) {
+  memset(out, 0, sizeof(*out));
+  if (!jit_partition_bbs(bc, n, &out->bbs)) return 0;
+
+  uint32_t max_slot = 0;
+  if (!jit_liveness_find_max_slot(bc, n, &max_slot)) {
+    jit_bb_free(&out->bbs);
+    return 0;
+  }
+  out->n_slots  = (size_t)max_slot + 1;
+  out->bs_words = (out->n_slots + 63) / 64;
+  if (out->bs_words == 0) out->bs_words = 1;  /* empty functions */
+
+  size_t total_words = out->bbs.n_blocks * out->bs_words;
+  out->gen      = (uint64_t*)calloc(total_words, sizeof(uint64_t));
+  out->kill     = (uint64_t*)calloc(total_words, sizeof(uint64_t));
+  out->live_in  = (uint64_t*)calloc(total_words, sizeof(uint64_t));
+  out->live_out = (uint64_t*)calloc(total_words, sizeof(uint64_t));
+  out->succ     = (int32_t*)malloc(out->bbs.n_blocks * 2 * sizeof(int32_t));
+  if (!out->gen || !out->kill || !out->live_in || !out->live_out || !out->succ) {
+    jit_liveness_free(out);
+    return 0;
+  }
+
+  /* Compute GEN/KILL per block. */
+  for (size_t k = 0; k < out->bbs.n_blocks; k++) {
+    jit_genkill_ctx ctx;
+    ctx.gen      = out->gen  + k * out->bs_words;
+    ctx.kill     = out->kill + k * out->bs_words;
+    ctx.max_slot = max_slot;
+    size_t i = out->bbs.blocks[k].start;
+    while (i < out->bbs.blocks[k].end) {
+      size_t L = bc_op_length(bc, i, n);
+      if (L == 0) { jit_liveness_free(out); return 0; }
+      if (!bc_op_defuse_visit(bc, i, n, jit_liveness_def_cb,
+                              jit_liveness_use_cb, &ctx)) {
+        jit_liveness_free(out); return 0;
+      }
+      i += L;
+    }
+  }
+
+  /* Compute successors. */
+  jit_liveness_compute_succ(bc, n, &out->bbs, out->succ);
+
+  /* Iterate backward dataflow to fixed point.  Worklist-free
+   * variant: just sweep all blocks per pass.  Symta-shape functions
+   * converge in 2-3 passes; cap at 64 to fail loudly if a bug
+   * keeps fueling change. */
+  int changed = 1;
+  int iters = 0;
+  while (changed && iters < 64) {
+    changed = 0;
+    iters++;
+    for (size_t k = 0; k < out->bbs.n_blocks; k++) {
+      uint64_t *gen      = out->gen      + k * out->bs_words;
+      uint64_t *kill     = out->kill     + k * out->bs_words;
+      uint64_t *live_in  = out->live_in  + k * out->bs_words;
+      uint64_t *live_out = out->live_out + k * out->bs_words;
+
+      /* LIVE_OUT[B] = union over successors S of LIVE_IN[S]. */
+      for (size_t w = 0; w < out->bs_words; w++) {
+        uint64_t new_out = 0;
+        for (int s = 0; s < 2; s++) {
+          int sb = out->succ[k * 2 + s];
+          if (sb < 0) continue;
+          new_out |= out->live_in[(size_t)sb * out->bs_words + w];
+        }
+        if (new_out != live_out[w]) { live_out[w] = new_out; changed = 1; }
+      }
+
+      /* LIVE_IN[B] = GEN[B] | (LIVE_OUT[B] & ~KILL[B]). */
+      for (size_t w = 0; w < out->bs_words; w++) {
+        uint64_t new_in = gen[w] | (live_out[w] & ~kill[w]);
+        if (new_in != live_in[w]) { live_in[w] = new_in; changed = 1; }
+      }
+    }
+  }
+  if (iters >= 64) {
+    fprintf(stderr, "liveness: failed to converge in 64 iterations "
+                    "(n_blocks=%zu, n_slots=%zu) -- likely a bug\n",
+            out->bbs.n_blocks, out->n_slots);
+    jit_liveness_free(out);
+    return 0;
+  }
+  return 1;
+}
+
+static void jit_liveness_free(jit_liveness *info) {
+  if (!info) return;
+  free(info->gen);      info->gen = NULL;
+  free(info->kill);     info->kill = NULL;
+  free(info->live_in);  info->live_in = NULL;
+  free(info->live_out); info->live_out = NULL;
+  free(info->succ);     info->succ = NULL;
+  jit_bb_free(&info->bbs);
+  info->n_slots = 0;
+  info->bs_words = 0;
+}
+
+/* ============================================================
+ * Phase 4 first user: dead-store elimination.
+ *
+ * Walk each basic block backward, tracking LIVE.  For each opcode
+ * whose only output is a single slot, if that slot is NOT in LIVE
+ * at the def site AND the opcode has no side effects beyond the
+ * write, mark the opcode for elision.  The translator skips
+ * emission for elided opcodes (bc_to_x86[i] still set so branches
+ * resolve correctly; the elided opcode effectively becomes a NOP
+ * in the emitted code).
+ *
+ * Eliminable opcodes: only pure copies / immediate loads / table
+ * lookups -- nothing that allocates, dispatches, calls a helper,
+ * stores to heap, or could trap.  This minimal whitelist is
+ * deliberately conservative; broadening it requires either
+ * proving no-side-effect for the helper variant or factoring the
+ * tag-check fast path out from the helper-fallback slow path.
+ *
+ * Env-gated by SYMTA_DSE (opt-in for now) until the test suite
+ * has exercised the pass at scale.  SYMTA_NO_DSE (an alias)
+ * forces off if it's later default-on. */
+
+/* True iff opcode `op` is pure and safe to elide when its def is
+ * dead.  Kept narrow on purpose -- arithmetic / heap-deref / GC-
+ * triggering allocators are excluded even though they often pass
+ * informal "no observable side effect" inspection.
+ *
+ * The whitelist covers:
+ *   - register copies (MOVE family)
+ *   - immediate / table-lookup loads (no allocation, no dispatch)
+ *
+ * Excluded for safety: anything that calls a helper (FXN arith,
+ * INC/DEC, NEG/ABS), allocates on the heap (LIST/LIST1/LIST2/
+ * OBJECT/CLOSURE), reads heap state (LD4/LOAD), stores heap
+ * (STOR/ST4/COPY), or could trap (IDIV/IREM). */
+static int bc_op_is_eliminable(uint8_t op) {
+  switch (op) {
+    /* Pure register copies. */
+    case BC_MOVE: case BC_MOVE8: case BC_MOVE4:
+    /* Pure typed-int immediate loads. */
+    case BC_FXN0: case BC_FXN8: case BC_FXN16: case BC_FXN32:
+    case BC_FXNB0: case BC_FXNB8: case BC_FXNB16: case BC_FXNB32:
+    /* Pure fixtext immediate loads. */
+    case BC_FXT8: case BC_FXT16: case BC_FXT24: case BC_FXT32:
+    case BC_FXT40: case BC_FXT48: case BC_FXT56:
+    /* Pure pre-tagged 64-bit immediate loads. */
+    case 0x2F /* BC_IMMB64 */: case 0x30 /* BC_IMM64 */:
+    /* Pure singletons (No, Empty). */
+    case BC_MOVENO: case BC_MOVEEMT:
+    /* Pure table loads: SBC static tables (im, mt, tx). */
+    case BC_MOVEIM: case BC_MOVEMT: case BC_MOVEMT8:
+    case BC_MOVETX: case BC_MOVETX8:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/* Callback to extract the single def slot from a pure opcode.
+ * Pure ops have at most one def (the whitelist guarantees this). */
+typedef struct {
+  uint32_t slot;
+  int count;
+} dse_single_def_ctx;
+static void dse_single_def_cb(uint32_t slot, void *user) {
+  dse_single_def_ctx *c = (dse_single_def_ctx*)user;
+  c->slot = slot;
+  c->count++;
+}
+
+/* Callbacks for updating LIVE during the backward walk.  def_cb
+ * removes from LIVE (kill), use_cb adds (gen).  Order in
+ * bc_op_defuse_visit: all defs fire before all uses, so for
+ * FXNLSET-style def+use of the same slot the slot ends up live
+ * (use re-adds it).  Correct backward-transfer semantics. */
+typedef struct {
+  uint64_t *live;
+} dse_live_ctx;
+static void dse_live_def_cb(uint32_t slot, void *user) {
+  dse_live_ctx *c = (dse_live_ctx*)user;
+  c->live[slot >> 6] &= ~(((uint64_t)1) << (slot & 63));
+}
+static void dse_live_use_cb(uint32_t slot, void *user) {
+  dse_live_ctx *c = (dse_live_ctx*)user;
+  c->live[slot >> 6] |= (((uint64_t)1) << (slot & 63));
+}
+
+/* Build dead_bm[0..n]: dead_bm[i]=1 iff opcode at offset i is a
+ * dead-store-elimination candidate.  Caller owns dead_bm; should
+ * be a calloc'd byte array of length n+1.
+ *
+ * Returns the number of opcodes marked dead (0 if liv is NULL or
+ * the function isn't analyzable). */
+static size_t jit_dse_compute(const uint8_t *bc, size_t n,
+                               const jit_liveness *liv,
+                               uint8_t *dead_bm) {
+  if (!liv) return 0;
+  /* Working LIVE bitset, sized like liveness's per-block bitset. */
+  uint64_t *live = (uint64_t*)calloc(liv->bs_words, sizeof(uint64_t));
+  if (!live) return 0;
+  /* Bounded array of opcode start offsets within a block.  Symta
+   * functions are typically <500 bytes; 4096 ops per block is a
+   * defensive cap. */
+  enum { DSE_OPS_PER_BLOCK = 4096 };
+  uint32_t *op_offs = (uint32_t*)malloc(DSE_OPS_PER_BLOCK * sizeof(uint32_t));
+  if (!op_offs) { free(live); return 0; }
+
+  size_t total_dead = 0;
+  for (size_t k = 0; k < liv->bbs.n_blocks; k++) {
+    /* Forward walk: collect opcode offsets in this block. */
+    size_t n_ops = 0;
+    size_t walk = liv->bbs.blocks[k].start;
+    while (walk < liv->bbs.blocks[k].end) {
+      if (n_ops >= DSE_OPS_PER_BLOCK) { n_ops = 0; break; }
+      op_offs[n_ops++] = (uint32_t)walk;
+      size_t L = bc_op_length(bc, walk, n);
+      if (L == 0) { n_ops = 0; break; }
+      walk += L;
+    }
+    if (n_ops == 0) continue;
+
+    /* Initialize LIVE = LIVE_OUT[k]. */
+    memcpy(live, liv->live_out + k * liv->bs_words,
+           liv->bs_words * sizeof(uint64_t));
+
+    /* Reverse iterate, marking dead ops + updating LIVE. */
+    for (size_t j = n_ops; j-- > 0; ) {
+      size_t off = op_offs[j];
+      uint8_t op = bc[off];
+
+      if (bc_op_is_eliminable(op)) {
+        /* Pure op -- check if its single def is dead. */
+        dse_single_def_ctx ctx = { (uint32_t)-1, 0 };
+        bc_op_defuse_visit(bc, off, n, dse_single_def_cb, NULL, &ctx);
+        /* Slot 0 = P (parent frame) and slot 1 = E (env/args) are
+         * runtime-special.  The interpreter / runtime helpers read
+         * them implicitly (stack traces, closure dispatch, the
+         * SUBR macro's frame setup) without the bytecode ever
+         * having an explicit USE.  Match pin-scan's convention
+         * and refuse to eliminate any write to slots 0 or 1. */
+        if (ctx.count == 1 && ctx.slot >= 2 && ctx.slot != (uint32_t)-1) {
+          uint32_t s = ctx.slot;
+          int is_live = (live[s >> 6] >> (s & 63)) & 1;
+          if (!is_live) {
+            if (getenv("SYMTA_DSE_VERBOSE")) {
+              fprintf(stderr, "  dse: elide op 0x%02X at %zu in block %zu (def slot %u dead)\n",
+                      op, off, k, s);
+            }
+            dead_bm[off] = 1;
+            total_dead++;
+            continue;   /* don't update LIVE -- op is gone */
+          }
+        }
+      }
+      /* Live op (or non-eliminable): update LIVE in place via the
+       * standard transfer (defs kill, uses gen). */
+      dse_live_ctx lctx = { live };
+      bc_op_defuse_visit(bc, off, n,
+                         dse_live_def_cb, dse_live_use_cb, &lctx);
+    }
+  }
+
+  free(op_offs);
+  free(live);
+  return total_dead;
+}
+
+/* Optional audit hook -- runs the partition pass on every function
+ * the translator sees, then validates the partition for self-
+ * consistency.  Used as a smoke test until step 3 (liveness)
+ * actually consumes the output.  Triggered by SYMTA_JIT_BB_AUDIT.
+ *
+ * Validation:
+ *   1. every block (start, end) satisfies start < end
+ *   2. start is a leader
+ *   3. every interior offset is an instruction start (walking
+ *      bc_op_length from start lands exactly at end)
+ *   4. blocks are sorted + non-overlapping
+ *   5. every opcode that bc_op_length recognises is also
+ *      classified by bc_op_defuse_visit (keeps the two tables in
+ *      sync as a compile-time-style invariant)
+ *
+ * Any violation prints to stderr and returns 0; otherwise 1.
+ * Returns 1 on success (or audit disabled), 0 on failure. */
+static int jit_bb_audit(const uint8_t *bc, size_t n) {
+  if (!getenv("SYMTA_JIT_BB_AUDIT")) return 1;
+  jit_bb_info info;
+  if (!jit_partition_bbs(bc, n, &info)) {
+    /* Partition refusing isn't a bug per se -- means the function
+     * has an opcode we don't track yet.  Silently skip. */
+    return 1;
+  }
+  int ok = 1;
+  for (size_t k = 0; k < info.n_blocks; k++) {
+    if (info.blocks[k].start >= info.blocks[k].end) {
+      fprintf(stderr, "bb-audit: block %zu has start>=end (%u, %u)\n",
+              k, info.blocks[k].start, info.blocks[k].end);
+      ok = 0; break;
+    }
+    if (!info.leader[info.blocks[k].start]) {
+      fprintf(stderr, "bb-audit: block %zu start %u not marked leader\n",
+              k, info.blocks[k].start);
+      ok = 0; break;
+    }
+    /* Walk interior instructions to confirm they tile exactly,
+     * and that every recognised opcode also classifies under the
+     * def-use visitor. */
+    size_t walk = info.blocks[k].start;
+    while (walk < info.blocks[k].end) {
+      size_t L = bc_op_length(bc, walk, n);
+      if (L == 0) {
+        fprintf(stderr, "bb-audit: block %zu unwalkable at %zu\n", k, walk);
+        ok = 0; break;
+      }
+      size_t dummy = 0;
+      if (!bc_op_defuse_visit(bc, walk, n,
+                              jit_bb_audit_def_cb, jit_bb_audit_use_cb,
+                              &dummy)) {
+        fprintf(stderr, "bb-audit: opcode 0x%02X at %zu has length but "
+                        "no def-use classification\n", bc[walk], walk);
+        ok = 0; break;
+      }
+      walk += L;
+    }
+    if (!ok) break;
+    if (walk != info.blocks[k].end) {
+      fprintf(stderr, "bb-audit: block %zu walks to %zu, expected end %u\n",
+              k, walk, info.blocks[k].end);
+      ok = 0; break;
+    }
+    if (k > 0 && info.blocks[k].start != info.blocks[k-1].end) {
+      fprintf(stderr, "bb-audit: block %zu start %u != prev end %u (gap)\n",
+              k, info.blocks[k].start, info.blocks[k-1].end);
+      ok = 0; break;
+    }
+  }
+  jit_bb_free(&info);
+  if (!ok) return 0;
+
+  /* Phase 4 step 3: also exercise the liveness builder and verify
+   * convergence -- one extra transfer iteration must be a no-op
+   * if the fixed point is real. */
+  jit_liveness liv;
+  if (!jit_liveness_build(bc, n, &liv)) {
+    if (getenv("SYMTA_JIT_BB_AUDIT_VERBOSE")) {
+      fprintf(stderr, "liv-audit: build bailed (n=%zu)\n", n);
+    }
+    return 1;
+  }
+  if (getenv("SYMTA_JIT_BB_AUDIT_VERBOSE")) {
+    fprintf(stderr, "liv-audit: built (n_blocks=%zu n_slots=%zu)\n",
+            liv.bbs.n_blocks, liv.n_slots);
+  }
+
+  int liv_ok = 1;
+  for (size_t k = 0; k < liv.bbs.n_blocks; k++) {
+    uint64_t *gen      = liv.gen      + k * liv.bs_words;
+    uint64_t *kill     = liv.kill     + k * liv.bs_words;
+    uint64_t *live_in  = liv.live_in  + k * liv.bs_words;
+    uint64_t *live_out = liv.live_out + k * liv.bs_words;
+
+    /* Recompute LIVE_OUT from successors; must match. */
+    for (size_t w = 0; w < liv.bs_words; w++) {
+      uint64_t expected_out = 0;
+      for (int s = 0; s < 2; s++) {
+        int sb = liv.succ[k * 2 + s];
+        if (sb < 0) continue;
+        expected_out |= liv.live_in[(size_t)sb * liv.bs_words + w];
+      }
+      if (expected_out != live_out[w]) {
+        fprintf(stderr, "liv-audit: block %zu LIVE_OUT word %zu unstable "
+                        "(got %llx, expected %llx)\n",
+                k, w,
+                (unsigned long long)live_out[w],
+                (unsigned long long)expected_out);
+        liv_ok = 0; break;
+      }
+      uint64_t expected_in = gen[w] | (live_out[w] & ~kill[w]);
+      if (expected_in != live_in[w]) {
+        fprintf(stderr, "liv-audit: block %zu LIVE_IN word %zu unstable "
+                        "(got %llx, expected %llx)\n",
+                k, w,
+                (unsigned long long)live_in[w],
+                (unsigned long long)expected_in);
+        liv_ok = 0; break;
+      }
+    }
+    if (!liv_ok) break;
+  }
+  jit_liveness_free(&liv);
+  return liv_ok;
+}
+
 static void jit_select_pinned_slots(jit_buf *b, const uint8_t *bc, size_t n) {
   b->pinned_count = 0;
   for (int i = 0; i < JIT_MAX_PINNED; i++) {
@@ -1774,12 +2954,52 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
    * slot-access primitives consult b->pinned[] thereafter. */
   jit_select_pinned_slots(b, bc, n);
 
+  /* Phase 4 step 1: optional basic-block partition audit.  Runs
+   * the partition pass + validates its output for every JIT'd
+   * function when SYMTA_JIT_BB_AUDIT is set.  No effect on code
+   * generation; the output is discarded. */
+  (void)jit_bb_audit(bc, n);
+
+  /* Phase 4 dead-store elimination.  Compute liveness, then mark
+   * pure ops whose single def is dead.  Gated by SYMTA_DSE for
+   * opt-in until exercised at scale; SYMTA_NO_DSE forces off if
+   * default is ever flipped. */
+  uint8_t *dse_dead_bm = NULL;
+  size_t   dse_dead_count = 0;
+  if (getenv("SYMTA_DSE") && !getenv("SYMTA_NO_DSE")) {
+    jit_liveness liv;
+    if (jit_liveness_build(bc, n, &liv)) {
+      dse_dead_bm = (uint8_t*)calloc(n + 1, 1);
+      if (dse_dead_bm) {
+        dse_dead_count = jit_dse_compute(bc, n, &liv, dse_dead_bm);
+      }
+      jit_liveness_free(&liv);
+    }
+    if (getenv("SYMTA_DSE_VERBOSE") && dse_dead_count > 0) {
+      fprintf(stderr, "dse: elided %zu opcode(s) in function (n=%zu)\n",
+              dse_dead_count, n);
+    }
+  }
+
   if (have_sbc) jit_emit_prologue2(b);
   else          jit_emit_prologue(b);
 
   size_t i = 0;
   while (i < n) {
     bc_to_x86[i] = b->len;
+    /* DSE: if this opcode was marked dead, skip emission.  bc_to_x86
+     * still records the (next instruction's) x86 position so any
+     * branch targeting this offset lands at the same place as a
+     * branch to the next opcode -- effectively a NOP-in-machine-
+     * code-space.  Pinned-slot accounting stays consistent because
+     * the dead def's slot is, by construction, not in LIVE_OUT and
+     * therefore unread by any later opcode in the function. */
+    if (dse_dead_bm && dse_dead_bm[i]) {
+      size_t L = bc_op_length(bc, i, n);
+      if (L == 0) { fail = 1; break; }
+      i += L;
+      continue;
+    }
     uint8_t op = bc[i];
     switch (op) {
     case BC_NOP:
@@ -3573,6 +4793,7 @@ static jit_buf *jit_translate_core(const uint8_t *bc, size_t n,
 done:
   if (fail) {
     free(bc_to_x86);
+    free(dse_dead_bm);
     jit_buf_free(b);
     return NULL;
   }
@@ -3588,6 +4809,7 @@ done:
   }
 
   free(bc_to_x86);
+  free(dse_dead_bm);
   if (fail) { jit_buf_free(b); return NULL; }
   return b;
 }
