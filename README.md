@@ -2,7 +2,7 @@
 
 # Symta
 
-**NOTE:* project moved to https://symta.aermia.com/ (see ./symta.aermia.com.md)
+**NOTE:** project moved to https://symta.aermia.com/ (see ./symta.aermia.com.md)
 
 > A list-processing Lisp dialect where one terse line replaces fifty
 > verbose ones — and stays readable.
