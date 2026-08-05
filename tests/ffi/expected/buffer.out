@@ -1,6 +1,0 @@
-PASS symta-alloc + c-fill 0xAB
-PASS c-alloc + symta-write + checksum match
-PASS u32 read at 0
-PASS u32 read at 4
-PASS u32 read at 8
-PASS u32 read at 12

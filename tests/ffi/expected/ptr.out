@@ -1,4 +1,0 @@
-PASS ptr roundtrip via c_id_ptr
-PASS ptr diff = 1
-PASS ptr diff = 2
-PASS ptr NULL roundtrip

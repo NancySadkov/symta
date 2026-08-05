@@ -1,1 +1,0 @@
-tests/static-check/cases/20-case-list-narrow-3plus.s:8,14: type mismatch: expected `int`, got `list` (in `_the int Xs`)

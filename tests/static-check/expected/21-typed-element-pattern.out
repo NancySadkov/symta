@@ -1,1 +1,0 @@
-tests/static-check/cases/21-typed-element-pattern.s:8,16: type mismatch: expected `text`, got `int` (in `_the text X`)

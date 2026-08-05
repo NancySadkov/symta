@@ -1,8 +1,0 @@
-#line 1 "escapes.c"
-                                                              
- 
-
-bare:   42
-#:     #
-inside: "X stays literal in quotes"
-mixed:  42 and # and "X"

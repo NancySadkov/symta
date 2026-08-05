@@ -1,9 +1,0 @@
-(3, 4)
-(3, 4) is 5.0 units from origin
-is_point? 1
-moved to (6, 8), distance now 10.0
-circle@(0,0) r=5
-area: 78.53981781
-T.tag      = origin
-T.tag_text = <origin>
-is_point?    1

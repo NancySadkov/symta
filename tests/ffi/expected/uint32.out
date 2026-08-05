@@ -1,7 +1,0 @@
-PASS u32 id 0
-PASS u32 id 1
-PASS u32 id 0xFF
-PASS u32 id 0xFFFF
-PASS u32 id 0x10000
-PASS u32 id 0x7FFFFFFF
-PASS u32_max const

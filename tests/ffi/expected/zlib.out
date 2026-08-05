@@ -1,3 +1,0 @@
-PASS zlib version = VERSION
-PASS crc32('Hello, World!') = 0xEC4AC3D0
-PASS zlib compress + uncompress round-trip

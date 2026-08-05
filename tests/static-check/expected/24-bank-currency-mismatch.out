@@ -1,1 +1,0 @@
-tests/static-check/cases/24-bank-currency-mismatch.s:8,13: type mismatch: expected `int`, got `text` (in `_the int (`"` `fifty cents`)`)

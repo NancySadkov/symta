@@ -1,7 +1,0 @@
-PASS mix iffi
-PASS mix fiif
-PASS mix ffii
-PASS mix iiff
-PASS mix ifiifi
-PASS mix fiiffi
-PASS mix iffi distinct

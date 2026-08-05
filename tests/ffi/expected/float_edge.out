@@ -1,8 +1,0 @@
-PASS f64 neg of 0.0
-PASS f32 neg of 0.0
-PASS f64 id 1024.0
-PASS f64 id 0.0625
-PASS f64 id 1048576.0
-PASS f64 id -1024.0
-PASS f64 id -0.0625
-PASS f64 seq 0.5

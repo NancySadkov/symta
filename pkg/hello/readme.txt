@@ -1,1 +1,0 @@
-to compile, enter "symta ./" and then "./run" to execute resulting program.

@@ -1,6 +1,0 @@
-- instead of ui_data use should call ui/m function to provide these callbacks
-
-- file_dlg.s still references $ui
-
-- font.s still references main.
-

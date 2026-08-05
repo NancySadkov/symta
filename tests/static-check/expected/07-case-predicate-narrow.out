@@ -1,1 +1,0 @@
-tests/static-check/cases/07-case-predicate-narrow.s:3,7: type mismatch: expected `text`, got `int` (in `_the text X`)

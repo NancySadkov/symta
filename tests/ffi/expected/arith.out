@@ -1,8 +1,0 @@
-PASS i32 add 7+5
-PASS i32 add -3+10
-PASS u32 add 100+200
-PASS u32 add 0xFF+1
-PASS f32 add 1.5+2.5
-PASS f64 add 1e3+1e3
-PASS mix i32+f64
-PASS mix f64+i32

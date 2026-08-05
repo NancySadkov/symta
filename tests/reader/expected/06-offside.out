@@ -1,8 +1,0 @@
-multi-line if body (auto-bar between statements):
-  ((`=` (f X) ((`|` ((`if` ((`>` X 0)) ((`|` (A) (B))) (C)))))))
-deeply nested:
-  ((`=` (f) ((`|` ((`if` (X) ((`|` ((`if` (Y) ((`|` (A))) (B))))) (C)))))))
-for-loop body:
-  ((`=` (g Xs) ((`|` (`:` (for X Xs) ((`|` (say X) (process X))))))))
-when body, multi-statement:
-  ((`=` (h) ((`|` (`:` (when X) ((`|` (A) (B))))))))

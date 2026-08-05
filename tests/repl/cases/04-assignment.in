@@ -1,6 +1,0 @@
-X = 10
-X*2
-Y = X+5
-Y
-[X Y X+Y]
-exit

@@ -1,1 +1,0 @@
-tests/static-check/cases/12-case-list-narrow.s:3,8: type mismatch: expected `text`, got `list` (in `_the text Xs`)

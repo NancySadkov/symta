@@ -1,6 +1,0 @@
-PASS sum i32×4
-PASS sum i32×4 alt
-PASS sum i32×6
-PASS sum i32×8
-PASS sum i32×12
-PASS sum i32×12 neg
